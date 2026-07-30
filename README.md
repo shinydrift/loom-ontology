@@ -95,6 +95,7 @@ Early. The **spec module** (this repo's current contents) is complete and tested
 | MCP server (`serve`) | ⏳ |
 
 `docs/spec-v0.md` is the full grammar — the framework's public contract.
+`docs/ROADMAP.md` tracks what's next, milestone by milestone.
 
 ## Quickstart
 
