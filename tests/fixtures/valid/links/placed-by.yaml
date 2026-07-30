@@ -1,0 +1,6 @@
+linkType:
+  apiName: placedBy
+  cardinality: many_to_one
+  from: { objectType: Order,    property: customerId }
+  to:   { objectType: Customer, property: customerId }
+  reverseName: orders

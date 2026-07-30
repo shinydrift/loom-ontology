@@ -1,0 +1,14 @@
+action:
+  apiName: upgradeTier
+  description: Raise a customer to a higher membership tier
+  targetObjectType: Customer
+  operation: modify
+  parameters:
+    - { name: customer, type: objectRef, objectType: Customer }
+    - { name: newTier,  type: enum, values: [silver, gold] }
+  validation:
+    - { rule: "newTier != object.tier", message: New tier must differ from current tier }
+  effects:
+    - modifyObject:
+        key: "{{ customer }}"
+        set: { tier: "{{ newTier }}" }

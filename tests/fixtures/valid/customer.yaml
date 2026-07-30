@@ -1,0 +1,11 @@
+objectType:
+  apiName: Customer
+  primaryKey: customerId
+  title: name
+  backing: { catalog: rest_main, table: crm.customers }
+  properties:
+    - { name: customerId, type: string, column: id, unique: true }
+    - { name: name,       type: string, column: full_name }
+    - { name: tier,       type: enum, values: [bronze, silver, gold], column: tier }
+    - { name: ltv,        type: double, column: lifetime_value, nullable: true }
+  searchable: [name, tier]

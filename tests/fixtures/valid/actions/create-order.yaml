@@ -1,0 +1,16 @@
+action:
+  apiName: createOrder
+  description: Record a new order for a customer
+  targetObjectType: Order
+  operation: create
+  parameters:
+    - { name: orderId,    type: string }
+    - { name: customerId, type: string }
+    - { name: total,      type: decimal, precision: 12, scale: 2 }
+  effects:
+    - createObject:
+        set:
+          orderId: "{{ orderId }}"
+          customerId: "{{ customerId }}"
+          total: "{{ total }}"
+          placedAt: "now()"

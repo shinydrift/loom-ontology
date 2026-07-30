@@ -1,0 +1,11 @@
+objectType:
+  apiName: Order
+  primaryKey: orderId
+  title: orderId
+  backing: { catalog: rest_main, table: sales.orders }
+  properties:
+    - { name: orderId,    type: string, column: id, unique: true }
+    - { name: customerId, type: string, column: customer_id }
+    - { name: total,      type: decimal, precision: 12, scale: 2, column: total_amount }
+    - { name: placedAt,   type: timestamp, column: created_at }
+  searchable: [orderId]
