@@ -21,24 +21,52 @@ catalog.
 
 ---
 
-## ⏳ M1 — Catalog + query slice (next)
+## ⏳ M1 — Read slice, end to end: catalog → query → MCP (next)
 
-*Goal: `get_customer("c1")` returns a real row from a local Iceberg table.* The first time you
-can query the ontology.
+*Goal: point an MCP client at a Loom ontology and ask it for a real row from a real Iceberg
+table.* The first time the ontology does the thing the README claims.
 
-- [ ] `catalog/` — Iceberg REST catalog client + table introspection (pyiceberg). Bind an
-      `objectType.backing` to a live table; list columns + Iceberg types.
+**Scope note — why MCP moved up.** M1 was originally just the catalog + query slice, with the
+MCP server deferred to M4 behind migrations and the action runtime. That ordering ends M1 at a
+`loom query` dev command that only a test can see. The read-only half of the MCP surface is
+~150 LOC on top of the resolver (registry introspection + two stdio handlers) and it's what
+makes the milestone demoable to a person rather than a test suite. So M1 now covers the whole
+**read** path top to bottom, and M4 keeps only what genuinely depends on M2/M3 — the `run_<action>`
+tools and capability negotiation.
+
+The write path is untouched by this: no migrations, no action runtime, no `_loom_meta`.
+
+- [ ] `config.py` — the `loom.yaml` project config from spec §6 (`catalogs`, `engine`, `mcp`),
+      reusing the same accumulate-all-errors `Diagnostics` as the spec loader.
+- [ ] `catalog/` — a `Catalog` port + table introspection (columns → Iceberg types, field ids),
+      with pyiceberg-backed implementations. Binds an `objectType.backing` to a live table.
 - [ ] Wire up **physical validation** — implement `validator.check_physical()` (the stub):
       table/column existence + type promotion-compatibility against the bound catalog.
+      Surfaced as `loom validate --physical`.
 - [ ] `query/ir.py` — the logical plan node set: `GetByKey`, `Search`, `Traverse`, `Project`.
 - [ ] `query/engine.py` — the `Engine` port (`capabilities()` / `compile()` / `execute()`).
 - [ ] `query/engines/duckdb.py` — first adapter; lowers IR → DuckDB SQL over Iceberg.
 - [ ] `resolver.py` — ontology ops → IR; link `Traverse` → JOIN via from/to mapping (+ reverse).
-- [ ] Local test harness: seed a tiny Iceberg table, assert `GetByKey` / `Search` round-trip.
-- [ ] `loom serve` (partial) or a `loom query` dev command to exercise it by hand.
+- [ ] `mcp/registry.py` — Ontology Model → read tool set (`get_` / `search_` / `list_` per
+      object type, generic `traverse`), input schemas from `PropType.json_schema()`.
+- [ ] `loom serve` over stdio, read-only. Hard-rule test: no raw-SQL tool is ever exposed.
+- [ ] `examples/` — a seedable local Iceberg warehouse + the worked-example ontology, so the
+      whole path is runnable by hand and in CI.
 
-**Definition of done:** a test writes rows to a local Iceberg table and reads them back through
-the resolver + DuckDB adapter, including a one-hop link traversal.
+**Definition of done:** a test seeds rows into a local Iceberg table and reads them back through
+the resolver + DuckDB adapter, including a one-hop link traversal — and `loom serve` exposes
+that same ontology as MCP tools, driven end to end over stdio.
+
+**Two decisions taken here:**
+- **Local-first catalog for tests and examples.** pyiceberg's SQLite catalog over a
+  filesystem warehouse (`type: iceberg-sql`) sits behind the same `Catalog` port as
+  `iceberg-rest`, so CI needs no running services. A REST catalog is a config change, not a
+  code change.
+- **DuckDB reads Iceberg through pyiceberg, not the DuckDB Iceberg extension.** The adapter
+  compiles IR to real DuckDB SQL, and `execute()` binds each referenced table as a named
+  relation materialized by a pyiceberg scan — with the scan's own predicate/column pruning
+  pushed down. This avoids a runtime extension install and keeps the adapter honest about
+  dialect lowering.
 
 ---
 
@@ -67,16 +95,18 @@ the resolver + DuckDB adapter, including a one-hop link traversal.
 
 ---
 
-## ⏳ M4 — MCP server (`loom serve`)
+## ⏳ M4 — MCP write surface + transport hardening
 
-*Goal: point any MCP client at the ontology and call typed tools.*
+*Goal: the action runtime shows up as tools; serve over more than stdio.*
 
-- [ ] `mcp/registry.py` — introspect the Ontology Model → tool set at boot.
-- [ ] Per object: `get_<type>` / `search_<type>` / `list_<type>`; generic `traverse`.
+The read tools, the registry, and stdio `loom serve` land in M1 — what's left here is
+everything that depends on M2/M3 or on a second transport.
+
 - [ ] Per action: `run_<action>` with JSON Schema from parameters, description from the spec.
 - [ ] Capability negotiation at serve — validate spec features vs. `engine.capabilities()`.
-- [ ] Hard rule tests: no raw-SQL tool is ever exposed.
-- [ ] `loom serve` over stdio (then HTTP).
+- [ ] HTTP transport alongside stdio.
+- [ ] Structured tool errors — surface validation-rule failures and write conflicts as typed
+      results an agent can act on, not opaque strings.
 
 ---
 
