@@ -7,10 +7,20 @@ name = "loom-ontology"
 version = "0.0.1"
 description = "Declarative ontology framework over Apache Iceberg, wired to agents via MCP"
 requires-python = ">=3.11"
+# The spec module — loading and validating an ontology — stays dependency-free on purpose.
+# Everything that touches storage, compute, or a transport is an extra.
 dependencies = ["pyyaml>=6"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "ruff>=0.6"]
+# Catalog layer: pyiceberg plus the SQLite metastore driver, so a local warehouse needs no services.
+iceberg = ["pyiceberg[sql-sqlite]>=0.9", "pyarrow>=15"]
+# Query layer. pytz is not optional in practice — DuckDB needs it to convert a `timestamptz`
+# column back to a Python datetime, which any spec with a `timestamp` property will hit.
+duckdb = ["duckdb>=1.0", "pytz"]
+# Agent layer. The 2.x lowlevel Server API (on_list_tools/on_call_tool) is what mcp/server.py uses.
+mcp = ["mcp>=2.0"]
+all = ["loom-ontology[iceberg,duckdb,mcp]"]
 
 [project.scripts]
 loom = "loom.cli:main"
@@ -20,3 +30,14 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "UP", "B"]
+ignore = [
+    "E501",  # long lines are usually aligned YAML/SQL fixtures; line-length above is the guard
+    "B008",  # dataclass field(default_factory=...) reads as a call in a default
+]

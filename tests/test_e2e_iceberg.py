@@ -1,0 +1,251 @@
+"""End to end over a real Iceberg table — M1's definition of done.
+
+Seeds a local Iceberg warehouse, then reads it back through the whole stack: catalog port ->
+pyiceberg -> Arrow -> DuckDB SQL -> resolver -> MCP tool dispatch. Nothing is stubbed.
+
+It runs the *shipped example* rather than a bespoke fixture, copied to a tmp dir, so a broken
+`examples/retail` fails CI instead of quietly rotting.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import shutil
+from datetime import UTC
+from pathlib import Path
+
+import pytest
+
+from loom import build
+from loom.config import find_config, load_config
+from loom.errors import Diagnostics
+
+pytest.importorskip("pyiceberg", reason="needs the [iceberg] extra")
+pytest.importorskip("duckdb", reason="needs the [duckdb] extra")
+
+EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "retail"
+
+
+def _load_seed_module(path: Path):
+    spec = importlib.util.spec_from_file_location("retail_seed", path / "seed.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def project(tmp_path_factory):
+    """A seeded copy of examples/retail, with its ontology and config loaded."""
+    root = tmp_path_factory.mktemp("retail")
+    target = root / "retail"
+    shutil.copytree(EXAMPLE, target, ignore=shutil.ignore_patterns(".warehouse"))
+
+    _load_seed_module(target).seed(target)
+
+    diag = Diagnostics()
+    config = load_config(find_config(target / "ontology"), diag)
+    ontology, _ = build(target / "ontology")
+    diag.raise_if_errors()
+    return ontology, config
+
+
+@pytest.fixture(scope="module")
+def catalogs(project):
+    from loom.catalog import open_catalogs
+
+    return open_catalogs(project[1])
+
+
+@pytest.fixture(scope="module")
+def resolver(project, catalogs):
+    from loom.resolver import build_resolver
+
+    return build_resolver(project[0], project[1], catalogs)
+
+
+# ---- catalog + physical validation ---------------------------------------------
+
+
+def test_the_example_validates_against_its_own_warehouse(project, catalogs):
+    """The spec and the seeded tables genuinely agree — the contract holds on real metadata."""
+    from loom.loader import load_dir
+    from loom.validator import check_physical, validate
+
+    ontology, config = project
+    diag = Diagnostics()
+    loaded = load_dir(Path(config.source).parent / "ontology", diag)
+    validate(loaded, diag)
+    check_physical(loaded, catalogs, diag)
+    assert [e.render() for e in diag.errors] == []
+    assert [w.render() for w in diag.warnings] == []
+
+
+def test_catalog_introspection_reports_real_iceberg_types(catalogs):
+    schema = catalogs["local"].describe("sales.orders")
+    assert {c.name: c.iceberg_type for c in schema.columns.values()} == {
+        "id": "string",
+        "customer_id": "string",
+        # Normalized to the spelling PropType.iceberg_type() produces — pyiceberg says
+        # "decimal(12, 2)" with a space.
+        "total_amount": "decimal(12,2)",
+        "created_at": "timestamptz",
+    }
+    assert schema.columns["id"].required is True
+
+
+def test_physical_validation_catches_a_spec_that_drifts_from_the_table(project, catalogs):
+    """Rename a column in the spec only, and the pass says so."""
+    from loom.loader import load_dir
+    from loom.validator import check_physical
+
+    _, config = project
+    ontology_dir = Path(config.source).parent / "ontology"
+    original = (ontology_dir / "customer.yaml").read_text()
+    try:
+        (ontology_dir / "customer.yaml").write_text(original.replace("column: full_name", "column: fullname"))
+        diag = Diagnostics()
+        check_physical(load_dir(ontology_dir, diag), catalogs, diag)
+        messages = " | ".join(e.message for e in diag.errors)
+        assert "maps to column 'fullname', which does not exist" in messages
+    finally:
+        (ontology_dir / "customer.yaml").write_text(original)
+
+
+# ---- reads ---------------------------------------------------------------------
+
+
+def test_get_returns_a_real_row(resolver):
+    assert resolver.get("Customer", "c1") == {
+        "customerId": "c1",
+        "name": "Ada Lovelace",
+        "tier": "gold",
+        "ltv": 48210.50,
+    }
+
+
+def test_get_a_missing_key_is_none(resolver):
+    assert resolver.get("Customer", "nobody") is None
+
+
+def test_get_preserves_decimal_and_timestamp_types(resolver):
+    from datetime import datetime
+    from decimal import Decimal
+
+    order = resolver.get("Order", "o1")
+    assert order["total"] == Decimal("1299.99")
+    assert order["placedAt"] == datetime(2026, 1, 4, 12, 0, tzinfo=UTC)
+
+
+def test_list_is_ordered_by_primary_key(resolver):
+    assert [c["customerId"] for c in resolver.list("Customer")] == ["c1", "c2", "c3"]
+
+
+def test_search_substring_is_case_insensitive(resolver):
+    """`name` is declared searchable, so "LOVE" finds "Ada Lovelace"."""
+    assert [c["customerId"] for c in resolver.search("Customer", {"name": "LOVE"})] == ["c1"]
+
+
+def test_search_matches_a_substring_across_rows(resolver):
+    assert [c["customerId"] for c in resolver.search("Customer", {"name": "ace"})] == ["c1", "c2"]
+
+
+def test_search_on_an_enum_is_exact(resolver):
+    assert [c["customerId"] for c in resolver.search("Customer", {"tier": "gold"})] == ["c1"]
+
+
+def test_search_filters_are_anded(resolver):
+    assert resolver.search("Customer", {"name": "ace", "tier": "silver"}) == [
+        {"customerId": "c2", "name": "Grace Hopper", "tier": "silver", "ltv": 12750.0}
+    ]
+
+
+def test_nullable_property_comes_back_as_none(resolver):
+    assert resolver.get("Customer", "c3")["ltv"] is None
+
+
+def test_paging_is_stable_across_pages(resolver):
+    """The ORDER BY is what makes this true; without it page 2 could repeat page 1."""
+    page1 = resolver.list("Customer", limit=2, offset=0)
+    page2 = resolver.list("Customer", limit=2, offset=2)
+    assert [c["customerId"] for c in page1] == ["c1", "c2"]
+    assert [c["customerId"] for c in page2] == ["c3"]
+
+
+# ---- traversal -----------------------------------------------------------------
+
+
+def test_reverse_traverse_returns_the_linked_objects(resolver):
+    """Customer -> orders, via the link's reverseName."""
+    orders = resolver.traverse("Customer", "c2", "orders")
+    assert [o["orderId"] for o in orders] == ["o3", "o4", "o5"]
+
+
+def test_forward_traverse_joins_back_to_the_one_side(resolver):
+    """Order -> placedBy. The join column is not Order's primary key, so this is a real JOIN."""
+    assert [c["customerId"] for c in resolver.traverse("Order", "o3", "placedBy")] == ["c2"]
+    assert resolver.traverse("Order", "o3", "placedBy")[0]["name"] == "Grace Hopper"
+
+
+def test_traverse_from_an_object_with_no_links_is_empty_not_an_error(resolver):
+    assert resolver.traverse("Customer", "c3", "orders") == []
+
+
+def test_traverse_of_a_nonexistent_anchor_is_empty(resolver):
+    assert resolver.traverse("Customer", "nobody", "orders") == []
+
+
+def test_traverse_pages(resolver):
+    assert [o["orderId"] for o in resolver.traverse("Customer", "c2", "orders", limit=2)] == ["o3", "o4"]
+    assert [o["orderId"] for o in resolver.traverse("Customer", "c2", "orders", limit=2, offset=2)] == ["o5"]
+
+
+# ---- the MCP surface over real data --------------------------------------------
+
+
+def test_the_generated_tools_answer_from_the_warehouse(project, catalogs):
+    from loom.mcp.server import build_server
+
+    server, _ = build_server(project[0], project[1], catalogs)
+    assert set(server.tools) == {
+        "get_customer",
+        "search_customer",
+        "list_customer",
+        "get_order",
+        "search_order",
+        "list_order",
+        "traverse",
+    }
+
+    text, is_error = server.call("get_customer", {"key": "c1"})
+    assert is_error is False
+    assert json.loads(text)["object"]["name"] == "Ada Lovelace"
+
+
+def test_a_tool_call_carries_money_as_a_string(project, catalogs):
+    from loom.mcp.server import build_server
+
+    server, _ = build_server(project[0], project[1], catalogs)
+    text, _ = server.call("get_order", {"key": "o1"})
+    assert json.loads(text)["object"]["total"] == "1299.99"
+
+
+def test_traverse_tool_walks_the_link(project, catalogs):
+    from loom.mcp.server import build_server
+
+    server, _ = build_server(project[0], project[1], catalogs)
+    text, is_error = server.call("traverse", {"objectType": "Customer", "key": "c2", "link": "orders"})
+    payload = json.loads(text)
+    assert is_error is False
+    assert payload["targetObjectType"] == "Order"
+    assert [o["orderId"] for o in payload["objects"]] == ["o3", "o4", "o5"]
+
+
+def test_an_agent_sending_a_key_as_the_wrong_json_type_still_gets_its_row(project, catalogs):
+    """`total` is a decimal; a filter arriving as a JSON number must not be compared as a float."""
+    from loom.mcp.server import build_server
+
+    server, _ = build_server(project[0], project[1], catalogs)
+    text, is_error = server.call("search_order", {"filter": {"orderId": "o1"}})
+    assert is_error is False
+    assert json.loads(text)["count"] == 1
