@@ -2,18 +2,27 @@
 
 Runs after the structural loader. Everything here needs more than one declaration in scope:
 do links point at real objects and properties? does an action stay single-object? do
-expressions reference only declared parameters and the target object's properties? Physical
-checks (does the backing table/column actually exist, is the type promotion-compatible) need a
-live catalog and are deferred to plan/serve — see check_physical() stub at the bottom.
+expressions reference only declared parameters and the target object's properties?
+
+Physical checks (does the backing table/column actually exist, is the type promotion-compatible)
+need a live catalog, so they live in `check_physical()` at the bottom and run only when one is
+bound — `loom validate` stays structural and offline, `loom validate --physical` adds that pass.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
+from ._shape import suggest
 from .errors import Diagnostics, SourceLoc
 from .expr import FUNCTIONS, Binary, Call, Expr, Literal, Ref, Unary
 from .loader import _Loaded
-from .model import Action, LinkType, ObjectType
-from .types import PropType
+from .model import Action, LinkType, ObjectType, Property
+from .types import PropType, promotable
+
+if TYPE_CHECKING:  # the port is a type-only dependency — importing it would drag in the catalog
+    from .catalog.base import Catalog, Column, TableSchema
 
 _COMPARISONS = {"==", "!=", "<", "<=", ">", ">="}
 _BOOLEANS = {"&&", "||"}
@@ -272,8 +281,110 @@ class _ExprChecker:
         return t is not None and t.kind in ("string", "enum")
 
 
-def check_physical(loaded: _Loaded, catalog, diag: Diagnostics) -> None:  # pragma: no cover - deferred
-    """Physical-plane validation against a live Iceberg catalog: table/column existence and
-    type promotion-compatibility (§2 rule 7). Deferred until the catalog module lands; the
-    rule set is specified, only the introspection is missing."""
-    raise NotImplementedError("physical validation requires a bound Iceberg catalog (post-v0)")
+def check_physical(loaded: _Loaded, catalogs: Mapping[str, Catalog], diag: Diagnostics) -> None:
+    """Physical-plane validation against live catalogs: table/column existence and type
+    promotion-compatibility (§2 rule 7).
+
+    Split from `validate()` because it needs a bound catalog and network — `loom validate` is
+    structural and offline by default, `loom validate --physical` adds this pass. Same
+    accumulate-everything contract: an unreachable table is one error, not an exception, so a
+    spec author sees the whole list.
+
+    `catalogs` maps the names used in `backing.catalog` to `Catalog` port implementations.
+    """
+    for obj in loaded.objects.values():
+        schema = _describe(
+            catalogs, obj.backing_catalog, obj.backing_table, obj.loc, f"objectType '{obj.api_name}'", diag
+        )
+        if schema is None:
+            continue
+        for prop in obj.properties.values():
+            col = schema.columns.get(prop.column)
+            if col is None:
+                diag.error(
+                    f"property '{prop.name}' maps to column '{prop.column}', which does not exist "
+                    f"in '{obj.backing_table}'",
+                    obj.loc,
+                    suggest(prop.column, schema.columns),
+                )
+                continue
+            _check_column_type(obj, prop, col, loaded, diag)
+            _check_column_nullability(obj, prop, col, diag)
+
+    for link in loaded.links.values():
+        if link.through is None:
+            continue
+        schema = _describe(
+            catalogs, link.through.catalog, link.through.table, link.loc, f"linkType '{link.api_name}'", diag
+        )
+        if schema is None:
+            continue
+        for side, column in (("fromColumn", link.through.from_column), ("toColumn", link.through.to_column)):
+            if column not in schema.columns:
+                diag.error(
+                    f"through.{side} '{column}' does not exist in '{link.through.table}'",
+                    link.loc,
+                    suggest(column, schema.columns),
+                )
+
+
+def _describe(
+    catalogs: Mapping[str, Catalog], catalog_name: str, table: str, loc, ctx: str, diag: Diagnostics
+) -> TableSchema | None:
+    catalog = catalogs.get(catalog_name)
+    if catalog is None:
+        diag.error(
+            f"{ctx}: backing catalog '{catalog_name}' is not declared in loom.yaml",
+            loc,
+            suggest(catalog_name, catalogs),
+        )
+        return None
+    if not catalog.table_exists(table):
+        diag.error(f"{ctx}: table '{table}' does not exist in catalog '{catalog_name}'", loc)
+        return None
+    try:
+        return catalog.describe(table)
+    except Exception as e:
+        diag.error(f"{ctx}: could not introspect '{table}': {e}", loc)
+        return None
+
+
+def _physical_type(prop_type: PropType, loaded: _Loaded) -> str | None:
+    """The Iceberg type a property's values are actually stored as. Only objectRef needs
+    resolving — it travels as the referenced object type's primary key."""
+    if prop_type.kind == "objectRef":
+        ref = loaded.objects.get(prop_type.object_type or "")
+        return ref.pk_property.type.iceberg_type() if ref is not None else None
+    return prop_type.iceberg_type()
+
+
+def _check_column_type(obj: ObjectType, prop: Property, col: Column, loaded: _Loaded, diag: Diagnostics) -> None:
+    declared = _physical_type(prop.type, loaded)
+    if declared is None:  # unresolvable objectRef — already reported by the referential pass
+        return
+    if not promotable(col.iceberg_type, declared):
+        diag.error(
+            f"property '{prop.name}' declares '{prop.type.kind}' (Iceberg {declared}) but column "
+            f"'{prop.column}' is {col.iceberg_type}, which does not promote to it",
+            obj.loc,
+        )
+
+
+def _check_column_nullability(obj: ObjectType, prop: Property, col: Column, diag: Diagnostics) -> None:
+    """A nullable column under a non-nullable property is a real mismatch, but only fatal for the
+    primary key: a null key breaks get-by-key and any join through it. Elsewhere it is extremely
+    common in existing lakes, so it warns rather than blocking a read-only spec."""
+    if prop.nullable or col.required:
+        return
+    if prop.name == obj.primary_key:
+        diag.error(
+            f"primary key '{prop.name}' maps to column '{prop.column}', which is optional in "
+            f"'{obj.backing_table}' — a null key cannot be addressed",
+            obj.loc,
+        )
+    else:
+        diag.warn(
+            f"property '{prop.name}' is declared non-nullable but column '{prop.column}' is "
+            f"optional in '{obj.backing_table}'",
+            obj.loc,
+        )

@@ -31,7 +31,11 @@ _ICEBERG = {
 
 # Iceberg's own promotion rules — widening only. Used when checking a property's declared
 # type against its backing column, and when checking link join-property comparability.
-_PROMOTIONS = frozenset({("int", "long"), ("int", "double"), ("long", "double")})
+# ("float", "double") is reachable only from the physical side: Loom has no `float` kind, so a
+# float column can back a double property but no Loom type ever compares as one.
+_PROMOTIONS = frozenset(
+    {("int", "long"), ("int", "double"), ("long", "double"), ("float", "double")}
+)
 
 
 @dataclass(frozen=True)
@@ -72,7 +76,7 @@ class PropType:
             return {"type": "string", "description": f"key of a {self.object_type}"}
         raise AssertionError(f"unhandled kind {k!r}")
 
-    def comparable_to(self, other: "PropType") -> bool:
+    def comparable_to(self, other: PropType) -> bool:
         """Whether two types can be compared/joined (link join props, expr comparisons).
         Same kind, or a numeric widening pair. enum compares as its string storage."""
         a, b = self._numeric_base(), other._numeric_base()
