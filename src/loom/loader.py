@@ -11,13 +11,16 @@ reports everything at once.
 
 from __future__ import annotations
 
-import difflib
 from pathlib import Path
 
 import yaml
 
+from ._shape import check_keys as _check_keys
+from ._shape import require as _require
+from ._shape import suggest as _suggest
 from .errors import Diagnostics, SourceLoc
-from .expr import ExprError, parse as parse_expr
+from .expr import ExprError
+from .expr import parse as parse_expr
 from .model import (
     Action,
     Effect,
@@ -29,7 +32,7 @@ from .model import (
     ThroughTable,
     ValidationRule,
 )
-from .types import ALL_KINDS, SCALAR_KINDS, PropType
+from .types import ALL_KINDS, PropType
 
 KINDS = ("objectType", "linkType", "action")
 
@@ -111,24 +114,6 @@ def _register(registry: dict, name: str, value: object, kind: str, rel: str, dia
 
 
 # ---- shared helpers ------------------------------------------------------------
-
-
-def _suggest(bad: str, options) -> str | None:
-    match = difflib.get_close_matches(bad, list(options), n=1)
-    return f"did you mean '{match[0]}'?" if match else None
-
-
-def _check_keys(raw: dict, allowed: set[str], loc: SourceLoc, diag: Diagnostics, ctx: str) -> None:
-    for k in raw:
-        if k not in allowed:
-            diag.error(f"unexpected key '{k}' in {ctx}", loc, _suggest(k, allowed))
-
-
-def _require(raw: dict, key: str, loc: SourceLoc, diag: Diagnostics, ctx: str):
-    if key not in raw or raw[key] is None:
-        diag.error(f"missing required key '{key}' in {ctx}", loc)
-        return None
-    return raw[key]
 
 
 def _api_name(raw: dict, loc: SourceLoc, diag: Diagnostics, ctx: str) -> str | None:
