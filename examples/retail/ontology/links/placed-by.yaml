@@ -1,0 +1,8 @@
+linkType:
+  apiName: placedBy
+  description: The customer who placed this order
+  cardinality: many_to_one
+  from: { objectType: Order,    property: customerId }
+  to:   { objectType: Customer, property: customerId }
+  # Gives Customer the reverse hop, so `traverse(Customer, key, "orders")` works too.
+  reverseName: orders

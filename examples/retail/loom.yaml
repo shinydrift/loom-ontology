@@ -1,0 +1,18 @@
+version: 0
+
+catalogs:
+  # A real Iceberg catalog with nothing to install and nothing to run: pyiceberg's SQL catalog
+  # keeps metadata in SQLite and table data on the local filesystem. Swapping this block for a
+  # `type: iceberg-rest` entry is the only change needed to point the same ontology at a
+  # production lake — no spec edits, no code changes.
+  local:
+    type: iceberg-sql
+    uri: sqlite:///.warehouse/catalog.db
+    warehouse: file://.warehouse
+
+engine:
+  type: duckdb
+
+mcp:
+  name: loom-retail
+  transport: stdio
