@@ -206,6 +206,143 @@ objectType:
     assert impl.load_table("hr.people").scan().to_arrow().to_pylist() == [{"id": "p1", "headcount": 7}]
 
 
+def _people_table(config, *, column: str = "headcount"):
+    """A populated `hr.people` outside the example spec, so a rename has real rows to survive."""
+    import pyarrow as pa
+    from pyiceberg.catalog.sql import SqlCatalog
+    from pyiceberg.schema import Schema
+    from pyiceberg.types import IntegerType, NestedField, StringType
+
+    cfg = config.catalogs["local"]
+    impl = SqlCatalog("local", uri=cfg.uri, warehouse=cfg.warehouse)
+    impl.create_namespace("hr")
+    impl.create_table(
+        "hr.people",
+        schema=Schema(
+            NestedField(1, "id", StringType(), required=True),
+            NestedField(2, column, IntegerType(), required=False),
+        ),
+    ).append(
+        pa.table(
+            {"id": ["p1", "p2"], column: [7, 9]},
+            schema=pa.schema([pa.field("id", pa.string(), nullable=False), pa.field(column, pa.int32())]),
+        )
+    )
+    return impl
+
+
+def _person_spec(target: Path, body: str) -> None:
+    (target / "ontology" / "person.yaml").write_text(
+        f"""
+objectType:
+  apiName: Person
+  primaryKey: id
+  title: id
+  backing: {{ catalog: local, table: hr.people }}
+  properties:
+    - {{ name: id, type: string, column: id, unique: true }}
+{body}
+"""
+    )
+
+
+def test_a_rename_keeps_the_field_id_and_the_rows(project):
+    """M2's `renamedFrom` promise, against a real metastore: a moved column is the *same* column
+    under a new name, so nothing is rewritten and nothing is stranded. The fake catalog would agree
+    to anything here — only Iceberg can actually be asked."""
+    target, _, config = project
+    impl = _people_table(config)
+    before = _local(config).describe("hr.people")
+
+    _person_spec(target, "    - { name: headcount, type: int, column: staff_count, nullable: true, renamedFrom: headcount }")
+    edited, _ = build(target / "ontology")
+    result = _apply(target, edited, _catalogs(config))
+
+    assert result.status == APPLIED, result.error
+    after = _local(config).describe("hr.people")
+    assert "headcount" not in after.columns
+    # The same field id, which is what every existing data file is keyed by...
+    assert after.columns["staff_count"].field_id == before.columns["headcount"].field_id == 2
+    assert after.columns["staff_count"].iceberg_type == "int"
+    # ...so the rows written before the rename read back under the new name, unrewritten.
+    assert impl.load_table("hr.people").scan().to_arrow().to_pylist() == [
+        {"id": "p1", "staff_count": 7},
+        {"id": "p2", "staff_count": 9},
+    ]
+
+
+def test_a_rename_and_a_promotion_commit_as_one_ordered_transaction(project):
+    """The edit ordering, proven against the API it exists for. pyiceberg's `UpdateSchema` resolves
+    every path against the schema the transaction opened with, so the promotion that follows a
+    rename has to be issued against the *old* name — asking for the new one raises "Could not find
+    field". That translation is the adapter's, and it only works because the rename arrives first."""
+    target, _, config = project
+    impl = _people_table(config)
+
+    _person_spec(target, "    - { name: headcount, type: long, column: staff_count, nullable: true, renamedFrom: headcount }")
+    edited, _ = build(target / "ontology")
+    result = _apply(target, edited, _catalogs(config))
+
+    assert result.status == APPLIED, result.error
+    after = _local(config).describe("hr.people")
+    assert after.columns["staff_count"].iceberg_type == "long"
+    assert after.columns["staff_count"].field_id == 2
+    assert impl.load_table("hr.people").scan().to_arrow().to_pylist() == [
+        {"id": "p1", "staff_count": 7},
+        {"id": "p2", "staff_count": 9},
+    ]
+    # One Iceberg schema commit for both edits, not two — there is never a moment where a reader
+    # could see the table renamed but not yet promoted. Two transactions would leave schema id 2.
+    metadata = impl.load_table("hr.people").metadata
+    assert (len(metadata.schemas), metadata.current_schema_id) == (2, 1)
+
+
+def test_the_spec_keeps_renamed_from_after_the_rename_has_landed(project):
+    """Lifetime, against a real catalog. The key is spent, the plan is empty, and Loom says nothing
+    about it — because the same file is deployed to lakes that have not run this yet."""
+    target, _, config = project
+    _people_table(config)
+    _person_spec(target, "    - { name: headcount, type: int, column: staff_count, nullable: true, renamedFrom: headcount }")
+    edited, _ = build(target / "ontology")
+
+    first = _apply(target, edited, _catalogs(config))
+    second = _apply(target, edited, _catalogs(config))
+
+    assert (first.status, second.status) == (APPLIED, UP_TO_DATE)
+    assert second.tables == ()
+    # And the physical validator is clean too, with the spent key still in the file.
+    from loom.loader import load_dir
+    from loom.validator import check_physical
+
+    diag = Diagnostics()
+    check_physical(load_dir(target / "ontology", diag), _catalogs(config), diag)
+    assert [e.render() for e in diag.errors] == []
+
+    # Which version performed the rename is recorded, since that — not a warning on every plan — is
+    # what answers "is it safe to drop `renamedFrom` yet?" for a given lake.
+    entry = MetaStore(_local(config)).latest()
+    people = [e for e in entry.summary_data() if e["table"] == "local.hr.people"]
+    assert people == [{"table": "local.hr.people", "action": "alter", "columns": ["staff_count: renamed from headcount"]}]
+
+
+def test_a_rename_onto_a_column_that_already_exists_is_refused(project):
+    """Both columns live — a half-finished migration. Loom refuses rather than guessing which one
+    holds the values, and leaves the table exactly as it found it."""
+    target, _, config = project
+    impl = _people_table(config)
+    with impl.load_table("hr.people").update_schema() as update:
+        update.add_column(path="staff_count", field_type=__import__("pyiceberg.types", fromlist=["LongType"]).LongType())
+
+    _person_spec(target, "    - { name: headcount, type: long, column: staff_count, nullable: true, renamedFrom: headcount }")
+    edited, _ = build(target / "ontology")
+    result = _apply(target, edited, _catalogs(config))
+
+    assert result.status == REFUSED
+    assert "cannot merge them" in result.error
+    live = _local(config).describe("hr.people")
+    assert set(live.columns) == {"id", "headcount", "staff_count"}, "nothing was touched"
+
+
 def test_a_breaking_change_leaves_the_live_table_alone(project):
     target, ontology, config = project
     _apply(target, ontology, _catalogs(config))

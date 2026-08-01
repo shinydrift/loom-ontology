@@ -47,9 +47,12 @@ REFUSED = "refused"
 FAILED = "failed"
 """Something went wrong mid-run. `ApplyResult.tables` says what had already landed."""
 
-# The safe/physical-safe column kinds, mapped to the write port's vocabulary. A kind that isn't
-# here is breaking by construction (`retype`, `tighten`) and is refused before this is consulted.
-_OPS = {"add": "add", "promote": "promote", "loosen": "relax"}
+# The executable column kinds, mapped to the write port's vocabulary. A kind that isn't here is
+# breaking by construction (`retype`, `tighten`) and is refused before this is consulted. `rename`
+# is here because a rename is normally safe; its one breaking form — the old and new columns both
+# live, which Loom cannot merge without dropping — is refused with the rest of the plan, so it
+# never reaches an edit either.
+_OPS = {"add": "add", "rename": "rename", "promote": "promote", "loosen": "relax"}
 
 
 @dataclass(frozen=True)
@@ -204,7 +207,9 @@ def _column(change: ColumnChange) -> Column:
 
 
 def _edit(change: ColumnChange) -> SchemaEdit:
-    return SchemaEdit(op=_OPS[change.kind], column=_column(change))
+    """Order is preserved from the plan, and that is load-bearing: `_alteration` emits a column's
+    rename ahead of anything else it needs, and `alter_table` is documented to rely on it."""
+    return SchemaEdit(op=_OPS[change.kind], column=_column(change), renamed_from=change.renamed_from)
 
 
 def _record(

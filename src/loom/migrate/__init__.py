@@ -3,9 +3,9 @@
 `plan` is pure read: it derives the tables the spec *wants* (`schema.py`), compares them against
 what the catalog actually holds (`diff.py`), and prints the classified result (`render.py`).
 `apply` executes that same plan (`executor.py`) and records it (`meta.py`). What remains of M2 is
-`renamedFrom` field-id remapping and rollback.
+rollback.
 
-Four rules shape the whole package:
+Five rules shape the whole package:
 
 - **The live catalog is the baseline, not a state file.** `Catalog.describe()` already returns
   column types and Iceberg field ids, which is everything a diff needs. `_loom_meta` records what
@@ -15,6 +15,10 @@ Four rules shape the whole package:
 - **Loom never proposes a drop.** An objectType maps a *subset* of a table's columns, so a column
   no property mentions is not evidence of a deleted property — it's someone else's data. Those
   columns are reported as unmanaged and left alone.
+- **A rename is a remap, not an add.** `renamedFrom` makes a moved column keep its field id, so no
+  data file is rewritten and nothing is stranded. Because the baseline is the live catalog, the
+  key stays in the spec after its migration lands and plans as a clean no-op — see `diff._renamed`
+  for the three live shapes, and `diff._unmergeable` for the fourth, which Loom refuses.
 - **A breaking plan is refused whole.** Not partially applied. See `executor._refusal`.
 - **Writes go through a separate port.** `apply` asks the catalog layer for a `CatalogWriter`;
   everything else in Loom holds a read-only `Catalog` and could not execute DDL if it tried.

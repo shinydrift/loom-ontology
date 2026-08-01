@@ -203,22 +203,35 @@ class PyIcebergCatalog:
                 if properties:
                     txn.set_properties(**dict(properties))
                 with txn.update_schema() as update:
+                    # `UpdateSchema` resolves every `path=` against the schema the transaction
+                    # opened with, not against the edits accumulated so far — so after a rename,
+                    # a promotion of that same column must *still* name the old column, and asking
+                    # for the new one raises "Could not find field with name ...". This map is that
+                    # translation, and it is why `alter_table` requires renames to arrive first.
+                    renamed: dict[str, str] = {}
                     for edit in edits:
-                        self._edit(update, edit)
+                        self._edit(update, edit, renamed)
         except Exception as e:
             raise CatalogError(f"could not alter '{table}' in catalog '{self.name}': {e}") from e
         self._schema_cache.pop(table, None)
 
-    def _edit(self, update: Any, edit: SchemaEdit) -> None:
+    def _edit(self, update: Any, edit: SchemaEdit, renamed: dict[str, str]) -> None:
         col = edit.column
+        # Everything but `add` addresses a column that already exists, so it goes through the
+        # pre-rename name when this batch has renamed it. `add` never does — the whole point of an
+        # add is that no field is there yet.
+        path = renamed.get(col.name, col.name)
         if edit.op == "add":
             # Never `required=True`: pyiceberg rejects it without allow_incompatible_changes, and
             # so does Loom — an added required column is classified breaking and never reaches here.
             update.add_column(path=col.name, field_type=iceberg_type(col.iceberg_type))
+        elif edit.op == "rename":
+            update.rename_column(edit.renamed_from, col.name)
+            renamed[col.name] = edit.renamed_from
         elif edit.op == "promote":
-            update.update_column(path=col.name, field_type=iceberg_type(col.iceberg_type))
+            update.update_column(path=path, field_type=iceberg_type(col.iceberg_type))
         elif edit.op == "relax":
-            update.make_column_optional(col.name)
+            update.make_column_optional(path)
         else:  # pragma: no cover - the executor builds these, so this is a programming error
             raise CatalogError(f"unsupported schema edit '{edit.op}' on column '{col.name}'")
 

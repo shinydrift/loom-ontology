@@ -38,10 +38,11 @@ KINDS = ("objectType", "linkType", "action")
 
 _OBJECT_KEYS = {"apiName", "displayName", "description", "primaryKey", "title", "status", "backing", "properties", "searchable"}
 _BACKING_KEYS = {"catalog", "table"}
-_PROPERTY_KEYS = {"name", "type", "column", "nullable", "unique", "values", "precision", "scale", "description"}
+_PROPERTY_KEYS = {"name", "type", "column", "renamedFrom", "nullable", "unique", "values", "precision", "scale", "description"}
 _LINK_KEYS = {"apiName", "displayName", "description", "cardinality", "from", "to", "reverseName", "through", "status"}
 _END_KEYS = {"objectType", "property"}
-_THROUGH_KEYS = {"catalog", "table", "fromColumn", "toColumn"}
+_THROUGH_KEYS = {"catalog", "table", "fromColumn", "toColumn", "renamedFrom"}
+_THROUGH_RENAME_KEYS = {"fromColumn", "toColumn"}
 _ACTION_KEYS = {"apiName", "displayName", "description", "targetObjectType", "operation", "parameters", "validation", "effects", "status"}
 _PARAM_KEYS = {"name", "type", "objectType", "required", "default", "values", "precision", "scale", "description"}
 _EFFECT_OPS = {"createObject", "modifyObject", "deleteObject"}
@@ -153,6 +154,25 @@ def _parse_type(raw: dict, loc: SourceLoc, diag: Diagnostics, ctx: str) -> PropT
     return PropType(kind=t, values=values, object_type=object_type, precision=precision, scale=scale)
 
 
+def _parse_renamed_from(raw: object, column: object, loc: SourceLoc, diag: Diagnostics, ctx: str) -> str | None:
+    """The structural half of `renamedFrom` (§2 rules 8-9): a non-empty string naming a *different*
+    column. Everything else about a rename needs the other declarations on the same table in
+    scope, so it lives in the validator."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw:
+        diag.error(f"'renamedFrom' in {ctx} must be a non-empty column name", loc)
+        return None
+    if raw == column:
+        diag.error(
+            f"'renamedFrom' in {ctx} names its own column '{raw}'",
+            loc,
+            "a rename needs an old name and a new one — drop the key if the column did not move",
+        )
+        return None
+    return raw
+
+
 def _parse_expr_field(text: object, loc: SourceLoc, diag: Diagnostics, ctx: str):
     if not isinstance(text, str):
         diag.error(f"{ctx} must be a string expression", loc)
@@ -231,6 +251,7 @@ def _parse_property(raw: object, loc: SourceLoc, diag: Diagnostics) -> Property 
     name = _require(raw, "name", loc, diag, "property")
     column = _require(raw, "column", loc, diag, "property")
     ptype = _parse_type(raw, loc, diag, f"property '{name}'")
+    renamed_from = _parse_renamed_from(raw.get("renamedFrom"), column, loc, diag, f"property '{name}'")
     if name is None or column is None or ptype is None:
         return None
     return Property(
@@ -240,6 +261,7 @@ def _parse_property(raw: object, loc: SourceLoc, diag: Diagnostics) -> Property 
         nullable=bool(raw.get("nullable", False)),
         unique=bool(raw.get("unique", False)),
         description=raw.get("description"),
+        renamed_from=renamed_from,
         loc=loc,
     )
 
@@ -271,8 +293,9 @@ def _parse_link(raw: dict, rel: str, diag: Diagnostics) -> LinkType | None:
             t = _require(th, "table", loc, diag, "through")
             fc = _require(th, "fromColumn", loc, diag, "through")
             tc = _require(th, "toColumn", loc, diag, "through")
+            frn, trn = _parse_through_renames(th.get("renamedFrom"), fc, tc, loc, diag)
             if None not in (c, t, fc, tc):
-                through = ThroughTable(c, t, fc, tc)
+                through = ThroughTable(c, t, fc, tc, frn, trn)
         else:
             diag.error("'through' must be a mapping", loc)
 
@@ -293,6 +316,24 @@ def _parse_link(raw: dict, rel: str, diag: Diagnostics) -> LinkType | None:
         description=raw.get("description"),
         status=status,
         loc=loc,
+    )
+
+
+def _parse_through_renames(
+    raw: object, from_column: object, to_column: object, loc: SourceLoc, diag: Diagnostics
+) -> tuple[str | None, str | None]:
+    """`through.renamedFrom` is a mapping keyed by the very fields it renames, rather than two
+    `fromColumnRenamedFrom`-shaped siblings: both columns of a mapping table live in one block, and
+    the flat spelling reads worse the moment there are two of them."""
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        diag.error("'through.renamedFrom' must be a mapping of fromColumn/toColumn to old names", loc)
+        return None, None
+    _check_keys(raw, _THROUGH_RENAME_KEYS, loc, diag, "through.renamedFrom")
+    return (
+        _parse_renamed_from(raw.get("fromColumn"), from_column, loc, diag, "through.fromColumn"),
+        _parse_renamed_from(raw.get("toColumn"), to_column, loc, diag, "through.toColumn"),
     )
 
 

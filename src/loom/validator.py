@@ -18,7 +18,7 @@ from ._shape import suggest
 from .errors import Diagnostics, SourceLoc
 from .expr import FUNCTIONS, Binary, Call, Expr, Literal, Ref, Unary
 from .loader import _Loaded
-from .model import Action, LinkType, ObjectType, Property, physical_type
+from .model import Action, LinkType, ObjectType, Property, check_renames, physical_type
 from .types import PropType, promotable
 
 if TYPE_CHECKING:  # the port is a type-only dependency — importing it would drag in the catalog
@@ -64,6 +64,10 @@ def _validate_object(obj: ObjectType, diag: Diagnostics) -> None:
         else:
             seen_cols[p.column] = p.name
 
+    check_renames(
+        {p.column: (p.renamed_from, f"property '{p.name}'") for p in props.values()}, diag, loc
+    )
+
     for s in obj.searchable:
         if s not in props:
             diag.error(f"searchable entry '{s}' is not a declared property", loc)
@@ -101,6 +105,16 @@ def _validate_link(link: LinkType, loaded: _Loaded, diag: Diagnostics) -> None:
         diag.error("many_to_many link requires a 'through' mapping table", loc)
     if not is_m2m and link.through is not None:
         diag.error(f"'through' is only valid for many_to_many, not {link.cardinality}", loc)
+
+    if link.through is not None:
+        check_renames(
+            {
+                link.through.from_column: (link.through.from_renamed_from, "through.fromColumn"),
+                link.through.to_column: (link.through.to_renamed_from, "through.toColumn"),
+            },
+            diag,
+            loc,
+        )
 
     # reverseName must not collide with anything already exposed on the `to` object.
     if link.reverse_name and to_obj is not None:
@@ -305,7 +319,7 @@ def check_physical(loaded: _Loaded, catalogs: Mapping[str, Catalog], diag: Diagn
                     f"property '{prop.name}' maps to column '{prop.column}', which does not exist "
                     f"in '{obj.backing_table}'",
                     obj.loc,
-                    suggest(prop.column, schema.columns),
+                    _missing_column_hint(prop.renamed_from, prop.column, schema),
                 )
                 continue
             _check_column_type(obj, prop, col, loaded, diag)
@@ -319,12 +333,16 @@ def check_physical(loaded: _Loaded, catalogs: Mapping[str, Catalog], diag: Diagn
         )
         if schema is None:
             continue
-        for side, column in (("fromColumn", link.through.from_column), ("toColumn", link.through.to_column)):
+        sides = (
+            ("fromColumn", link.through.from_column, link.through.from_renamed_from),
+            ("toColumn", link.through.to_column, link.through.to_renamed_from),
+        )
+        for side, column, renamed_from in sides:
             if column not in schema.columns:
                 diag.error(
                     f"through.{side} '{column}' does not exist in '{link.through.table}'",
                     link.loc,
-                    suggest(column, schema.columns),
+                    _missing_column_hint(renamed_from, column, schema),
                 )
 
 
@@ -347,6 +365,18 @@ def _describe(
     except Exception as e:
         diag.error(f"{ctx}: could not introspect '{table}': {e}", loc)
         return None
+
+
+def _missing_column_hint(renamed_from: str | None, column: str, schema: TableSchema) -> str | None:
+    """A pending rename is still a physical mismatch — the read path selects `column` and the table
+    hasn't got one — so this stays an error. But the reason is a migration nobody has run yet, not
+    a typo, and the default "did you mean" would either say nothing or point somewhere unhelpful."""
+    if renamed_from and renamed_from in schema.columns:
+        return (
+            f"its 'renamedFrom' column '{renamed_from}' is still there — run `loom apply` to "
+            f"perform the rename"
+        )
+    return suggest(column, schema.columns)
 
 
 def _check_column_type(obj: ObjectType, prop: Property, col: Column, loaded: _Loaded, diag: Diagnostics) -> None:
