@@ -1,28 +1,35 @@
-"""The plan, as a human reads it.
+"""The plan and its execution, as a human reads them.
 
 Deliberately terraform-shaped, because the job is the same one terraform's plan output does: let
 someone scan a diff and decide whether to run it. The symbols carry the classification —
 `+` adds, `~` changes something in place, `!` is a change that existing data won't survive — so
 the severity of a plan is visible from the left margin before any of the text is read.
 
-Kept apart from `diff.py` so the classification has no opinion about presentation: `apply` will
-consume the same `MigrationPlan`, and a future `--json` is a second renderer, not a rewrite.
+Kept apart from `diff.py` so the classification has no opinion about presentation: `apply` runs
+off the same `MigrationPlan` this prints, and a future `--json` is a second renderer, not a
+rewrite.
 """
 
 from __future__ import annotations
 
 from .diff import LABELS, ColumnChange, MigrationPlan, Severity, TableChange
+from .executor import APPLIED, REFUSED, UP_TO_DATE, ApplyResult, TableOutcome
 
 _COLUMN_SYMBOL = {"add": "+", "promote": "~", "loosen": "~", "retype": "!", "tighten": "!"}
 _BREAKING_SYMBOL = "!"
 _TABLE_SYMBOL = {"create": "+", "alter": "~"}
 
 NO_CHANGES = "No changes — the catalog already matches the ontology."
-DRY_RUN_NOTE = "`loom apply` is not implemented yet — `plan` is a dry run (M2)."
+DRY_RUN_NOTE = "This is a dry run — nothing was changed. Run `loom apply` to execute it."
+BREAKING_NOTE = "`loom apply` will refuse this plan: a breaking change cannot be executed safely."
 
 
-def render_plan(plan: MigrationPlan, title: str | None = None) -> str:
-    """The full plan as one printable block, with no trailing newline."""
+def render_plan(plan: MigrationPlan, title: str | None = None, *, executing: bool = False) -> str:
+    """The full plan as one printable block, with no trailing newline.
+
+    `executing` drops the closing note: `apply` prints the plan too — the same plan, so the reader
+    can check what ran against what was proposed — and telling them there that nothing was changed
+    would be a lie a second before it changes something."""
     if plan.is_empty:
         return "\n".join([NO_CHANGES, *_render_unmanaged(plan)])
 
@@ -33,8 +40,51 @@ def render_plan(plan: MigrationPlan, title: str | None = None) -> str:
     for table in plan.changes:
         lines += _render_table(table, name_width, detail_width)
         lines.append("")
-    lines += [_summary(plan), DRY_RUN_NOTE, *_render_unmanaged(plan)]
+    lines.append(_summary(plan))
+    if not executing:
+        lines.append(BREAKING_NOTE if plan.severity is Severity.BREAKING else DRY_RUN_NOTE)
+    lines += _render_unmanaged(plan)
     return "\n".join(lines)
+
+
+def render_apply(result: ApplyResult) -> str:
+    """What `apply` did, once it has done it.
+
+    Shaped like the plan it executed — same symbols, same order — so the two can be read against
+    each other. A refusal prints the executor's own message rather than a rephrasing of it: the
+    reasons are the plan's, and there is exactly one place they should be written."""
+    if result.status == REFUSED:
+        return result.error
+    if result.status == UP_TO_DATE:
+        return f"Already applied — nothing to do.{_versions(result, ' Recorded as')}"
+
+    lines = [_render_outcome(o) for o in result.tables]
+    if result.status == APPLIED:
+        landed = len(result.applied)
+        lines.append(f"Applied {landed} table change(s).{_versions(result, ' Recorded as')}")
+    else:
+        lines.append(f"Failed: {result.error}")
+        # The distinction that matters after a failed run: Iceberg commits per table, so what
+        # already landed is still there and a re-run picks up from it.
+        lines.append(f"{len(result.applied)} table change(s) had already been committed and remain applied.")
+        lines.append("Re-run `loom plan` — the diff is taken from the live catalog, so it shows what is left.")
+    return "\n".join(lines)
+
+
+def _render_outcome(outcome: TableOutcome) -> str:
+    symbol = "!" if not outcome.ok else _TABLE_SYMBOL[outcome.action]
+    what = "created" if outcome.action == "create" else f"{len(outcome.columns)} change(s) applied"
+    namespace = f" · namespace '{outcome.namespace_created}' created" if outcome.namespace_created else ""
+    tail = f" — FAILED: {outcome.error}" if not outcome.ok else ""
+    return f"  {symbol} {outcome.catalog}.{outcome.table} — {what}{namespace}{tail}"
+
+
+def _versions(result: ApplyResult, prefix: str) -> str:
+    if not result.versions:
+        return ""
+    # One number for the whole apply; the catalogs are named because that is where the row landed.
+    version = max(result.versions.values())
+    return f"{prefix} version {version} in `_loom_meta` ({', '.join(sorted(result.versions))})."
 
 
 def _render_unmanaged(plan: MigrationPlan) -> list[str]:

@@ -104,9 +104,45 @@ def test_an_unreachable_catalog_is_an_error_not_a_traceback(tmp_path, capsys):
     assert "rest_main" in err
 
 
-def test_apply_is_still_a_stub(capsys):
-    assert main(["apply", str(VALID)]) == 2
-    assert "not implemented yet" in capsys.readouterr().err
+def test_apply_without_a_terminal_refuses_rather_than_assuming_yes(tmp_path, capsys):
+    """The safety property of the confirmation prompt is what it does when nobody is there: an
+    `apply` in a pipeline has to be a deliberate `--yes`, not a consequence of stdin being a pipe.
+    pytest captures stdin, so this is exactly that situation."""
+    pytest.importorskip("pyiceberg", reason="needs the [iceberg] extra")
+    ontology = _project(tmp_path)
+    assert main(["apply", str(ontology)]) == 1
+    captured = capsys.readouterr()
+    assert "Plan: 2 to create" in captured.out, "the plan is still shown — you can read it, just not run it"
+    assert "pass --yes" in captured.err
+    assert "aborted" in captured.err
+
+
+def test_apply_creates_the_tables_and_says_where_it_recorded_them(tmp_path, capsys):
+    pytest.importorskip("pyiceberg", reason="needs the [iceberg] extra")
+    ontology = _project(tmp_path)
+    assert main(["apply", str(ontology), "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "+ rest_main.crm.customers — created · namespace 'crm' created" in out
+    assert "Applied 2 table change(s)." in out
+    assert "version 1 in `_loom_meta`" in out
+
+    # ...and again: the second run has nothing to do, which is the idempotency claim end to end.
+    assert main(["apply", str(ontology), "--yes"]) == 0
+    assert "Already applied — nothing to do." in capsys.readouterr().out
+
+
+def test_apply_refuses_a_breaking_plan_and_exits_nonzero(tmp_path, capsys):
+    pytest.importorskip("pyiceberg", reason="needs the [iceberg] extra")
+    ontology = _project(tmp_path)
+    assert main(["apply", str(ontology), "--yes"]) == 0
+    capsys.readouterr()
+
+    customer = ontology / "customer.yaml"
+    customer.write_text(customer.read_text().replace("column: lifetime_value, nullable: true", "column: lifetime_value"))
+    assert main(["apply", str(ontology), "--yes"]) == 1
+    out = capsys.readouterr().out
+    assert "refusing to apply: the plan contains breaking changes" in out
+    assert "nothing was applied" in out
 
 
 def test_plan_needs_a_config_like_every_other_catalog_command(capsys):

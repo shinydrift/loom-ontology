@@ -10,12 +10,15 @@ pyiceberg is imported lazily, inside methods, so that `import loom` and a struct
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .base import CatalogError, Column, TableSchema
+from .base import CatalogError, Column, SchemaEdit, TableSchema
+
+_DECIMAL = re.compile(r"^decimal\((\d+),\s*(\d+)\)$")
 
 
 def canonical_iceberg_type(t: object) -> str:
@@ -27,9 +30,45 @@ def canonical_iceberg_type(t: object) -> str:
     return str(t).replace(" ", "")
 
 
+def iceberg_type(canonical: str):
+    """The inverse: the type system's spelling -> a pyiceberg type object, for DDL.
+
+    Only the spellings `PropType.iceberg_type()` can produce are here, plus the two the physical
+    side already tolerates on a column Loom didn't create (`float`, naive `timestamp`). Anything
+    else is a bug above this line rather than a user error, but it still gets a message that names
+    the spelling instead of a KeyError."""
+    from pyiceberg import types as t
+
+    simple = {
+        "string": t.StringType,
+        "boolean": t.BooleanType,
+        "int": t.IntegerType,
+        "long": t.LongType,
+        "float": t.FloatType,
+        "double": t.DoubleType,
+        "date": t.DateType,
+        "time": t.TimeType,
+        "timestamp": t.TimestampType,
+        "timestamptz": t.TimestamptzType,
+    }
+    if canonical in simple:
+        return simple[canonical]()
+    m = _DECIMAL.match(canonical)
+    if m:
+        return t.DecimalType(int(m.group(1)), int(m.group(2)))
+    raise CatalogError(f"no Iceberg type for '{canonical}'")
+
+
+def _namespace_of(table: str) -> str:
+    """`crm.customers` -> `crm`; `a.b.c` -> `a.b`. Everything but the last segment, because
+    Iceberg namespaces nest and only the final element names the table."""
+    head, _, _ = table.rpartition(".")
+    return head
+
+
 @dataclass
 class PyIcebergCatalog:
-    """Adapts a constructed pyiceberg catalog to the `Catalog` port."""
+    """Adapts a constructed pyiceberg catalog to the `Catalog` and `CatalogWriter` ports."""
 
     name: str
     _impl: Any
@@ -104,6 +143,101 @@ class PyIcebergCatalog:
             return self._impl.load_table(table)
         except Exception as e:
             raise CatalogError(f"table '{table}' not found in catalog '{self.name}': {e}") from e
+
+    # --- CatalogWriter -------------------------------------------------------------------
+    # Every method below invalidates the introspection cache for the table it touched. A cache
+    # that outlives the DDL that stales it is how an `apply` reports a column it never added.
+
+    def ensure_namespace(self, table: str) -> bool:
+        namespace = _namespace_of(table)
+        if not namespace:
+            return False
+        try:
+            if self._impl.namespace_exists(namespace):
+                return False
+            self._impl.create_namespace(namespace)
+        except Exception as e:
+            raise CatalogError(
+                f"could not create namespace '{namespace}' in catalog '{self.name}': {e}"
+            ) from e
+        return True
+
+    def create_table(
+        self, table: str, columns: Sequence[Column], properties: Mapping[str, str] = {}
+    ) -> None:
+        from pyiceberg.schema import Schema
+        from pyiceberg.types import NestedField
+
+        # Field ids are assigned here, densely and in declaration order, because this table has no
+        # history for them to be compatible with yet. Every later change goes through
+        # `alter_table`, where pyiceberg assigns the next id itself — Loom must never reuse one.
+        schema = Schema(
+            *(
+                NestedField(
+                    field_id=i,
+                    name=col.name,
+                    field_type=iceberg_type(col.iceberg_type),
+                    required=col.required,
+                )
+                for i, col in enumerate(columns, start=1)
+            )
+        )
+        try:
+            self._impl.create_table(table, schema=schema, properties=dict(properties))
+        except Exception as e:
+            raise CatalogError(f"could not create table '{table}' in catalog '{self.name}': {e}") from e
+        self._schema_cache.pop(table, None)
+
+    def alter_table(
+        self, table: str, edits: Sequence[SchemaEdit], properties: Mapping[str, str] = {}
+    ) -> None:
+        if not edits and not properties:
+            return
+        tbl = self._load(table)
+        try:
+            # One transaction for the schema edits *and* the properties: Iceberg commits a single
+            # new metadata version, so a reader either sees the whole migration or none of it.
+            # This is as atomic as apply gets — Iceberg has no cross-table transaction, which is
+            # why the executor above sequences tables and reports what landed.
+            with tbl.transaction() as txn:
+                if properties:
+                    txn.set_properties(**dict(properties))
+                with txn.update_schema() as update:
+                    for edit in edits:
+                        self._edit(update, edit)
+        except Exception as e:
+            raise CatalogError(f"could not alter '{table}' in catalog '{self.name}': {e}") from e
+        self._schema_cache.pop(table, None)
+
+    def _edit(self, update: Any, edit: SchemaEdit) -> None:
+        col = edit.column
+        if edit.op == "add":
+            # Never `required=True`: pyiceberg rejects it without allow_incompatible_changes, and
+            # so does Loom — an added required column is classified breaking and never reaches here.
+            update.add_column(path=col.name, field_type=iceberg_type(col.iceberg_type))
+        elif edit.op == "promote":
+            update.update_column(path=col.name, field_type=iceberg_type(col.iceberg_type))
+        elif edit.op == "relax":
+            update.make_column_optional(col.name)
+        else:  # pragma: no cover - the executor builds these, so this is a programming error
+            raise CatalogError(f"unsupported schema edit '{edit.op}' on column '{col.name}'")
+
+    def append_rows(self, table: str, rows: Sequence[Mapping[str, Any]]) -> None:
+        if not rows:
+            return
+        import pyarrow as pa
+        from pyiceberg.io.pyarrow import schema_to_pyarrow
+
+        tbl = self._load(table)
+        # The table's own schema, converted — not one inferred from the values. Inference would
+        # turn an all-null column into a null-typed one and an int into an int64, and the append
+        # would be rejected for a mismatch that says nothing about what the caller got wrong.
+        arrow_schema = schema_to_pyarrow(tbl.schema())
+        try:
+            batch = pa.Table.from_pylist([dict(r) for r in rows], schema=arrow_schema)
+            tbl.append(batch)
+        except Exception as e:
+            raise CatalogError(f"could not append to '{table}' in catalog '{self.name}': {e}") from e
 
 
 def build(name: str, ctype: str, uri: str, warehouse: str | None, properties: Mapping[str, object]):

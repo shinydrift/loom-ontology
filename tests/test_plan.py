@@ -361,7 +361,7 @@ def test_the_render_marks_severity_in_the_left_margin(ontology):
     assert "      ! full_name" in out
     assert "breaking" in out
     assert "Plan: 0 to create, 1 to change · 1 breaking" in out
-    assert "`loom apply` is not implemented yet" in out
+    assert "`loom apply` will refuse this plan" in out
 
 
 def test_a_breaking_add_is_marked_by_severity_not_by_kind(ontology):

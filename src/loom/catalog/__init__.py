@@ -5,20 +5,25 @@ Everything above this package (physical validation, the query engines, the resol
 SQLite-backed warehouse in a test and a REST catalog in production, and it's where a
 non-Iceberg backing store would eventually plug in.
 
-The port is deliberately narrow: introspect a table's columns, and scan it. Writes are not here
-— they arrive with the action runtime (M3) and go through the catalog rather than the engine.
+The read port is deliberately narrow: introspect a table's columns, and scan it. Writes are a
+*separate* port, `CatalogWriter`, so that holding a `Catalog` — which is all the resolver, the
+engines and `loom serve` are ever given — carries no ability to execute DDL. `loom apply` reaches
+for `writer_for()` explicitly; row-level writes join it with the action runtime (M3).
 """
 
 from __future__ import annotations
 
-from .base import Catalog, CatalogError, Column, TableSchema
+from .base import Catalog, CatalogError, CatalogWriter, Column, SchemaEdit, TableSchema, writer_for
 from .factory import open_catalog, open_catalogs
 
 __all__ = [
     "Catalog",
     "CatalogError",
+    "CatalogWriter",
     "Column",
+    "SchemaEdit",
     "TableSchema",
     "open_catalog",
     "open_catalogs",
+    "writer_for",
 ]

@@ -70,17 +70,37 @@ that same ontology as MCP tools, driven end to end over stdio.
 
 ---
 
-## ⏳ M2 — Migration engine (`plan` / `apply`) — *in progress: `plan` has landed*
+## ⏳ M2 — Migration engine (`plan` / `apply`) — *in progress: `plan` and `apply` have landed*
 
 *Goal: edit the YAML, run `loom plan`, see a classified diff; `loom apply` evolves Iceberg.*
 
 - [x] Diff engine (`migrate/`) — classify changes: safe/additive · physical-safe (Iceberg
       field-id) · breaking.
 - [x] `loom plan` — terraform-style dry-run of the classified diff.
-- [ ] `_loom_meta` state store — serialized applied spec + version + content-hash + history.
+- [x] `_loom_meta` state store — serialized applied spec + version + content-hash + history.
+- [x] `loom apply` — write port + namespace creation; executes physical DDL in an Iceberg
+      transaction; bumps version; idempotent.
 - [ ] `renamedFrom:` handling — treat as a field-id remap, not drop+add.
-- [ ] `loom apply` — execute physical DDL in an Iceberg transaction; bump version; idempotent.
 - [ ] Rollback path — restore prior spec + point physical schema at an earlier snapshot.
+      (`_loom_meta` already stores the spec source verbatim, which is what this restores.)
+
+**Three decisions taken in the `apply` slice:**
+- **A breaking plan is refused whole.** Not "apply the safe parts and report the rest": a
+  partial apply leaves the lake in a state that neither the old spec nor the new one describes,
+  and `_loom_meta` would then be recording a spec that was never really applied. There is
+  deliberately no `--force` — every breaking change either loses data or leaves existing rows
+  violating a constraint that was just declared, and the fix is a data migration (add nullable,
+  backfill, tighten) that Loom has no verb for until the action runtime lands.
+- **Atomicity is per table, and says so.** Iceberg's unit is the table, so each table's column
+  edits and its provenance properties commit in one transaction. There is no cross-table
+  transaction to be had, so `apply` sequences tables, stops at the first failure, and reports
+  exactly which ones landed rather than pretending the run was atomic.
+- **Writes are a second port, not extra methods on `Catalog`.** `CatalogWriter` is what `apply`
+  asks for; everything else in Loom holds a read-only `Catalog` and therefore cannot execute DDL
+  at all. The same reasoning as "no raw-SQL tool is ever exposed", applied one layer down. One
+  consequence worth stating: **`version` is global to the spec, not per catalog** — a row is
+  written to each catalog the spec binds, but all carry the same number, so "version 7" names the
+  same apply wherever you read it.
 
 **Two decisions taken in the `plan` slice:**
 - **The live catalog is the baseline, not a state file.** `Catalog.describe()` already returns

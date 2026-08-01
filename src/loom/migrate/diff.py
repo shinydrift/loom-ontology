@@ -49,6 +49,11 @@ class ColumnChange:
     detail: str  # the change itself, e.g. "int -> long" or "optional -> required"
     reason: str = ""  # why it carries that severity; rendered for anything not plainly safe
     source: str = ""  # the declaration that wants it, e.g. "Customer.lifetimeValue"
+    # The end state the change produces. `detail` is prose for a human and says where the column
+    # came *from*; these two say what it must become, so the executor builds DDL from the plan it
+    # was shown rather than re-deriving a desired state that could differ from the printed one.
+    iceberg_type: str = ""
+    required: bool = False
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,15 @@ class Unmanaged:
 class MigrationPlan:
     changes: tuple[TableChange, ...]
     unmanaged: tuple[Unmanaged, ...] = ()
+    # Every (catalog, table) the spec binds, changed or not. `changes` alone can't answer "which
+    # catalogs is this ontology deployed to?" — a spec that already matches produces no changes,
+    # and that is precisely the run where `apply` still has to find its `_loom_meta` history.
+    targets: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def catalogs(self) -> tuple[str, ...]:
+        """The catalogs this plan concerns, in first-mention order."""
+        return tuple(dict.fromkeys(catalog for catalog, _ in self.targets))
 
     @property
     def is_empty(self) -> bool:
@@ -120,7 +134,9 @@ def diff_ontology(
     """
     changes: list[TableChange] = []
     unmanaged: list[Unmanaged] = []
+    targets: list[tuple[str, str]] = []
     for desired in desired_tables(ontology, diag).values():
+        targets.append(desired.key)
         catalog = catalogs.get(desired.catalog)
         if catalog is None:
             diag.error(
@@ -134,7 +150,7 @@ def diff_ontology(
             changes.append(change)
         if extra is not None:
             unmanaged.append(extra)
-    return MigrationPlan(tuple(changes), tuple(unmanaged))
+    return MigrationPlan(tuple(changes), tuple(unmanaged), tuple(targets))
 
 
 def _diff_table(
@@ -160,6 +176,8 @@ def _creation(desired: DesiredTable) -> TableChange:
             severity=Severity.SAFE,
             detail=f"{col.iceberg_type} {_nullability(col.required)}",
             source=col.source,
+            iceberg_type=col.iceberg_type,
+            required=col.required,
         )
         for col in desired.columns.values()
     )
@@ -207,6 +225,8 @@ def _added(col: DesiredColumn) -> ColumnChange:
             else ""
         ),
         source=col.source,
+        iceberg_type=col.iceberg_type,
+        required=col.required,
     )
 
 
@@ -222,6 +242,8 @@ def _retyped(col: DesiredColumn, current: str, field_id: int | None) -> ColumnCh
             detail=f"{current} -> {col.iceberg_type}",
             reason=f"widening promotion applied by {held}; existing data files are not rewritten",
             source=col.source,
+            iceberg_type=col.iceberg_type,
+            required=col.required,
         )
     return ColumnChange(
         kind="retype",
@@ -230,6 +252,8 @@ def _retyped(col: DesiredColumn, current: str, field_id: int | None) -> ColumnCh
         detail=f"{current} -> {col.iceberg_type}",
         reason=f"{current} does not promote to {col.iceberg_type} — values would have to be rewritten",
         source=col.source,
+        iceberg_type=col.iceberg_type,
+        required=col.required,
     )
 
 
@@ -243,6 +267,8 @@ def _renullabled(col: DesiredColumn, currently_required: bool) -> ColumnChange:
             severity=Severity.SAFE,
             detail="required -> optional",
             source=col.source,
+            iceberg_type=col.iceberg_type,
+            required=False,
         )
     return ColumnChange(
         kind="tighten",
@@ -251,6 +277,8 @@ def _renullabled(col: DesiredColumn, currently_required: bool) -> ColumnChange:
         detail="optional -> required",
         reason="existing rows may already hold nulls, which the new constraint would not admit",
         source=col.source,
+        iceberg_type=col.iceberg_type,
+        required=True,
     )
 
 

@@ -83,8 +83,9 @@ Two decisions shape the framework:
 ## Status
 
 Early, but the **read path works end to end**: a YAML spec over real Iceberg tables, served to an
-MCP client as typed tools. The write path is under way — `loom plan` classifies what a spec change
-would do to the physical tables; executing it (`loom apply`) and the action runtime are next.
+MCP client as typed tools. The **migration path** now runs too — `loom plan` classifies what a spec
+change would do to the physical tables and `loom apply` executes it, bootstrapping an empty
+warehouse from nothing but a spec. The action runtime (row-level writeback) is next.
 
 | Component | State |
 |-----------|-------|
@@ -101,7 +102,8 @@ would do to the physical tables; executing it (`loom apply`) and the action runt
 | Resolver — ontology ops → IR (`resolver.py`) | ✅ |
 | MCP **read** tools + `loom serve` (`mcp/`) | ✅ |
 | Migration diff + dry run (`migrate/`) | ✅ `loom plan` |
-| Migration executor — `_loom_meta`, DDL, rollback | ⏳ next `loom apply` |
+| Migration executor + `_loom_meta` state store | ✅ `loom apply` |
+| `renamedFrom` remap · rollback | ⏳ |
 | Action runtime — single-object writeback | ⏳ |
 | MCP `run_<action>` tools + HTTP transport | ⏳ |
 | Governance (row/column policies) | ⏳ |
@@ -115,7 +117,7 @@ would do to the physical tables; executing it (`loom apply`) and the action runt
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 191 tests
+pytest                              # 217 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 2 action(s)
 ```
 
@@ -204,6 +206,52 @@ Two rules shape it. The **live catalog is the baseline** — no state file to dr
 a table someone changed out of band shows up honestly. And **Loom never proposes a drop**: an
 objectType maps a subset of a table's columns, so a column no property mentions is someone else's
 data, reported as unmanaged and left alone.
+
+## Applying it
+
+`loom apply` executes that same plan — it prints it first, then asks — and creates the namespaces
+it needs along the way, so an empty warehouse becomes a working ontology with no seed script:
+
+```
+$ loom apply examples/retail/ontology
+Loom plan — examples/retail/ontology
+...
+Plan: 2 to create, 0 to change · 8 safe
+
+Apply these changes? [y/N] y
+
+  + local.crm.customers — created · namespace 'crm' created
+  + local.sales.orders — created · namespace 'sales' created
+Applied 2 table change(s). Recorded as version 1 in `_loom_meta` (local).
+```
+
+Run it again and it has nothing to do — the diff is re-derived from the live catalog every time,
+so idempotency isn't a bookkeeping trick, it's the same mechanism that makes `plan` honest:
+
+```
+$ loom apply examples/retail/ontology
+No changes — the catalog already matches the ontology.
+
+Already applied — nothing to do. Recorded as version 1 in `_loom_meta` (local).
+```
+
+Three rules shape the executor:
+
+- **A breaking plan is refused whole**, and nothing runs — not even the safe tables in it. The
+  fix for a breaking change is a data migration (add the column nullable, backfill, then tighten),
+  and there is no `--force`, because forcing it wouldn't make it safe.
+- **One table, one Iceberg transaction.** That is Iceberg's unit of atomicity, so it is Loom's:
+  a table's column changes and its provenance properties commit together. Across tables the run
+  is sequential and stops at the first failure, and says exactly which tables landed — an honest
+  partial beats a pretend-atomic one.
+- **Writes go through their own port.** The resolver, the query engines and `loom serve` hold a
+  read-only `Catalog` and could not execute DDL if they tried; only `apply` asks for a
+  `CatalogWriter`.
+
+Every apply appends to `_loom_meta.applied`, an ordinary Iceberg table in the lake: the spec's
+source, its content hash, a version, who ran it, and what it did. It lives in the lake rather than
+beside the YAML because a state file only ever describes the checkout it sits in — and it is
+history, never the planner's input.
 
 The validator accumulates every problem and reports them in one pass with source locations:
 
