@@ -358,6 +358,51 @@ of YAML.
 
 ---
 
+## 9. `_loom_meta` — what `apply` recorded
+
+Part of the contract because it is a table in *your* lake, not an implementation detail: anything
+with an Iceberg client can read it, and a later Loom must keep it readable.
+
+One table per catalog the spec binds, created by the first `loom apply` that touches that catalog:
+
+```
+_loom_meta.applied
+  version       long         required   # global to the spec, not to the catalog — see below
+  applied_at    timestamptz  required
+  content_hash  string                  # sha256 of the spec source, canonicalized
+  spec          string                  # {relative path: file text} as JSON — what a rollback restores
+  summary       string                  # JSON: the tables this apply created/altered in this catalog
+  status        string                  # applied | partial
+  loom_version  string
+  actor         string                  # $LOOM_ACTOR, else the OS user
+```
+
+**Append-only.** The current state is the row with the highest `version`; everything before it is
+history. Nothing rewrites a row.
+
+**It is not the planner's input.** The diff is always taken against the live catalog, so a table
+someone changed out of band shows up honestly instead of being masked by a state file that says
+otherwise. This table answers a narrower question — *has this exact spec already been applied
+here, and what did that apply do?*
+
+**`version` counts applies of the spec, not of a catalog.** A spec spanning two catalogs writes a
+row to each, both carrying the same version and the same `content_hash`, and each summarizing only
+its own tables. There is no central place to hold that counter, so it is derived: one past the
+highest version any bound catalog holds. A catalog added to a project at version 7 starts its
+history at 7.
+
+**`content_hash` covers the spec's YAML only** — not `loom.yaml`, which is deployment config, so
+the same spec hashes identically against staging and production. An edit that changes no column
+still records a new version: the stored `spec` is what a rollback restores, so it has to track the
+file text, not just the physical shape.
+
+Each managed table additionally carries three Iceberg table properties, set in the same
+transaction as its schema change: `loom.managed`, `loom.spec_hash`, `loom.applied_version`. They
+duplicate what this table records on purpose — a table should be self-describing without the
+reader knowing `_loom_meta` exists.
+
+---
+
 ## Open edges (v0 → v1)
 
 Named deliberately so they're conscious deferrals, not gaps:

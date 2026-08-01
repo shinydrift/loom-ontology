@@ -2,7 +2,7 @@
 
 `validate` is structural and offline by default; `--physical` adds the catalog pass. `query` is a
 dev command for exercising the read path by hand, and `serve` exposes those same reads as MCP
-tools. `plan` dry-runs the migration engine; `apply` stays a stub until the executor lands.
+tools. `plan` dry-runs the migration engine and `apply` executes exactly what `plan` printed.
 """
 
 from __future__ import annotations
@@ -196,11 +196,72 @@ def cmd_plan(args) -> int:
     return 0
 
 
-def _stub(name: str):
-    def run(args) -> int:
-        print(f"'{name}' is not implemented yet (post-v0)", file=sys.stderr)
-        return 2
-    return run
+def cmd_apply(args) -> int:
+    """Execute the plan. Prints it first, unchanged, because that is what is about to happen.
+
+    Re-planning here rather than reading a plan file is deliberate: a plan is only true of the
+    catalog it was taken against, and one saved half an hour ago describes a lake that may have
+    moved. The diff is cheap; a stale apply is not."""
+    diag = Diagnostics()
+    try:
+        ontology, config = _load_project(args.path, diag)
+    except SpecErrors as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    from .catalog import CatalogError, open_catalogs
+    from .migrate import Severity, apply_plan, diff_ontology, render_apply, render_plan, snapshot_spec
+
+    try:
+        catalogs = open_catalogs(config)
+        plan = diff_ontology(ontology, catalogs, diag)
+        diag.raise_if_errors()
+    except SpecErrors as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    except CatalogError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    for w in diag.warnings:
+        print(f"warning: {w.render()}", file=sys.stderr)
+    print(render_plan(plan, title=str(args.path), executing=True))
+
+    # A breaking plan needs no confirmation — the executor refuses it, and asking first would
+    # imply an answer that would change the outcome.
+    if not plan.is_empty and plan.severity is not Severity.BREAKING and not _confirmed(args.yes):
+        print("aborted — nothing was applied", file=sys.stderr)
+        return 1
+
+    print()
+    try:
+        result = apply_plan(plan, catalogs, snapshot_spec(args.path))
+    except CatalogError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(render_apply(result))
+    return 0 if result.ok else 1
+
+
+def _confirmed(assume_yes: bool) -> bool:
+    """Ask before writing to someone's lake.
+
+    Refusing when there's no terminal — rather than assuming yes — is the important half: `apply`
+    inside a pipeline should be a deliberate `--yes`, not a side effect of nobody being there to
+    object."""
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print(
+            "error: refusing to apply without confirmation — no terminal to ask at, pass --yes",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        answer = input("\nApply these changes? [y/N] ")
+    except EOFError:  # pragma: no cover - a tty that closes mid-question
+        return False
+    return answer.strip().lower() in ("y", "yes")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -233,9 +294,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")
     p.set_defaults(func=cmd_plan)
 
-    a = sub.add_parser("apply", help="apply (stub — executor not implemented yet)")
-    a.add_argument("path", nargs="?", default="ontology")
-    a.set_defaults(func=_stub("apply"))
+    a = sub.add_parser("apply", help="execute the migration the ontology implies")
+    a.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")
+    a.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    a.set_defaults(func=cmd_apply)
 
     args = parser.parse_args(argv)
     return args.func(args)

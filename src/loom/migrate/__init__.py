@@ -2,18 +2,22 @@
 
 `plan` is pure read: it derives the tables the spec *wants* (`schema.py`), compares them against
 what the catalog actually holds (`diff.py`), and prints the classified result (`render.py`).
-Nothing here executes DDL — `apply` lands in the next slice, and with it the `_loom_meta` state
-store, `renamedFrom` field-id remapping, and rollback.
+`apply` executes that same plan (`executor.py`) and records it (`meta.py`). What remains of M2 is
+`renamedFrom` field-id remapping and rollback.
 
-Two rules shape the whole package:
+Four rules shape the whole package:
 
 - **The live catalog is the baseline, not a state file.** `Catalog.describe()` already returns
   column types and Iceberg field ids, which is everything a diff needs. `_loom_meta` records what
   `apply` did; it is not required to work out what `apply` *should* do, and diffing against it
-  instead would make `plan` lie whenever someone changed a table out of band.
+  instead would make `plan` lie whenever someone changed a table out of band. It is also what
+  makes `apply` idempotent for free: a second run re-derives the diff and finds nothing to do.
 - **Loom never proposes a drop.** An objectType maps a *subset* of a table's columns, so a column
   no property mentions is not evidence of a deleted property — it's someone else's data. Those
   columns are reported as unmanaged and left alone.
+- **A breaking plan is refused whole.** Not partially applied. See `executor._refusal`.
+- **Writes go through a separate port.** `apply` asks the catalog layer for a `CatalogWriter`;
+  everything else in Loom holds a read-only `Catalog` and could not execute DDL if it tried.
 """
 
 from __future__ import annotations
@@ -26,18 +30,33 @@ from .diff import (
     Unmanaged,
     diff_ontology,
 )
-from .render import render_plan
+from .executor import APPLIED, FAILED, REFUSED, UP_TO_DATE, ApplyResult, TableOutcome, apply_plan
+from .meta import META_TABLE, AppliedRecord, MetaStore, SpecSnapshot, snapshot_spec
+from .render import render_apply, render_plan
 from .schema import DesiredColumn, DesiredTable, desired_tables
 
 __all__ = [
+    "APPLIED",
+    "FAILED",
+    "REFUSED",
+    "UP_TO_DATE",
+    "AppliedRecord",
+    "ApplyResult",
     "ColumnChange",
     "DesiredColumn",
     "DesiredTable",
+    "META_TABLE",
+    "MetaStore",
     "MigrationPlan",
     "Severity",
+    "SpecSnapshot",
     "TableChange",
+    "TableOutcome",
     "Unmanaged",
+    "apply_plan",
     "desired_tables",
     "diff_ontology",
+    "render_apply",
     "render_plan",
+    "snapshot_spec",
 ]
