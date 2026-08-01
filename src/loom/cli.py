@@ -2,7 +2,7 @@
 
 `validate` is structural and offline by default; `--physical` adds the catalog pass. `query` is a
 dev command for exercising the read path by hand, and `serve` exposes those same reads as MCP
-tools. `plan`/`apply` stay stubs until the migration engine lands.
+tools. `plan` dry-runs the migration engine; `apply` stays a stub until the executor lands.
 """
 
 from __future__ import annotations
@@ -162,6 +162,40 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def cmd_plan(args) -> int:
+    """Dry-run the migration engine: what would `apply` have to do to make the catalog match?
+
+    Note what this deliberately is *not*: `validate --physical`. That pass treats a missing table
+    or column as an error, which is exactly what a plan has to be able to report as a creation
+    instead. Structural validation still runs first — diffing against a spec that doesn't parse
+    produces noise, not a plan."""
+    diag = Diagnostics()
+    try:
+        ontology, config = _load_project(args.path, diag)
+    except SpecErrors as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    from .catalog import CatalogError, open_catalogs
+    from .migrate import diff_ontology, render_plan
+
+    try:
+        plan = diff_ontology(ontology, open_catalogs(config), diag)
+        # A plan built on a binding we couldn't resolve would be missing tables without saying so.
+        diag.raise_if_errors()
+    except SpecErrors as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    except CatalogError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    for w in diag.warnings:
+        print(f"warning: {w.render()}", file=sys.stderr)
+    print(render_plan(plan, title=str(args.path)))
+    return 0
+
+
 def _stub(name: str):
     def run(args) -> int:
         print(f"'{name}' is not implemented yet (post-v0)", file=sys.stderr)
@@ -195,10 +229,13 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")
     s.set_defaults(func=cmd_serve)
 
-    for name in ("plan", "apply"):
-        p = sub.add_parser(name, help=f"{name} (post-v0 stub)")
-        p.add_argument("path", nargs="?", default="ontology")
-        p.set_defaults(func=_stub(name))
+    p = sub.add_parser("plan", help="dry-run the migration the ontology implies")
+    p.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")
+    p.set_defaults(func=cmd_plan)
+
+    a = sub.add_parser("apply", help="apply (stub — executor not implemented yet)")
+    a.add_argument("path", nargs="?", default="ontology")
+    a.set_defaults(func=_stub("apply"))
 
     args = parser.parse_args(argv)
     return args.func(args)

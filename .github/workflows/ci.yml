@@ -42,8 +42,16 @@ jobs:
       # Runs the documented quickstart exactly as a reader would: seed a local Iceberg warehouse,
       # check the spec against its real metadata, then read through the resolver and DuckDB. If the
       # README's commands stop working, this job fails.
+      # Before anything exists, so the plan is the whole warehouse as creations — the one state
+      # `validate --physical` can't be run against at all.
+      - name: Plan against an empty warehouse
+        run: |
+          mkdir -p examples/retail/.warehouse  # the local SQL catalog keeps its metastore in here
+          loom plan examples/retail/ontology
       - name: Seed the local warehouse
         run: python examples/retail/seed.py
+      - name: Re-plan — a seeded warehouse matches the spec, so this must be a no-op
+        run: loom plan examples/retail/ontology | grep -q 'No changes'
       - name: Validate against the live catalog
         run: loom validate --physical examples/retail/ontology
       - name: Read one object

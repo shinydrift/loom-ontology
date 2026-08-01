@@ -83,7 +83,8 @@ Two decisions shape the framework:
 ## Status
 
 Early, but the **read path works end to end**: a YAML spec over real Iceberg tables, served to an
-MCP client as typed tools. The write path — migrations and actions — is next.
+MCP client as typed tools. The write path is under way — `loom plan` classifies what a spec change
+would do to the physical tables; executing it (`loom apply`) and the action runtime are next.
 
 | Component | State |
 |-----------|-------|
@@ -99,7 +100,8 @@ MCP client as typed tools. The write path — migrations and actions — is next
 | DuckDB adapter | ✅ |
 | Resolver — ontology ops → IR (`resolver.py`) | ✅ |
 | MCP **read** tools + `loom serve` (`mcp/`) | ✅ |
-| Migration engine (`plan` / `apply`) | ⏳ next |
+| Migration diff + dry run (`migrate/`) | ✅ `loom plan` |
+| Migration executor — `_loom_meta`, DDL, rollback | ⏳ next `loom apply` |
 | Action runtime — single-object writeback | ⏳ |
 | MCP `run_<action>` tools + HTTP transport | ⏳ |
 | Governance (row/column policies) | ⏳ |
@@ -113,7 +115,7 @@ MCP client as typed tools. The write path — migrations and actions — is next
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 148 tests
+pytest                              # 191 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 2 action(s)
 ```
 
@@ -162,6 +164,46 @@ documented:
 - **Declared types are honored on the way in and out.** A key arriving as `"42"` for a `long`
   property is coerced before it becomes a predicate, and `decimal` values never pass through a
   float.
+
+## Planning a schema change
+
+`loom plan` is the write path's dry run: it derives the tables the spec wants, diffs them against
+the live catalog, and classifies every difference. Run it before seeding anything and the whole
+warehouse is a creation:
+
+```
+$ loom plan examples/retail/ontology
+Loom plan — examples/retail/ontology
+
+  + local.crm.customers — create table · Customer
+      + id              string required
+      + full_name       string required
+      + tier            string required
+      + lifetime_value  double optional
+...
+Plan: 2 to create, 0 to change · 8 safe
+```
+
+The classification is the point. Iceberg will let you make a change that costs nothing, one that
+rewrites the schema but not the data, and one that quietly invalidates existing rows — and all
+three look identical in a YAML diff. Against a table already holding rows, they don't:
+
+```
+$ loom plan ./ontology
+  ! local.demo.widgets — 3 change(s) · Widget
+      ~ score     int -> double         physical-safe
+          widening promotion applied by field id 2; existing data files are not rewritten
+      ! label     optional -> required  breaking
+          existing rows may already hold nulls, which the new constraint would not admit
+      + nickname  string optional       safe
+
+Plan: 0 to create, 1 to change · 1 safe, 1 physical-safe, 1 breaking
+```
+
+Two rules shape it. The **live catalog is the baseline** — no state file to drift out of sync, so
+a table someone changed out of band shows up honestly. And **Loom never proposes a drop**: an
+objectType maps a subset of a table's columns, so a column no property mentions is someone else's
+data, reported as unmanaged and left alone.
 
 The validator accumulates every problem and reports them in one pass with source locations:
 
