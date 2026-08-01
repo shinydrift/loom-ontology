@@ -18,7 +18,7 @@ from ._shape import suggest
 from .errors import Diagnostics, SourceLoc
 from .expr import FUNCTIONS, Binary, Call, Expr, Literal, Ref, Unary
 from .loader import _Loaded
-from .model import Action, LinkType, ObjectType, Property
+from .model import Action, LinkType, ObjectType, Property, physical_type
 from .types import PropType, promotable
 
 if TYPE_CHECKING:  # the port is a type-only dependency — importing it would drag in the catalog
@@ -349,17 +349,8 @@ def _describe(
         return None
 
 
-def _physical_type(prop_type: PropType, loaded: _Loaded) -> str | None:
-    """The Iceberg type a property's values are actually stored as. Only objectRef needs
-    resolving — it travels as the referenced object type's primary key."""
-    if prop_type.kind == "objectRef":
-        ref = loaded.objects.get(prop_type.object_type or "")
-        return ref.pk_property.type.iceberg_type() if ref is not None else None
-    return prop_type.iceberg_type()
-
-
 def _check_column_type(obj: ObjectType, prop: Property, col: Column, loaded: _Loaded, diag: Diagnostics) -> None:
-    declared = _physical_type(prop.type, loaded)
+    declared = physical_type(prop.type, loaded.objects)
     if declared is None:  # unresolvable objectRef — already reported by the referential pass
         return
     if not promotable(col.iceberg_type, declared):

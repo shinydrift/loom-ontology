@@ -7,6 +7,7 @@ handed out by ontology.build().
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from .errors import SourceLoc
@@ -123,3 +124,18 @@ class Ontology:
             f"{len(self.link_types)} link type(s), "
             f"{len(self.actions)} action(s)"
         )
+
+
+def physical_type(prop_type: PropType, object_types: Mapping[str, ObjectType]) -> str | None:
+    """The Iceberg type a property's values are actually stored as.
+
+    Only `objectRef` needs the wider map: it travels as the referenced object type's primary key,
+    so its storage type is that key's. Returns None for an objectRef whose target is unknown —
+    the referential pass reports that, and callers here just skip the column.
+
+    Shared by physical validation (declared type vs. an existing column) and the migration
+    planner (declared type vs. the column it wants to exist), so the two can never disagree."""
+    if prop_type.kind == "objectRef":
+        ref = object_types.get(prop_type.object_type or "")
+        return ref.pk_property.type.iceberg_type() if ref is not None else None
+    return prop_type.iceberg_type()

@@ -21,7 +21,7 @@ catalog.
 
 ---
 
-## ⏳ M1 — Read slice, end to end: catalog → query → MCP (next)
+## ✅ Done — M1: Read slice, end to end: catalog → query → MCP
 
 *Goal: point an MCP client at a Loom ontology and ask it for a real row from a real Iceberg
 table.* The first time the ontology does the thing the README claims.
@@ -36,21 +36,21 @@ tools and capability negotiation.
 
 The write path is untouched by this: no migrations, no action runtime, no `_loom_meta`.
 
-- [ ] `config.py` — the `loom.yaml` project config from spec §6 (`catalogs`, `engine`, `mcp`),
+- [x] `config.py` — the `loom.yaml` project config from spec §6 (`catalogs`, `engine`, `mcp`),
       reusing the same accumulate-all-errors `Diagnostics` as the spec loader.
-- [ ] `catalog/` — a `Catalog` port + table introspection (columns → Iceberg types, field ids),
+- [x] `catalog/` — a `Catalog` port + table introspection (columns → Iceberg types, field ids),
       with pyiceberg-backed implementations. Binds an `objectType.backing` to a live table.
-- [ ] Wire up **physical validation** — implement `validator.check_physical()` (the stub):
+- [x] Wire up **physical validation** — implement `validator.check_physical()` (the stub):
       table/column existence + type promotion-compatibility against the bound catalog.
       Surfaced as `loom validate --physical`.
-- [ ] `query/ir.py` — the logical plan node set: `GetByKey`, `Search`, `Traverse`, `Project`.
-- [ ] `query/engine.py` — the `Engine` port (`capabilities()` / `compile()` / `execute()`).
-- [ ] `query/engines/duckdb.py` — first adapter; lowers IR → DuckDB SQL over Iceberg.
-- [ ] `resolver.py` — ontology ops → IR; link `Traverse` → JOIN via from/to mapping (+ reverse).
-- [ ] `mcp/registry.py` — Ontology Model → read tool set (`get_` / `search_` / `list_` per
+- [x] `query/ir.py` — the logical plan node set: `GetByKey`, `Search`, `Traverse`, `Project`.
+- [x] `query/engine.py` — the `Engine` port (`capabilities()` / `compile()` / `execute()`).
+- [x] `query/engines/duckdb.py` — first adapter; lowers IR → DuckDB SQL over Iceberg.
+- [x] `resolver.py` — ontology ops → IR; link `Traverse` → JOIN via from/to mapping (+ reverse).
+- [x] `mcp/registry.py` — Ontology Model → read tool set (`get_` / `search_` / `list_` per
       object type, generic `traverse`), input schemas from `PropType.json_schema()`.
-- [ ] `loom serve` over stdio, read-only. Hard-rule test: no raw-SQL tool is ever exposed.
-- [ ] `examples/` — a seedable local Iceberg warehouse + the worked-example ontology, so the
+- [x] `loom serve` over stdio, read-only. Hard-rule test: no raw-SQL tool is ever exposed.
+- [x] `examples/` — a seedable local Iceberg warehouse + the worked-example ontology, so the
       whole path is runnable by hand and in CI.
 
 **Definition of done:** a test seeds rows into a local Iceberg table and reads them back through
@@ -70,16 +70,29 @@ that same ontology as MCP tools, driven end to end over stdio.
 
 ---
 
-## ⏳ M2 — Migration engine (`plan` / `apply`)
+## ⏳ M2 — Migration engine (`plan` / `apply`) — *in progress: `plan` has landed*
 
 *Goal: edit the YAML, run `loom plan`, see a classified diff; `loom apply` evolves Iceberg.*
 
+- [x] Diff engine (`migrate/`) — classify changes: safe/additive · physical-safe (Iceberg
+      field-id) · breaking.
+- [x] `loom plan` — terraform-style dry-run of the classified diff.
 - [ ] `_loom_meta` state store — serialized applied spec + version + content-hash + history.
-- [ ] Diff engine — classify changes: safe/additive · physical-safe (Iceberg field-id) · breaking.
 - [ ] `renamedFrom:` handling — treat as a field-id remap, not drop+add.
-- [ ] `loom plan` — terraform-style dry-run of the classified diff.
 - [ ] `loom apply` — execute physical DDL in an Iceberg transaction; bump version; idempotent.
 - [ ] Rollback path — restore prior spec + point physical schema at an earlier snapshot.
+
+**Two decisions taken in the `plan` slice:**
+- **The live catalog is the baseline, not a state file.** `Catalog.describe()` already returns
+  column types and Iceberg field ids, which is everything a diff needs, so `plan` needs no
+  `_loom_meta` to work — and diffing against one instead would make `plan` lie the moment
+  somebody changed a table out of band. `_loom_meta` records what `apply` *did*; it is a
+  history and an idempotency key, not the planner's source of truth. That's why it moved down
+  the list into the `apply` slice.
+- **Loom never proposes a drop.** An objectType maps a *subset* of a table's columns, so a
+  column no property mentions is not a deleted property — it's someone else's data. Those are
+  reported as unmanaged and left alone. It also means `plan` is not `validate --physical`: that
+  pass treats a missing table as an error, which is exactly what a plan reports as a creation.
 
 ---
 
@@ -137,5 +150,5 @@ Consciously deferred in v0; each is a self-contained follow-up:
 
 - [ ] `pyproject` extras for engine backends (`[duckdb]`, `[trino]`) and catalog clients
 - [ ] Example end-to-end project under `examples/` (seedable local Iceberg + a demo agent loop)
-- [ ] Docs site / expanded README once M1 lands
+- [ ] Docs site / expanded README now that M1 has landed
 - [ ] Type-check (mypy) + lint (ruff) in CI alongside pytest

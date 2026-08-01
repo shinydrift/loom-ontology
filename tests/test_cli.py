@@ -104,10 +104,35 @@ def test_an_unreachable_catalog_is_an_error_not_a_traceback(tmp_path, capsys):
     assert "rest_main" in err
 
 
-@pytest.mark.parametrize("command", ["plan", "apply"])
-def test_write_path_commands_are_still_stubs(command, capsys):
-    assert main([command, str(VALID)]) == 2
+def test_apply_is_still_a_stub(capsys):
+    assert main(["apply", str(VALID)]) == 2
     assert "not implemented yet" in capsys.readouterr().err
+
+
+def test_plan_needs_a_config_like_every_other_catalog_command(capsys):
+    assert main(["plan", str(VALID)]) == 1
+    assert "no loom.yaml found" in capsys.readouterr().err
+
+
+def test_plan_against_an_empty_warehouse_proposes_creations(tmp_path, capsys):
+    """The end the read path can't reach: a project whose tables don't exist yet plans clean
+    rather than erroring, which is the whole difference between `plan` and `validate --physical`."""
+    pytest.importorskip("pyiceberg", reason="needs the [iceberg] extra")
+    ontology = _project(tmp_path)
+    assert main(["plan", str(ontology)]) == 0
+    out = capsys.readouterr().out
+    assert "create table · Customer" in out
+    assert "create table · Order" in out
+    assert "Plan: 2 to create, 0 to change" in out
+
+
+def test_plan_reports_a_missing_catalog_binding_rather_than_planning_around_it(tmp_path, capsys):
+    """A plan built on an unresolved binding would be silently missing tables."""
+    ontology = _project(tmp_path, config="catalogs: {}\n")
+    assert main(["plan", str(ontology)]) == 1
+    err = capsys.readouterr().err
+    assert "catalog 'rest_main', which is not declared in loom.yaml" in err
+    assert "Customer" in err  # the hint names what asked for it
 
 
 def test_warnings_go_to_stderr_so_stdout_stays_parseable(tmp_path, capsys):
