@@ -1,6 +1,6 @@
-"""The action runtime — one declared action, run against one row.
+"""The action runtime — one declared action, run against one row, and a record that it happened.
 
-The whole of an action is four steps, in this order and no other:
+The whole of an action is five steps, in this order and no other:
 
 1. **Bind.** Caller-supplied parameters are coerced to their declared types by the same function
    the read path coerces with (`model.coerce_value`), defaults are applied, and a missing required
@@ -11,40 +11,73 @@ The whole of an action is four steps, in this order and no other:
 4. **Write.** One call to one `RowWriter` verb, which is one Iceberg transaction — carrying the
    snapshot step 2 read, so that the read and the write take effect as one decision or not at all.
 
-Everything that can refuse happens in 1-3, so **a run that refuses changes nothing** — the same
-promise `loom apply` makes, and for the same reason: a half-done write leaves a row that neither
-the caller nor the spec describes. A run that conflicts refuses on that same definition: the write
-was declined before it committed, not undone afterwards.
+5. **Record.** One row in `_loom_meta.edits`, once per run and after the last attempt, through a
+   fourth port that can name no table. The row write has already stamped the same `edit_id` into its
+   own Iceberg commit, which is the only attribution that is atomic with the edit; this is a second
+   commit, and the ordering it chose is written up on `ActionRuntime._record`.
 
-The four steps run up to `MAX_ATTEMPTS` times. `ActionRuntime.run` carries the argument for why a
-conflict is retried here rather than handed straight back; `_write` carries the argument for why
-all three operations are checked, and `_conflict` for what the failure tells a caller.
+Everything that can refuse happens in 1-3, so **a run that refuses changes nothing it was asked to
+change** — the same promise `loom apply` makes, and for the same reason: a half-done write leaves a
+row that neither the caller nor the spec describes. A run that conflicts refuses on that same
+definition: the write was declined before it committed, not undone afterwards.
 
-Two boundaries this file is careful about:
+That sentence used to end at "changes nothing", and step 5 is why it does not. **A refused run is
+recorded.** It writes no data — the promise the words were protecting is intact — but it appends a
+row to Loom's own log, because an audit trail of successes cannot answer *who tried to delete this
+customer*, and a conflict is now a refusal too, so a contended row would otherwise leave no trace of
+the attempts that lost on it. `ActionRuntime._record` carries the boundary (a run is recorded once it
+has named a row) and `action.log` carries the rest.
+
+Steps 1-4 run up to `MAX_ATTEMPTS` times; step 5 runs once. `ActionRuntime.run` carries the argument
+for why a conflict is retried here rather than handed straight back; `_write` carries the argument
+for why all three operations are checked, and `_conflict` for what the failure tells a caller.
+
+Three boundaries this file is careful about:
 
 - **It does not go through the resolver.** The resolver projects a row down to declared properties,
   which is exactly the set a modify must *not* be limited to — see `_read`. The resolver stays the
   semantic read (projected, paged, and where governance will live); this is a physical read of one
   row by key.
 - **It holds a `RowWriter`, never a `CatalogWriter`.** It cannot alter a schema, because the port
-  it asks for has no verb for it.
+  it asks for has no verb for it. The `EditLogWriter` it also holds does not weaken that: it takes
+  no table name, so the only thing it can reach is `_loom_meta.edits`.
+- **It never invents an actor.** `default_actor()` is not called from here — it is honest for
+  `loom apply` and for `loom run`, and a lie for `run_<action>` over MCP, where it would name whoever
+  started `loom serve`. The actor is an argument, and when nobody supplies one the log says so.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
-from ..catalog.base import Catalog, CatalogError, ConcurrencyError, RowWriter, row_writer_for
+from ..catalog.base import (
+    Catalog,
+    CatalogError,
+    ConcurrencyError,
+    RowWriter,
+    edit_log_writer_for,
+    row_writer_for,
+)
 from ..model import Action, ObjectType, Ontology, coerce_value
 from .evaluate import EvalError, Scope, evaluate
+from .log import (
+    UNKNOWN_ACTOR,
+    EditLog,
+    EditRecord,
+    commit_properties,
+    new_edit_id,
+    now,
+    render_key,
+)
 from .result import (
     AMBIGUOUS_KEY,
     APPLIED,
     CONFLICT,
     EXPRESSION_ERROR,
     FAILED,
+    LOG_FAILED,
     MISSING_PARAMETER,
     OBJECT_EXISTS,
     OBJECT_NOT_FOUND,
@@ -85,9 +118,17 @@ class ActionRuntime:
     catalogs: Mapping[str, Catalog]
 
     def run(
-        self, action_name: str, parameters: Mapping[str, Any], *, dry_run: bool = False
+        self,
+        action_name: str,
+        parameters: Mapping[str, Any],
+        *,
+        actor: str | None = None,
+        dry_run: bool = False,
     ) -> ActionResult:
-        """One action, up to `MAX_ATTEMPTS` times, and the last word either way.
+        """One action, up to `MAX_ATTEMPTS` times, recorded once, and the last word either way.
+
+        `actor` is per call rather than per runtime because `loom serve` is long-lived and a caller
+        is not. It is not defaulted here — see the module docstring and `log.UNKNOWN_ACTOR`.
 
         A conflict is retried **here** rather than handed straight back, because the check it comes
         from is deliberately coarse: it asserts the whole table's snapshot, so every unrelated
@@ -116,19 +157,101 @@ class ActionRuntime:
             raise ActionError(f"unknown action '{action_name}' (known: {known})")
         target = self.ontology.object_types[action.target_object_type]
 
+        # Minted before the first attempt, not after the last: the write has to be able to stamp it
+        # into its own commit, and every attempt of one run carries the same one because they are one
+        # edit that took several tries rather than several edits.
+        edit_id = new_edit_id()
+        who = actor or UNKNOWN_ACTOR
+
         result = None
+        run = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
-            run = _Run(self, action, target, dry_run, attempt=attempt)
+            run = _Run(self, action, target, dry_run, attempt=attempt, edit_id=edit_id, actor=who)
             result = run.execute(parameters)
             if not run.conflicted:
                 break
-        assert result is not None  # the loop runs at least once
-        return result
+        assert result is not None and run is not None  # the loop runs at least once
+        if dry_run:
+            # A preview writes nothing and holds nothing, so there is no edit to record and no id to
+            # cite. `loom run` previews before every real run; logging them would double the table.
+            return result
+        return self._record(run, result, target, edit_id, who)
 
     def preview(self, action_name: str, parameters: Mapping[str, Any]) -> ActionResult:
         """Everything but the write. The write path's `loom plan`, and nearly free, because a
         refusal already had to change nothing."""
         return self.run(action_name, parameters, dry_run=True)
+
+    def _record(
+        self, run: _Run, result: ActionResult, target: ObjectType, edit_id: str, actor: str
+    ) -> ActionResult:
+        """One row in `_loom_meta.edits`, after the fact.
+
+        **Once per run, not once per attempt.** The losing attempts wrote nothing, so they are not
+        edits; they are one edit that took three tries, and `attempts` on the row says so. The states
+        they lost to are not this run's to describe either — if the competing writer came through
+        Loom, its own record is already in this table, and if it did not, Loom could not describe it
+        honestly anyway. The alternative leaves a log in which most rows describe things that did not
+        happen.
+
+        **Only once the run named a row.** `run.addressed` is the gate: a `missing_parameter` or an
+        unparseable key never reached an object, so its record would carry no key and answer no audit
+        question. That is a *request* log — it belongs at the serve boundary, not in a table called
+        `edits`.
+
+        **After the write, never before.** Both orderings lose something, and this one loses the
+        thing that can be recovered. Log-then-write records intentions that may not have happened,
+        which makes every row in the table suspect; write-then-log loses the records of writes that
+        succeeded, which would be worse if the record were the only copy — and it is not. The row
+        write stamped `loom.edit_id` into its own Iceberg commit, so a crash in this gap leaves a
+        stamped snapshot with no matching row: a gap a reader can *find*, rather than silence. That
+        is also what makes `failed` answerable for the first time. The guarantee is asymmetric and
+        worth saying so: a lost record of a *refusal* is not detectable, because a refusal leaves
+        nothing in the lake to stamp. That is inherent to refusing, not a defect in the log.
+
+        **A failed append does not fail the action.** By the time this runs the row has committed;
+        returning `failed` would tell a caller to retry a delete that already happened. It comes back
+        as a non-retryable `log_failed` beside an otherwise unchanged status — and the same for a
+        catalog that implements no `EditLogWriter`, because making the log a precondition of the
+        write is a policy ("no log, no write") that belongs in M5 with the other policies, not wired
+        in here where nobody can turn it off."""
+        if not run.addressed:
+            return result
+        entry = EditRecord(
+            edit_id=edit_id,
+            recorded_at=now(),
+            actor=actor,
+            action=result.action,
+            object_type=result.object_type,
+            operation=result.operation,
+            catalog=target.backing_catalog,
+            table_name=target.backing_table,
+            object_key=render_key(result.key),
+            status=result.status,
+            attempts=result.attempts,
+            read_snapshot_id=result.read_snapshot_id,
+            parameters=run.bound,
+            before=result.before,
+            after=result.after,
+            failures=[f.as_json() for f in result.failures],
+        )
+        result = replace(result, edit_id=edit_id)
+        try:
+            catalog = self.catalog_for(target)
+            EditLog(catalog=catalog, writer=edit_log_writer_for(catalog)).record(entry)
+        except CatalogError as e:
+            return replace(
+                result,
+                failures=(
+                    *result.failures,
+                    Failure(
+                        code=LOG_FAILED,
+                        message=f"the run was not recorded in the edit log: {e}",
+                        detail={"editId": edit_id, "status": result.status},
+                    ),
+                ),
+            )
+        return result
 
     def catalog_for(self, obj: ObjectType) -> Catalog:
         catalog = self.catalogs.get(obj.backing_catalog)
@@ -150,8 +273,17 @@ class _Run:
     target: ObjectType
     dry_run: bool
     attempt: int = 1
+    edit_id: str = ""
+    actor: str = UNKNOWN_ACTOR
     failures: list[Failure] = field(default_factory=list)
     conflicted: bool = False
+    bound: dict[str, Any] | None = None
+    """The parameters as coerced, for the log. `None` until `_bind` has run and produced a key."""
+    addressed: bool = False
+    """Whether this run got as far as naming a row. The edit log's gate — see `_record`.
+
+    Distinct from `key is not None`, which cannot be the test: `None` is a key a nullable primary-key
+    column can genuinely hold, and `_result` has already flattened `_ABSENT` into it by then."""
 
     # ---- the four steps --------------------------------------------------------
 
@@ -171,6 +303,10 @@ class _Run:
         key = self._key(params)
         if key is _ABSENT:
             return self._result(REFUSED)
+        # From here the run has named an object, which is what makes it an attempted *edit* rather
+        # than a malformed call — and therefore what makes it worth a row in the log.
+        self.addressed = True
+        self.bound = params
 
         # The snapshot *before* the rows, not after: it makes the recorded id at-or-before the data
         # the rules were evaluated against, so the check can report a conflict that wasn't one but
@@ -412,20 +548,38 @@ class _Run:
         checked on the strongest reason of the three — and the objection gets the outcome it wanted
         anyway, because when the competing write really was a delete, the retry re-reads, finds
         nothing, and returns `object_not_found`. That is "it has already happened", said accurately,
-        rather than a delete reporting that it did work it did not do."""
+        rather than a delete reporting that it did work it did not do.
+
+        **And every verb carries this run's identity into the commit it produces.** The edit log is a
+        second commit and Iceberg has no transaction spanning two tables, so the stamp is the only
+        record of this write that cannot be separated from it. It is what turns a lost log row from
+        silence into a detectable gap, and it is why the log can be written afterwards at all."""
         writer: RowWriter = row_writer_for(catalog)
+        stamp = commit_properties(self.edit_id, self.action.api_name, self.actor)
         op = self.action.effect.op
         if op == "deleteObject":
-            writer.delete_row(table, key_column, key, expect_snapshot_id=snapshot)
+            writer.delete_row(
+                table, key_column, key, expect_snapshot_id=snapshot, commit_properties=stamp
+            )
             return
         if op == "createObject":
-            writer.insert_row(table, self._columns({}, values), expect_snapshot_id=snapshot)
+            writer.insert_row(
+                table,
+                self._columns({}, values),
+                expect_snapshot_id=snapshot,
+                commit_properties=stamp,
+            )
             return
         assert row is not None  # OBJECT_NOT_FOUND refused the run otherwise
         # `row` first, then the effect's columns over the top: every column the ontology does not
         # map survives the rewrite exactly as it was read.
         writer.replace_row(
-            table, key_column, key, self._columns(row, values), expect_snapshot_id=snapshot
+            table,
+            key_column,
+            key,
+            self._columns(row, values),
+            expect_snapshot_id=snapshot,
+            commit_properties=stamp,
         )
 
     def _columns(self, row: Mapping[str, Any], values: Mapping[str, Any]) -> dict[str, Any]:

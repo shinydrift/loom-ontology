@@ -185,7 +185,7 @@ that same ontology as MCP tools, driven end to end over stdio.
 
 ---
 
-## ⏳ M3 — Action runtime (single-object writeback)
+## ✅ Done — M3: Action runtime (single-object writeback)
 
 *Goal: `run_upgradeTier(...)` mutates one row atomically.*
 
@@ -195,10 +195,12 @@ that same ontology as MCP tools, driven end to end over stdio.
 - [x] `loom run` — one declared action, through the same entry point `run_<action>` will call.
 - [x] Optimistic concurrency — snapshot check carried into the commit; conflict → typed retryable
       error, retried up to `MAX_ATTEMPTS` first.
-- [ ] Edit-log (audit) table — actor, action, before/after, snapshot id.
-      *`conflict`'s `detail` already carries expected/found/changed — the shape this wants.*
+- [x] Edit-log (audit) table — actor, action, before/after, snapshot id. `_loom_meta.edits`, behind
+      a fourth port (`EditLogWriter`) that can name no table; refusals recorded, one row per run.
+      *`conflict`'s `detail` carried expected/found/changed into it unchanged, as predicted.*
 - [x] Tests: create / modify / delete happy paths, against the fake catalog and against live
-      pyiceberg — plus a real competing commit landing between a run's read and its write, on both.
+      pyiceberg — plus a real competing commit landing between a run's read and its write, on both,
+      and a record written beside a real row with the commit stamp that ties the two together.
 
 **Eight decisions taken in the first slice** (parameter binding, rule evaluation, one row written):
 
@@ -365,14 +367,99 @@ left open, and said it was leaving open):
   any of them is one this action reads or writes. An agent told only "conflict, retry" will hammer a
   table that is merely busy and give up just as readily when its intent has really been overtaken.
 
+**Eight decisions taken in the third slice** (the edit log — the last box, and the one that closes
+M3):
+
+- **A fourth port, and the count is the honest thing to change.** `insert_row` was the obvious home
+  and it is the wrong one: it *requires* `expect_snapshot_id`, and the log append follows no read and
+  puts no row over another, so there is no honest value to pass — before considering that it would
+  subject every action to a check against the hottest table in the system. A `CatalogWriter` held
+  beside the row writer reopens "an action cannot touch DDL, because the port has no verb for it" to
+  buy one append. And `append_rows` takes a table name and a batch, which is exactly the pair an
+  action must not hold. So `EditLogWriter`, one verb, **no table argument** — there is nothing to
+  point at the wrong table with. What it costs is the sentence in `catalog/base.py`: three ports and
+  two planes became four and three, the third plane being Loom's own record. The fake proves it —
+  a catalog implementing `RowWriter` and `EditLogWriter` and *not* `CatalogWriter` logs successfully,
+  which is an assertion no real catalog can make, because a real one implements every port at once.
+
+- **The first append creates the table; `apply` never learns it exists.** The alternatives were
+  `apply` creating it up front, or a run refusing without it — both give the log a precondition the
+  write does not have. Loom writes to lakes it never migrated (the whole posture `ambiguous_key`
+  exists for), and an audit trail that switches itself off in exactly those deployments is worse than
+  a create verb that can only reach `_loom_meta`. The quickstart seeds and runs without applying, and
+  still logs. Per catalog, like `applied`: an action only ever writes one catalog, and *what did this
+  actor do today* is a cross-table question a per-table sidecar cannot answer.
+
+- **A refusal is recorded, and the invariant is restated rather than weakened.** "A run that refuses
+  changes nothing" becomes "changes nothing **it was asked to change**" — no row, no column, no
+  table — and it is changed in all four places it appears rather than quietly reinterpreted in one. A
+  log of successes cannot answer *who tried to delete this customer*, and a conflict is a refusal, so
+  a contended row would otherwise leave no trace of the attempts it swallowed. Still true of
+  `loom apply`, which refuses before it holds a writer and records nothing: a stronger instance, not
+  an exception. The boundary is the key — a call that could not be bound never addressed a row, and a
+  record with no key answers no audit question (and every append is a commit, so an agent looping on
+  a malformed call would otherwise write one per attempt into the table meant to hold edits).
+
+- **Declared properties, because the physical row is a worse leak than the one the rule prevents.**
+  The never-report rule is extended to a new reader rather than excepted for one. An unabridged copy
+  of the data, in a table nothing governs, retained forever — and it is the copy that *outlives* the
+  row, so the shipped `forgetCustomer` action would erase a customer into a permanent record of them.
+  The incompleteness objection has a real answer rather than a shrug: the unmapped columns were
+  carried across unchanged and the commit asserted the snapshot the read saw, so **what the record
+  does not name, the run did not change** — the silence is the record of a guarantee. The bound
+  parameters are recorded too, because a refused modify has no `after` and would otherwise say that
+  somebody tried without saying what. What is *not* fixed — declared properties are still somebody's
+  data and still outlive a delete — is spec-v0's open edges rather than a thing that got past.
+
+- **The runtime never invents an actor.** `default_actor()` is honest for the commands a person runs
+  and a lie for `run_<action>`, where it names whoever started `loom serve` and stamps every caller
+  with one string. So `run` takes an `actor` argument, per call rather than per runtime because a
+  serving process is long-lived and a caller is not; `loom run` passes `default_actor()` in at the
+  one call site where it is true; nobody supplying one records `unknown`, which beats a confident
+  wrong answer. M5 unpicks nothing — the argument is already there and does not move.
+
+- **The record that has to be atomic is carried inside the commit.** Iceberg has no cross-table
+  transaction, so the row write and the log append are two commits and both orderings lose something:
+  log-then-write records intentions that may not have happened, write-then-log loses the records of
+  writes that succeeded. Neither is acceptable on its own, because a gap indistinguishable from
+  silence is not evidence. Iceberg has exactly one slot that *is* atomic with a row write — the
+  snapshot summary — so `RowWriter`'s three verbs grew a required `commit_properties`, and the write
+  stamps `loom.edit_id` into its own commit. This is the previous slice's move applied to a record
+  instead of a check, and `table_properties()`'s move one plane down. Given that, write-then-log
+  follows: a lost record is a stamped snapshot the log does not hold, which a reader can find, and
+  `failed` becomes answerable for the first time. The guarantee is asymmetric and says so — a lost
+  record of a *refusal* is undetectable, because a refusal leaves nothing to stamp. A failed append
+  never fails the action, which has committed; it is a non-retryable `log_failed` beside the real
+  status, which is where this diverges from `apply` (whose result lists what landed, so `failed`
+  there is unambiguous). A catalog with no edit-log port gets the same treatment: "no log, no write"
+  is a policy, and policies are M5.
+
+- **A retried run is one row.** The attempts that lost wrote nothing, so they are not edits; they are
+  one edit that took three tries, and `attempts` says so. The states they lost to are not this run's
+  to describe either — a competing writer coming through Loom has its own record in the same table,
+  and one that did not could never be described honestly. Three rows would mean most of the log
+  described things that did not happen.
+
+- **Rollback does not touch it, and `plan` cannot see it — but not for the reason it looked like.**
+  The premise that `loom.managed` is the marker plan and rollback key off turned out to be false:
+  that property is written by `apply` and read by *nothing*. What keeps both off `_loom_meta` is that
+  `diff_ontology` only ever visits `desired_tables(ontology)` — the tables the spec declares — which
+  is why `applied` was never proposed either. Pinned with a test now that an action can conjure a
+  table no spec has heard of. Rollback leaves the log alone for the ordinary reason: it reverses DDL
+  and only DDL, and the writer it holds has no verb that removes a row from anything.
+
 ---
 
 ## ⏳ M4 — MCP write surface + transport hardening
 
 *Goal: the action runtime shows up as tools; serve over more than stdio.*
 
-The read tools, the registry, and stdio `loom serve` land in M1 — what's left here is
-everything that depends on M2/M3 or on a second transport.
+The read tools, the registry, and stdio `loom serve` landed in M1; M2 and M3 are done, so what is
+left here is a transport and the surface over a runtime that already exists. Two seams M3 left
+pointing at this milestone: `ActionResult` is the shape `run_<action>` serializes rather than
+composes, and `ActionRuntime.run` takes the `actor` this transport has to supply — an unauthenticated
+one recording `unknown` is correct, and a served tool that never fills it in makes the edit log
+useless without failing anything, which is worth a test here rather than a hope.
 
 - [ ] Per action: `run_<action>` with JSON Schema from parameters, description from the spec.
 - [ ] Capability negotiation at serve — validate spec features vs. `engine.capabilities()`.
@@ -389,6 +476,13 @@ everything that depends on M2/M3 or on a second transport.
 - [ ] Design the `governance.policies` grammar (deliberately deferred in v0).
 - [ ] Enforce in the **resolver** (below MCP) so direct + agent calls filter the same way.
 - [ ] Column masking + row predicates; policy tests over both paths.
+- [ ] What the **edit log** holds under a policy. M3 deliberately left three questions here rather
+      than answering them where nobody could turn the answer off: whether `_loom_meta.edits` masks
+      under the same policies as a read (it records declared properties and the bound parameters —
+      less than the physical row, still somebody's data, in a table that outlives the row it
+      describes); whether a retention window expires it; and whether "no log, no write" is
+      expressible, since today an unloggable run still happens and reports `log_failed`. The record's
+      *shape* is not deferred — the columns are fixed, because the table is only ever created.
 
 ---
 

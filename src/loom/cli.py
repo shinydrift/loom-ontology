@@ -143,7 +143,12 @@ def cmd_run(args) -> int:
     something the tools can't, the ontology has a back door. That test is stronger here, because
     this one writes: so it takes an action apiName and named parameters, exactly the shape M4's
     `run_<action>` tool will take, and calls the same `ActionRuntime.run`. It cannot name a table,
-    a column, or a predicate, because the runtime has no argument for one."""
+    a column, or a predicate, because the runtime has no argument for one.
+
+    It does pass one thing the tool will pass differently: the actor. `default_actor()` lives here
+    rather than in the runtime because *here* is where it is true — a person at a terminal, or a CI
+    job that set `LOOM_ACTOR`. Over MCP the same string would name whoever started `loom serve`, so
+    `run_<action>` will pass what its transport authenticated, through this same argument."""
     diag = Diagnostics()
     try:
         ontology, config = _load_project(args.path, diag)
@@ -151,9 +156,10 @@ def cmd_run(args) -> int:
         print(str(e), file=sys.stderr)
         return 1
 
-    from .action import ActionError, ActionRuntime
-    from .catalog import CatalogError, open_catalogs
+    from .action import LOG_FAILED, ActionError, ActionRuntime
+    from .catalog import EDIT_LOG_TABLE, CatalogError, open_catalogs
     from .mcp.registry import json_safe
+    from .migrate.meta import default_actor
 
     # Argument shape before anything opens a catalog, as `loom query` does — a typo'd flag should
     # not need a reachable metastore to be reported.
@@ -189,13 +195,28 @@ def cmd_run(args) -> int:
         return 1
 
     try:
-        result = runtime.run(args.action, parameters)
+        result = runtime.run(args.action, parameters, actor=default_actor())
     except CatalogError as e:  # pragma: no cover - the runtime folds these into WRITE_FAILED
         print(f"error: {e}", file=sys.stderr)
         return 1
     print(json.dumps(json_safe(result.as_json()), indent=2, default=str))
     for failure in result.failures:
         print(f"error: {failure.code}: {failure.message}", file=sys.stderr)
+    unlogged = any(f.code == LOG_FAILED for f in result.failures)
+    if result.edit_id and not unlogged:
+        print(f"note: recorded in {EDIT_LOG_TABLE} as {result.edit_id}.", file=sys.stderr)
+    elif unlogged:
+        # The id is still worth printing: the row write stamped it into its own Iceberg commit, so it
+        # is how someone finds this write in the table's history now that the log has not got it.
+        print(
+            f"note: the edit log did not record this run — the commit it stamped carries "
+            f"{result.edit_id}.",
+            file=sys.stderr,
+        )
+    elif not result.edit_id:
+        # Said out loud rather than left to silence. For a refusal that never named an object this is
+        # correct and deliberate; anywhere else it is worth noticing.
+        print("note: nothing was recorded in the edit log — this run named no object.", file=sys.stderr)
     if result.read_snapshot_id != preview.read_snapshot_id:
         # The one thing the preview promised to tell them. The CLI is the only caller with a
         # before-and-after to compare, so it is the only one that can say the thinking time

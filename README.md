@@ -67,7 +67,7 @@ milestones. See [Status](#status).*
 
 ```
 5. Agent / MCP layer       ← LLMs call the ontology as typed verbs (never raw SQL)
-4. Action & function layer ← single-object writeback via the Iceberg catalog, optimistic concurrency
+4. Action & function layer ← single-object writeback via the Iceberg catalog, optimistic concurrency, audited
 3. SEMANTIC / ONTOLOGY layer ← object types, links, mappings   ★ the moat
 ------------------------------------------------------------
 2. Query / compute engine  ← engine-agnostic IR → DuckDB / Trino / Spark adapters
@@ -80,7 +80,8 @@ Two decisions shape the framework:
 - **Writes** are single-object and bypass the compute engine entirely — an equality-delete +
   append committed as one atomic Iceberg transaction — which keeps the write path uniform
   across engines. They also go through their own ports: one for a table's *shape*, one for its
-  *rows*, so a migration cannot touch data and an action cannot touch DDL.
+  *rows*, and one for Loom's own record, so a migration cannot touch data and an action cannot
+  touch DDL — nor name a table through the port it records itself with.
 
 ## Status
 
@@ -90,8 +91,11 @@ change would do to the physical tables, `loom apply` executes it (bootstrapping 
 from nothing but a spec), and `loom rollback` puts an earlier spec back. And the **action runtime**
 now writes: `loom run` binds an action's parameters, evaluates the validation rules the spec
 declares, and mutates one row as one Iceberg commit — with the snapshot its read saw asserted
-inside that commit, so a competing write refuses the run rather than silently losing to it. The
-edit log is the piece still to come.
+inside that commit, so a competing write refuses the run rather than silently losing to it. Every run
+that named a row leaves a record in `_loom_meta.edits`, **including the ones that refused**, because
+an audit trail of successes cannot say who *tried*; and the write stamps that record's id into its
+own Iceberg commit, so the log is an index over facts the lake already carries rather than the only
+copy of them. That completes M3 — what's next is exposing the runtime as MCP tools, and governance.
 
 | Component | State |
 |-----------|-------|
@@ -113,7 +117,7 @@ edit log is the piece still to come.
 | Migration rollback | ✅ `loom rollback` |
 | Action runtime — single-object writeback (`action/`) | ✅ `loom run` |
 | Optimistic concurrency — snapshot check | ✅ asserted inside the commit |
-| Edit-log (audit) table | ⏳ |
+| Edit-log (audit) table | ✅ `_loom_meta.edits` |
 | MCP `run_<action>` tools + HTTP transport | ⏳ |
 | Governance (row/column policies) | ⏳ |
 
@@ -126,7 +130,7 @@ edit log is the piece still to come.
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 371 tests
+pytest                              # 409 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 3 action(s)
 ```
 
@@ -140,9 +144,26 @@ loom validate --physical examples/retail/ontology     # check the spec against l
 loom query Customer examples/retail/ontology --key c1 # → one row, through DuckDB
 loom query Customer examples/retail/ontology --key c2 --link orders   # → a link traversal
 loom run upgradeTier examples/retail/ontology \
-  --param customer=c3 --param newTier=gold            # → one row, rewritten
+  --param customer=c3 --param newTier=gold            # → one row rewritten, one row recorded
 loom serve examples/retail/ontology                   # → 7 MCP tools over stdio
 ```
+
+That run also created `_loom_meta.edits` and appended to it — no `loom apply` in this lake's history
+at all, because the log is created by whatever run needs it first rather than by a migration:
+
+```
+$ loom run upgradeTier examples/retail/ontology --param customer=c3 --param newTier=gold --yes
+...
+note: recorded in _loom_meta.edits as cb24ed913c28437a8e658b1e1ea1d7bd.
+applied · Customer 'c3'
+```
+
+The record holds the actor, the action, the key, the status, the attempt count, the snapshot the
+write asserted, the bound parameters, and before/after **as the ontology sees them** — never the
+physical row, which would make the log an unabridged copy of the data that outlives the row it
+describes. Refused runs are in there too: a log of successes cannot say who *tried*. And the row
+write stamps `loom.edit_id` into its own Iceberg snapshot summary, so a record and the commit it
+describes can always be tied back together.
 
 Point any MCP client at that last command and the ontology shows up as typed tools:
 
@@ -171,7 +192,7 @@ same runtime in the meantime.
 Swapping the local warehouse for a production lake is a `loom.yaml` edit — `type: iceberg-rest`
 with a URI — not a spec or code change.
 
-Three properties of that generated surface are worth naming, because they're enforced rather than
+Four properties of that generated surface are worth naming, because they're enforced rather than
 documented:
 
 - **No raw SQL reaches the agent.** The resolver only emits plan nodes it built itself, so there is
@@ -181,6 +202,10 @@ documented:
 - **Declared types are honored on the way in and out.** A key arriving as `"42"` for a `long`
   property is coerced before it becomes a predicate, and `decimal` values never pass through a
   float.
+- **A write cannot alter a schema, and recording a write cannot reach a table.** Four ports, three
+  planes: reads, a table's shape, a table's rows, and Loom's own record. The action runtime holds
+  the last two, and neither has a verb for DDL — the edit-log port takes no table name at all.
+  Asserted against a fake catalog that implements exactly those ports and no others.
 
 ## Planning a schema change
 

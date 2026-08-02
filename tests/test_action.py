@@ -35,6 +35,7 @@ from loom.action import (
     ActionRuntime,
 )
 from loom.catalog.base import (
+    EDIT_LOG_TABLE,
     CatalogError,
     Column,
     ConcurrencyError,
@@ -58,20 +59,29 @@ CUSTOMERS = [
 
 
 class FakeRowCatalog:
-    """An in-memory catalog implementing the read port and `RowWriter` — and deliberately *not*
-    `CatalogWriter`.
+    """An in-memory catalog implementing the read port, `RowWriter` and `EditLogWriter` — and
+    deliberately *not* `CatalogWriter`.
 
     That absence is an assertion in itself: the action runtime is handed this and works, which
     means it never reached for a schema verb. The migration fake in `test_apply.py` is its mirror
-    image — schema verbs, no row verbs — and neither can do the other's job."""
+    image — schema verbs, no row verbs — and neither can do the other's job.
 
-    def __init__(self, rows=None, snapshot=1, fail_on=""):
+    The edit-log port keeps that true through the slice that gave the runtime something to record.
+    `append_edit` creates its table and appends to it, so the runtime provably does not need
+    `create_table` to log — which is the whole argument for a fourth port, and the one thing only a
+    fake can demonstrate. A real catalog implements every port at once and so can never show which
+    one was used."""
+
+    def __init__(self, rows=None, snapshot=1, fail_on="", log_fails=False):
         self.name = "rest_main"
         self.rows: dict[str, list[dict]] = {"crm.customers": [dict(r) for r in (rows or CUSTOMERS)],
                                             "sales.orders": []}
         self.snapshots = {t: snapshot for t in self.rows}
         self.log: list[tuple] = []
         self.fail_on = fail_on
+        self.log_fails = log_fails
+        self.edit_columns = None
+        self.commits: dict[tuple, dict] = {}
 
     # --- read port
     def table_exists(self, table: str) -> bool:
@@ -92,24 +102,35 @@ class FakeRowCatalog:
         return self.snapshots.get(table)
 
     # --- row write port
-    def insert_row(self, table, row, *, expect_snapshot_id):
+    def insert_row(self, table, row, *, expect_snapshot_id, commit_properties):
         self._guard(table, expect_snapshot_id)
         self.rows.setdefault(table, []).append(dict(row))
-        self._bump(table)
+        self._bump(table, commit_properties)
         self.log.append(("insert", table, dict(row)))
 
-    def replace_row(self, table, key_column, key_value, row, *, expect_snapshot_id):
+    def replace_row(self, table, key_column, key_value, row, *, expect_snapshot_id, commit_properties):
         self._guard(table, expect_snapshot_id)
         kept = [r for r in self.rows[table] if r.get(key_column) != key_value]
         self.rows[table] = [*kept, dict(row)]
-        self._bump(table)
+        self._bump(table, commit_properties)
         self.log.append(("replace", table, key_value, dict(row)))
 
-    def delete_row(self, table, key_column, key_value, *, expect_snapshot_id):
+    def delete_row(self, table, key_column, key_value, *, expect_snapshot_id, commit_properties):
         self._guard(table, expect_snapshot_id)
         self.rows[table] = [r for r in self.rows[table] if r.get(key_column) != key_value]
-        self._bump(table)
+        self._bump(table, commit_properties)
         self.log.append(("delete", table, key_value))
+
+    # --- edit-log port
+    def append_edit(self, columns, row):
+        """One append, to the one table this port can name. No snapshot argument, because there is
+        nothing to assert: the caller read nothing and is putting no row over another."""
+        if self.log_fails:
+            raise CatalogError("boom: the edit log is unreachable")
+        self.edit_columns = tuple(columns)
+        self.rows.setdefault(EDIT_LOG_TABLE, []).append(dict(row))
+        self.snapshots.setdefault(EDIT_LOG_TABLE, 0)
+        self.snapshots[EDIT_LOG_TABLE] += 1
 
     def _guard(self, table, expect_snapshot_id):
         """The compare-and-swap, which in one process and one thread is exactly what it says.
@@ -129,12 +150,20 @@ class FakeRowCatalog:
                 found=current,
             )
 
-    def _bump(self, table):
+    def _bump(self, table, commit_properties=None):
         self.snapshots[table] = self.snapshots.get(table, 0) + 1
+        # What a real catalog puts in the snapshot summary. Keyed by the snapshot it belongs to,
+        # because the point of the stamp is that it is inseparable from *that* commit.
+        self.commits[(table, self.snapshots[table])] = dict(commit_properties or {})
 
     @property
     def writes(self):
         return [e for e in self.log if e[0] in ("insert", "replace", "delete")]
+
+    @property
+    def edits(self):
+        """The edit log's rows, oldest first — appended in order, so insertion order is that."""
+        return [dict(r) for r in self.rows.get(EDIT_LOG_TABLE, [])]
 
     def row(self, table, key_column, key):
         return next((r for r in self.rows[table] if r.get(key_column) == key), None)
@@ -183,7 +212,7 @@ class Interloper:
         self.write = write or (lambda cat, n: cat.replace_row(
             "crm.customers", "id", "c1",
             {**cat.row("crm.customers", "id", "c1"), "region": f"apac-{n}"},
-            expect_snapshot_id=cat.snapshots["crm.customers"],
+            expect_snapshot_id=cat.snapshots["crm.customers"], commit_properties={},
         ))
         self.attempts = 0
         self._armed = False
@@ -214,16 +243,25 @@ class Interloper:
     def describe(self, table):  # pragma: no cover - the runtime never asks
         return self.inner.describe(table)
 
-    def insert_row(self, table, row, *, expect_snapshot_id):
-        self.inner.insert_row(table, row, expect_snapshot_id=expect_snapshot_id)
-
-    def replace_row(self, table, key_column, key_value, row, *, expect_snapshot_id):
-        self.inner.replace_row(
-            table, key_column, key_value, row, expect_snapshot_id=expect_snapshot_id
+    def insert_row(self, table, row, *, expect_snapshot_id, commit_properties):
+        self.inner.insert_row(
+            table, row, expect_snapshot_id=expect_snapshot_id, commit_properties=commit_properties
         )
 
-    def delete_row(self, table, key_column, key_value, *, expect_snapshot_id):
-        self.inner.delete_row(table, key_column, key_value, expect_snapshot_id=expect_snapshot_id)
+    def replace_row(self, table, key_column, key_value, row, *, expect_snapshot_id, commit_properties):
+        self.inner.replace_row(
+            table, key_column, key_value, row,
+            expect_snapshot_id=expect_snapshot_id, commit_properties=commit_properties,
+        )
+
+    def delete_row(self, table, key_column, key_value, *, expect_snapshot_id, commit_properties):
+        self.inner.delete_row(
+            table, key_column, key_value,
+            expect_snapshot_id=expect_snapshot_id, commit_properties=commit_properties,
+        )
+
+    def append_edit(self, columns, row):
+        self.inner.append_edit(columns, row)
 
 
 @pytest.fixture(scope="module")
@@ -596,7 +634,7 @@ def test_the_conflict_names_the_property_that_moved_when_it_is_one_this_action_i
         write=lambda cat, n: cat.replace_row(
             "crm.customers", "id", "c2",
             {**cat.row("crm.customers", "id", "c2"), "tier": ["bronze", "silver"][n % 2]},
-            expect_snapshot_id=cat.snapshots["crm.customers"],
+            expect_snapshot_id=cat.snapshots["crm.customers"], commit_properties={},
         ),
     )
     runtime = ActionRuntime(ontology=ontology, catalogs={"rest_main": catalog})
@@ -619,7 +657,7 @@ def test_the_conflict_diff_never_compares_a_column_no_property_maps(ontology):
         write=lambda cat, n: cat.replace_row(
             "crm.customers", "id", "c2",
             {**cat.row("crm.customers", "id", "c2"), "region": f"apac-{n}", "full_name": f"G. Hopper {n}"},
-            expect_snapshot_id=cat.snapshots["crm.customers"],
+            expect_snapshot_id=cat.snapshots["crm.customers"], commit_properties={},
         ),
     )
     runtime = ActionRuntime(ontology=ontology, catalogs={"rest_main": catalog})
@@ -645,7 +683,7 @@ def test_a_retry_re_evaluates_the_rules_against_the_row_it_is_about_to_write_ove
         strike_on=(1,),
         write=lambda cat, n: cat.replace_row(
             "crm.customers", "id", "c2", {**cat.row("crm.customers", "id", "c2"), "tier": "gold"},
-            expect_snapshot_id=cat.snapshots["crm.customers"],
+            expect_snapshot_id=cat.snapshots["crm.customers"], commit_properties={},
         ),
     )
     runtime = _with_rules(ontology, interloper, ("newTier != object.tier", "Already on that tier"))
@@ -666,7 +704,8 @@ def test_a_delete_whose_row_was_deleted_under_it_says_so_rather_than_claiming_th
         inner,
         strike_on=(1,),
         write=lambda cat, n: cat.delete_row(
-            "crm.customers", "id", "c2", expect_snapshot_id=cat.snapshots["crm.customers"]
+            "crm.customers", "id", "c2", expect_snapshot_id=cat.snapshots["crm.customers"],
+            commit_properties={},
         ),
     )
     runtime = ActionRuntime(ontology=ontology, catalogs={"rest_main": catalog})
@@ -689,7 +728,7 @@ def test_two_creates_on_one_key_cannot_both_append(ontology):
         write=lambda cat, n: cat.insert_row(
             "sales.orders",
             {"id": "o7", "customer_id": "c1", "total": Decimal("1.00"), "created_at": datetime.now()},
-            expect_snapshot_id=cat.snapshots["sales.orders"],
+            expect_snapshot_id=cat.snapshots["sales.orders"], commit_properties={},
         ),
     )
     runtime = ActionRuntime(ontology=ontology, catalogs={"rest_main": catalog})
