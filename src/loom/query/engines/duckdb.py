@@ -16,7 +16,24 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..engine import Capabilities, CompiledQuery, EngineError, ScanRequest
-from ..ir import Contains, Eq, GetByKey, Project, Search, Traverse
+from ..ir import (
+    And,
+    ColumnRef,
+    Compare,
+    Const,
+    Contains,
+    Eq,
+    GetByKey,
+    Not,
+    Or,
+    Predicate,
+    Project,
+    Search,
+    TableRef,
+    Traverse,
+    predicate_columns,
+    tables_of,
+)
 
 # DuckDB's LIKE metacharacters. A user searching for "50%" means the literal characters, so the
 # value is escaped and the pattern declares an ESCAPE clause.
@@ -75,17 +92,27 @@ class DuckDBEngine:
         else:
             raise EngineError(f"unsupported source node {type(src).__name__}")
 
+        # Every table the plan reads, not the one it projects: a traverse's anchor end is governed
+        # too, or the link is the way around a policy on the type you cannot search. `tables_of` is
+        # what makes that structural rather than remembered — see `ir.TableRef`.
+        governed, governed_params = self._governance(tables_of(src))
+        clauses = [c for c in (where, governed) if c]
+
         sql = f"SELECT {select} FROM {frm}"
-        if where:
-            sql += f" WHERE {where}"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += tail
-        return CompiledQuery(sql=sql, params=tuple(params) + tuple(tail_params), scans=scans)
+        return CompiledQuery(
+            sql=sql,
+            params=tuple(params) + tuple(governed_params) + tuple(tail_params),
+            scans=scans,
+        )
 
     def _compile_get(self, src: GetByKey, plan: Project):
         """LIMIT 2, not 1 (applied by `compile`): the resolver needs to *see* a duplicate primary
         key in the data rather than silently returning whichever row happened to come first."""
         alias = src.table.alias
-        columns = self._columns_for(plan, alias) | {src.key_column}
+        columns = self._columns_for(plan, src, alias) | {src.key_column}
         scans = (
             ScanRequest(
                 alias=alias,
@@ -104,7 +131,7 @@ class DuckDBEngine:
         clauses: list[str] = []
         params: list[Any] = []
         pushdown: list[tuple[str, Any]] = []
-        referenced = self._columns_for(plan, alias) | set(src.order_by)
+        referenced = self._columns_for(plan, src, alias) | set(src.order_by)
 
         for f in src.filters:
             referenced.add(f.column)
@@ -134,8 +161,8 @@ class DuckDBEngine:
 
     def _compile_traverse(self, src: Traverse, plan: Project):
         to_alias, from_alias = src.to_table.alias, src.from_table.alias
-        to_cols = self._columns_for(plan, to_alias) | {src.to_column} | set(src.order_by)
-        from_cols = {src.from_column, src.anchor.column} | self._columns_for(plan, from_alias)
+        to_cols = self._columns_for(plan, src, to_alias) | {src.to_column} | set(src.order_by)
+        from_cols = {src.from_column, src.anchor.column} | self._columns_for(plan, src, from_alias)
 
         if src.through is None:
             join = (
@@ -178,8 +205,81 @@ class DuckDBEngine:
         return join, where, [src.anchor.value], scans
 
     @staticmethod
-    def _columns_for(plan: Project, alias: str) -> set[str]:
-        return {c.column for c in plan.columns if c.alias == alias}
+    def _columns_for(plan: Project, src, alias: str) -> set[str]:
+        """The columns of one alias this query touches: what it projects, plus what a governance
+        predicate reads.
+
+        The two are not the same set, and deliberately: a policy may filter on a property it also
+        masks, so a scan has to carry a column the projection never asks for."""
+        projected = {c.column for c in plan.columns if c.alias == alias}
+        governed = {
+            column
+            for table in tables_of(src)
+            for a, column in predicate_columns(table.predicate)
+            if a == alias
+        }
+        return projected | governed
+
+    # ---- governance ------------------------------------------------------------
+
+    def _governance(self, tables: Sequence[TableRef]) -> tuple[str, list[Any]]:
+        """Every governed table's predicate, ANDed, in the order the plan names them.
+
+        Never a `ScanRequest` predicate: that channel is a documented pushdown *hint* an adapter
+        may ignore and the resolver re-applies, which is right for a caller's filter and wrong for
+        a policy. A governance predicate lives in the `WHERE` clause and nowhere else, which is
+        also what makes it filter *before* `LIMIT`/`OFFSET` — a page thinned after the fact would
+        make `hasMore` and `offset` lie."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        for table in tables:
+            if table.predicate is not None:
+                clauses.append(self._predicate(table.predicate, params))
+        return " AND ".join(clauses), params
+
+    def _predicate(self, pred: Predicate, params: list[Any]) -> str:
+        if isinstance(pred, And):
+            return f"({self._predicate(pred.left, params)} AND {self._predicate(pred.right, params)})"
+        if isinstance(pred, Or):
+            return f"({self._predicate(pred.left, params)} OR {self._predicate(pred.right, params)})"
+        if isinstance(pred, Not):
+            return f"(NOT {self._predicate(pred.term, params)})"
+        if isinstance(pred, Compare):
+            return self._compare(pred, params)
+        # `predicate.lower()` builds these and emits no others.
+        raise EngineError(f"unsupported predicate node {type(pred).__name__}")  # pragma: no cover
+
+    def _compare(self, cmp: Compare, params: list[Any]) -> str:
+        """**`==` is not `=` here.** §5 says null is a value — `null == null` is true — so the
+        equality a policy writes lowers to `IS NOT DISTINCT FROM`, which is the same statement in
+        SQL's vocabulary. `=` would return unknown instead, and under a `NOT` that flips a row from
+        excluded to admitted: the one place the two planes could disagree, closed at the one node
+        where they disagree.
+
+        Ordering is *not* lifted, and that is the other half of the same decision: SQL yields
+        unknown for `NULL > 100` and §5 refuses to order a null, so `predicate.admits` calls it
+        undecided and neither plane admits the row.
+
+        A null literal takes the shorter spelling — `IS NULL` says exactly what `IS NOT DISTINCT
+        FROM NULL` says, and needs no typed parameter for a value that has no type."""
+        left, right = cmp.left, cmp.right
+        if cmp.op in ("==", "!="):
+            negated = "NOT " if cmp.op == "!=" else ""
+            for a, b in ((left, right), (right, left)):
+                if isinstance(a, Const) and a.value is None:
+                    return f"{self._operand(b, params)} IS {negated}NULL"
+            distinct = "IS NOT DISTINCT FROM" if cmp.op == "==" else "IS DISTINCT FROM"
+            return f"{self._operand(left, params)} {distinct} {self._operand(right, params)}"
+        return f"{self._operand(left, params)} {cmp.op} {self._operand(right, params)}"
+
+    @staticmethod
+    def _operand(operand: Any, params: list[Any]) -> str:
+        if isinstance(operand, ColumnRef):
+            return _ref(operand.alias, operand.column)
+        if isinstance(operand, Const):
+            params.append(operand.value)
+            return "?"
+        raise EngineError(f"unsupported operand {type(operand).__name__}")  # pragma: no cover
 
     @staticmethod
     def _order_and_page(alias: str, order_by: Sequence[str], limit: int | None, offset: int):

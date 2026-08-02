@@ -8,22 +8,49 @@ new module under `engines/`, with nothing above this package changed.
 from __future__ import annotations
 
 from .engine import Capabilities, CompiledQuery, Engine, EngineError, ScanRequest
-from .ir import Column, Comparison, Contains, Eq, GetByKey, Plan, Project, Search, TableRef, Traverse
+from .ir import (
+    And,
+    Column,
+    ColumnRef,
+    Compare,
+    Comparison,
+    Const,
+    Contains,
+    Eq,
+    GetByKey,
+    Not,
+    Or,
+    Plan,
+    Predicate,
+    Project,
+    Search,
+    TableRef,
+    Traverse,
+    tables_of,
+)
 
 __all__ = [
+    "And",
     "Capabilities",
     "Column",
+    "ColumnRef",
+    "Compare",
     "Comparison",
     "CompiledQuery",
+    "Const",
     "Contains",
     "Engine",
     "EngineError",
     "Eq",
     "GetByKey",
+    "Not",
+    "Or",
     "Plan",
+    "Predicate",
     "Project",
     "ScanRequest",
     "Search",
     "TableRef",
     "Traverse",
+    "tables_of",
 ]

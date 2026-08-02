@@ -14,7 +14,7 @@ from decimal import Decimal
 
 import pytest
 
-from loom.action import EvalError, Scope, evaluate
+from loom.evaluate import EvalError, Scope, evaluate
 from loom.expr import ExprError
 from loom.expr import parse as parse_expr
 

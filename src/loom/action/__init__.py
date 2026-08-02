@@ -1,8 +1,10 @@
 """The action runtime — the kinetic layer, one object at a time.
 
 `run_upgradeTier(...)` binds its parameters, evaluates the validation rules the spec declares,
-mutates exactly one row, and records that it did. `runtime.py` is the loop, `evaluate.py` runs the
-expression language over real values, `result.py` is what comes back, `log.py` is what stays behind.
+mutates exactly one row, and records that it did. `runtime.py` is the loop, `result.py` is what comes
+back, `log.py` is what stays behind. The expression language it evaluates is `loom.evaluate`, which
+lived here until M5 gave it a second plane — a governance predicate is evaluated over a row by the
+same rules and is not an action.
 
 Ten rules shape the package. Each had an obvious-looking alternative:
 
@@ -133,7 +135,6 @@ Ten rules shape the package. Each had an obvious-looking alternative:
 
 from __future__ import annotations
 
-from .evaluate import EvalError, Scope, evaluate
 from .log import EDIT_COLUMNS, UNKNOWN_ACTOR, EditLog, EditRecord
 from .result import (
     AMBIGUOUS_KEY,
@@ -182,9 +183,6 @@ __all__ = [
     "ActionRuntime",
     "EditLog",
     "EditRecord",
-    "EvalError",
     "Failure",
-    "Scope",
     "build_runtime",
-    "evaluate",
 ]

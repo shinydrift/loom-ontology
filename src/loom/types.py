@@ -76,6 +76,25 @@ class PropType:
             return {"type": "string", "description": f"key of a {self.object_type}"}
         raise AssertionError(f"unhandled kind {k!r}")
 
+    @staticmethod
+    def of_literal(value: object) -> PropType | None:
+        """The type of an expression literal, or None for `null` — which has every type and so
+        constrains nothing.
+
+        Here rather than in either of its readers because it is a statement about the type system:
+        the validator infers it for a rule, `predicate.py` infers it for a policy, and a literal
+        that means `long` in one place and `int` in the other would be two answers to one
+        question."""
+        if isinstance(value, bool):
+            return PropType("boolean")
+        if isinstance(value, int):
+            return PropType("long")
+        if isinstance(value, float):
+            return PropType("double")
+        if isinstance(value, str):
+            return PropType("string")
+        return None
+
     def comparable_to(self, other: PropType) -> bool:
         """Whether two types can be compared/joined (link join props, expr comparisons).
         Same kind, or a numeric widening pair. enum compares as its string storage."""

@@ -372,16 +372,33 @@ def _governance_mode(resolver) -> list[str]:
 
     It says *deployment* out loud, because that is the part a reader is most likely to assume
     otherwise. Every caller of this server gets these same masks; there is no per-caller filtering
-    here, and a server that let somebody believe there was would be the support ticket."""
+    here, and a server that let somebody believe there was would be the support ticket.
+
+    **Row filters are named here and nowhere a caller can see**, which is the one place the two
+    halves of a policy are treated differently on purpose. A mask announces itself in every tool
+    description because the property names are already in the spec; a row predicate announces itself
+    only to whoever started the process, because to anybody else "these rows are filtered" is a
+    statement about data they were not shown. This banner goes to stderr, once, for the operator
+    holding the `loom.yaml` it is describing."""
     withheld = [
         f"{name}: {', '.join(resolver.masked(name))}"
         for name in resolver.ontology.object_types
         if resolver.masked(name)
     ]
-    if not withheld:
+    filtered = [
+        f"{name} (by {', '.join(resolver.policies.filtered_by(name))})"
+        for name in resolver.ontology.object_types
+        if resolver.policies.filtered_by(name)
+    ]
+    if not withheld and not filtered:
         return []
+    what = []
+    if withheld:
+        what.append(f"withhold {'; '.join(withheld)}")
+    if filtered:
+        what.append(f"filter the rows of {'; '.join(filtered)}")
     return [
-        f"governed · {len(resolver.policies.policies)} policy/policies withhold {'; '.join(withheld)}",
+        f"governed · {len(resolver.policies.policies)} policy/policies {' and '.join(what)}",
         "  (deployment-wide — every caller of this server is filtered the same way, and `loom query` "
         "against this config is filtered identically)",
     ]

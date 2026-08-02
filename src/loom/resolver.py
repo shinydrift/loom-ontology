@@ -6,11 +6,15 @@ only an object-type api name and property names that must exist in the model. Th
 "the LLM never receives raw SQL" structural rather than a convention — there is no code path from
 a tool call to arbitrary SQL, because the resolver only ever emits `ir` nodes it built itself.
 
-It's also where governance enforces (M5): column masks — and row predicates after them — belong
-*here*, below the MCP layer, so a direct API caller and an agent get filtered identically. A mask
-is applied to the **projection**, which is the strongest place available: a withheld property is
-never selected, so it is never in a result set for anything above to forget to drop. See
-`governance.py` for what a policy may say and why none of them names a caller.
+It's also where governance enforces (M5): column masks and row predicates belong *here*, below the
+MCP layer, so a direct API caller and an agent get filtered identically. A mask is applied to the
+**projection** and a predicate to the **table**, which are the two strongest places available: a
+withheld property is never selected and a withheld row is not in the table the query reads, so
+neither is in a result set for anything above to forget to drop. Nothing above this line has to
+know a policy exists — and for rows, nothing above it is *told*: a mask announces itself because
+the schema is public, and a row predicate does not because the rows are the data. See
+`governance.py` for what a policy may say and why none of them names a caller, and `predicate.py`
+for what a `rows:` expression means on the two planes that have to agree about it.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from typing import Any
 
 from .governance import PolicySet
 from .model import LinkType, ObjectType, Ontology, Property, coerce_value
+from .predicate import lower
 from .query.engine import Engine
 from .query.ir import Column, Comparison, Contains, Eq, GetByKey, Project, Search, TableRef, ThroughRef, Traverse
 
@@ -69,7 +74,14 @@ class Resolver:
     # ---- reads -----------------------------------------------------------------
 
     def get(self, object_type: str, key: Any) -> dict | None:
-        """Fetch one object by primary key. None when it doesn't exist."""
+        """Fetch one object by primary key. None when it doesn't exist — or when a policy does not
+        show it, which is the same answer on purpose: a caller that could tell the two apart would
+        have an existence oracle over the rows a `rows:` predicate withholds.
+
+        One honest consequence of that, since the duplicate-key check below reads the governed set:
+        under a predicate this can no longer *see* a duplicate primary key whose second row is
+        withheld. The write path still refuses it — `_Run._read` reads physically, and `ambiguous_key`
+        is the one refusal that has to, because an equality-delete on a doubled key removes both."""
         obj = self._object(object_type)
         plan = Project(
             source=GetByKey(
@@ -202,9 +214,21 @@ class Resolver:
             raise ResolverError(f"{ctx}: '{obj.api_name}' has no property '{name}'")
         return prop
 
-    @staticmethod
-    def _table(obj: ObjectType, alias: str) -> TableRef:
-        return TableRef(catalog=obj.backing_catalog, table=obj.backing_table, alias=alias)
+    def _table(self, obj: ObjectType, alias: str) -> TableRef:
+        """An object type as a table — and as the rows of it this deployment shows.
+
+        The one place a type becomes a table, which is why the row predicate is attached here: both
+        ends of a traverse are governed by this line rather than by two rules somebody has to
+        remember, and `get`, `search` and `list` are governed by it without asking. See
+        `ir.TableRef` for why the predicate rides on the table reference rather than on the three
+        source nodes."""
+        expr = self.policies.predicate_for(obj.api_name)
+        return TableRef(
+            catalog=obj.backing_catalog,
+            table=obj.backing_table,
+            alias=alias,
+            predicate=None if expr is None else lower(expr, obj, alias),
+        )
 
     def masked(self, object_type: str) -> tuple[str, ...]:
         """The properties a policy withholds from every read of this type.

@@ -2,8 +2,9 @@
 
 An ontology says what exists; a `loom.yaml` says what this deployment will show of it. This module
 is the grammar between them, and the enforcement lives one rung below every surface that asks —
-in `Resolver._projection` and in `_Run._project` — so `loom query`, a `get_` tool and an action's
-`before` all withhold the same property for the same reason.
+in `Resolver._projection` and in `_Run._project` for a masked property, in `Resolver._table` and
+`_Run._admitted` for a withheld row — so `loom query`, a `get_` tool and an action's `before` all
+withhold the same thing for the same reason.
 
 **No policy in this milestone names a principal, and that is the decision the grammar is built
 around.** The obvious shape for a policy is "this caller sees these rows", and it was rejected for a
@@ -28,11 +29,19 @@ whoever wrote it, exactly like one that was obeyed.
 
 *The schema is public; the data is not.* A mask **announces itself** — the property list is already
 in the spec, in the tool description and in the JSON Schema, so saying "withheld" tells a caller
-nothing the surface did not already say. A row predicate (the next slice) will not announce itself,
-because the rows *are* the data and "you may not see this one" is an existence oracle over it. The
-same principle decides a question that looks unrelated: filtering on a masked property is a refusal
-rather than an empty result, because an empty result is an oracle (a substring filter on a withheld
-column binary-searches its value) and a refusal only repeats what the mask already said.
+nothing the surface did not already say. A row predicate **does not**, because the rows *are* the
+data and "you may not see this one" is an existence oracle over it: a filtered row is simply
+absent, `get_` says `found: false`, and no tool description gains a sentence. The same principle
+decides a question that looks unrelated: filtering on a masked property is a refusal rather than an
+empty result, because an empty result is an oracle (a substring filter on a withheld column
+binary-searches its value) and a refusal only repeats what the mask already said.
+
+It also decides what a row predicate does when it cannot be evaluated over a row, which was the
+hardest question of the slice that landed the predicates. Nothing can be *reported*: per row there
+is no channel, and per call, "this row exists but I could not decide about it" is the oracle again.
+So an undecided predicate does not admit, and `predicate.py` carries the rest of that argument —
+including why it makes the read path's SQL and the write path's in-process evaluation agree instead
+of drift.
 
 *Policies subtract, never add.* A policy can withhold; none can grant, and none can widen what the
 config already permits — which is why `mcp.writes` stays a switch of its own rather than being
@@ -69,9 +78,12 @@ from dataclasses import dataclass, field
 
 from ._shape import check_keys, suggest
 from .errors import Diagnostics, SourceLoc
+from .expr import Binary, Expr, ExprError
+from .expr import parse as parse_expr
 from .model import Ontology, properties_in_play
+from .predicate import check as check_predicate
 
-ENFORCED_KEYS = frozenset({"name", "objectType", "mask"})
+ENFORCED_KEYS = frozenset({"name", "objectType", "mask", "rows"})
 """The keys a policy may carry today, all of which change what a caller gets."""
 
 
@@ -88,11 +100,6 @@ class Reserved:
 
 
 RESERVED_KEYS: Mapping[str, Reserved] = {
-    "rows": Reserved(
-        why="row predicates are not enforced yet",
-        hint="drop it until the next slice lands — a declared row filter that Loom ignores is worse "
-        "than one it refuses, because it reads like protection",
-    ),
     "audit": Reserved(
         why="'no log, no write' is not enforced yet",
         hint="drop it until the slice that makes an unloggable run refuse; today a run whose record "
@@ -108,9 +115,12 @@ RESERVED_KEYS: Mapping[str, Reserved] = {
 """Every other key, with the reason it is refused.
 
 Together with `ENFORCED_KEYS` this covers `POLICY_KEYS` exactly, under a test — the same device
-`negotiate.NEGOTIATED` uses, so a fourth key has to be declared as one kind or the other instead of
+`negotiate.NEGOTIATED` uses, so a fifth key has to be declared as one kind or the other instead of
 arriving as a third: silently accepted. That third kind is how `loom.managed` got written by `apply`
-and read by nothing for two milestones."""
+and read by nothing for two milestones.
+
+`rows` was here and is now enforced, which is what the reservation was for: nothing written against
+the refusal has to change, because a config that was refused is a config nobody deployed."""
 
 POLICY_KEYS = ENFORCED_KEYS | set(RESERVED_KEYS)
 
@@ -126,11 +136,18 @@ class Policy:
     `object_type` is spelled `objectType:` in YAML, which is Loom's own vocabulary for the same
     thing (§7's `traverse` takes an `objectType`) and dodges a trap the obvious spelling walks into:
     under YAML 1.1 the bare key `on:` resolves to the boolean `True`, so a policy written that way
-    would arrive with a key no grammar could name."""
+    would arrive with a key no grammar could name.
+
+    `rows` is a parsed `Expr` rather than the string it was written as, because there is one
+    expression language and this is it: `rows: "object.tier == 'gold'"` and an action's
+    `rule: "newTier != object.tier"` are the same grammar, parsed by the same function. What it may
+    *contain* is narrower — see `predicate.py` — and that is checked against the ontology at bind,
+    not here."""
 
     name: str
     object_type: str
     mask: tuple[str, ...] = ()
+    rows: Expr | None = None
 
 
 @dataclass(frozen=True)
@@ -144,10 +161,17 @@ class PolicySet:
     `masks` is the resolution rather than a cache: object type -> property -> the policy that
     withheld it. Resolved once at bind rather than per read, because the answer cannot change
     between two calls of a process — which is a consequence of policies being deployment-scoped, and
-    the thing that stops being true when a principal arrives per call."""
+    the thing that stops being true when a principal arrives per call.
+
+    `filters` is the same statement for rows: object type -> the policies that filter it, in
+    declared order, each with the expression it filters by. Kept as a list rather than pre-combined
+    so a refusal, a banner or a test can still name *which* policy is doing the withholding —
+    `predicate_for` is the combination, and it is a conjunction because policies subtract and never
+    add."""
 
     policies: tuple[Policy, ...] = ()
     masks: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    filters: Mapping[str, tuple[tuple[str, Expr], ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # A `PolicySet` holding policies whose masks are not in the resolution is the failure this
@@ -184,6 +208,30 @@ class PolicySet:
                 f"{', '.join(orphaned)} is withheld by a policy this set does not declare — every "
                 "mask is attributable to a policy somebody wrote"
             )
+        # Both statements again for rows, because a filter that is declared and not resolved is the
+        # same failure as a mask that is: a config that reads like protection and enforces none.
+        unfiltered = [
+            p.name
+            for p in self.policies
+            if p.rows is not None
+            and p.name not in {name for entries in self.filters.values() for name, _ in entries}
+        ]
+        if unfiltered:
+            raise ValueError(
+                f"policy {', '.join(unfiltered)} declares a row filter that is not in the "
+                "resolution — a PolicySet must be built by bind_policies()"
+            )
+        unattributed = [
+            f"{object_type} (by '{name}')"
+            for object_type, entries in self.filters.items()
+            for name, _ in entries
+            if name not in declared
+        ]
+        if unattributed:
+            raise ValueError(
+                f"rows of {', '.join(unattributed)} are filtered by a policy this set does not "
+                "declare — every filter is attributable to a policy somebody wrote"
+            )
 
     def __bool__(self) -> bool:
         return bool(self.policies)
@@ -195,6 +243,34 @@ class PolicySet:
     def masked_by(self, object_type: str, property_name: str) -> str | None:
         """Which policy withholds this property, or None if nothing does."""
         return self.masks.get(object_type, {}).get(property_name)
+
+    def filtered_by(self, object_type: str) -> tuple[str, ...]:
+        """Which policies filter the rows of this object type, in declared order.
+
+        For an operator reading a startup banner, never for a caller reading a result: a mask
+        announces itself because the property names are already in the spec, and a row predicate
+        does not because the rows are the data. See `governance.py`'s two rules."""
+        return tuple(name for name, _ in self.filters.get(object_type, ()))
+
+    def predicate_for(self, object_type: str) -> Expr | None:
+        """Every policy's row filter for this type, as one expression, or None if none filters it.
+
+        **A conjunction, and that is forced rather than chosen.** Policies subtract and never add,
+        so two policies filtering one type can only mean *both*; an `||` would let a second policy
+        widen what the first permitted, which is the one thing no policy may do. It also makes
+        composition order-free, exactly as masks union — `test_governance.py` asserts the
+        monotonicity rather than trusting it.
+
+        Combined here rather than at bind so `filters` keeps naming the policy behind each half."""
+        entries = self.filters.get(object_type, ())
+        if not entries:
+            return None
+        if len(entries) == 1:
+            return entries[0][1]
+        root: object = entries[0][1].root
+        for _, expr in entries[1:]:
+            root = Binary("&&", root, expr.root)
+        return Expr(root=root, raw=" && ".join(f"({expr.raw})" for _, expr in entries))
 
 
 def parse_policies(raw: object, loc: SourceLoc, diag: Diagnostics) -> tuple[Policy, ...]:
@@ -239,32 +315,47 @@ def parse_policies(raw: object, loc: SourceLoc, diag: Diagnostics) -> tuple[Poli
             diag.error(f"{ctx} needs an 'objectType' naming the type it governs", loc)
             continue
 
-        mask = entry.get("mask")
-        if mask is None:
+        mask, rows = entry.get("mask"), entry.get("rows")
+        if mask is None and rows is None:
             # Not a warning. A policy that withholds nothing is the shape this module exists to
             # prevent: it reads, to whoever wrote it and to whoever reviews the deployment, exactly
             # like one that is protecting something.
             diag.error(
                 f"{ctx} withholds nothing", loc,
-                "give it a 'mask' of property names — a policy with no effect reads like protection",
+                "give it a 'mask' of property names, a 'rows' predicate, or both — a policy with no "
+                "effect reads like protection",
             )
-            continue
-        if isinstance(mask, (str, bytes)) or not isinstance(mask, Sequence):
-            diag.error(f"{ctx}: 'mask' must be a list of property names, got {mask!r}", loc)
-            continue
-        if not mask:
-            diag.error(f"{ctx}: 'mask' is empty, so the policy withholds nothing", loc)
-            continue
-        if not all(isinstance(m, str) and m.strip() for m in mask):
-            diag.error(f"{ctx}: 'mask' entries must be non-empty property names, got {list(mask)!r}", loc)
             continue
 
+        columns: tuple[str, ...] = ()
+        if mask is not None:
+            if isinstance(mask, (str, bytes)) or not isinstance(mask, Sequence):
+                diag.error(f"{ctx}: 'mask' must be a list of property names, got {mask!r}", loc)
+                continue
+            if not mask:
+                diag.error(f"{ctx}: 'mask' is empty, so the policy withholds nothing", loc)
+                continue
+            if not all(isinstance(m, str) and m.strip() for m in mask):
+                diag.error(f"{ctx}: 'mask' entries must be non-empty property names, got {list(mask)!r}", loc)
+                continue
+            columns = tuple(dict.fromkeys(m.strip() for m in mask))
+
+        predicate: Expr | None = None
+        if rows is not None:
+            # Parsed here and checked against the ontology at bind, the same two phases the whole
+            # module splits along: this runs where the config is read and there is no spec in hand,
+            # so it can say "that is not an expression" and nothing about what it may say.
+            if not isinstance(rows, str) or not rows.strip():
+                diag.error(f"{ctx}: 'rows' must be an expression, got {rows!r}", loc)
+                continue
+            try:
+                predicate = parse_expr(rows)
+            except ExprError as e:
+                diag.error(f"{ctx}: 'rows' is not a valid expression: {e}", loc)
+                continue
+
         out.append(
-            Policy(
-                name=name,
-                object_type=object_type.strip(),
-                mask=tuple(dict.fromkeys(m.strip() for m in mask)),
-            )
+            Policy(name=name, object_type=object_type.strip(), mask=columns, rows=predicate)
         )
     return tuple(out)
 
@@ -292,6 +383,7 @@ def bind_policies(ontology: Ontology, policies: Sequence[Policy]) -> PolicySet:
     """
     problems: list[str] = []
     masks: dict[str, dict[str, str]] = {}
+    filters: dict[str, list[tuple[str, Expr]]] = {}
 
     for policy in policies:
         obj = ontology.object_types.get(policy.object_type)
@@ -339,6 +431,24 @@ def bind_policies(ontology: Ontology, policies: Sequence[Policy]) -> PolicySet:
                 continue
             masks.setdefault(obj.api_name, {}).setdefault(name, policy.name)
 
+        if policy.rows is not None:
+            # A row predicate has no equivalent of the four refusals above, and that is a
+            # consequence of what it does rather than an oversight. A mask cannot withhold a
+            # primary key, a link's join property or a property an action touches, because each of
+            # those is a surface still trying to *use* the value. A predicate uses the value and
+            # shows nobody: it may filter on the key, on a join property, on a property an action
+            # reads — and on one the same policy masks, which is Loom filtering rather than the
+            # caller. What it may not do is be a predicate the two planes could answer differently,
+            # which is the whole of what `predicate.check` refuses.
+            refusals = check_predicate(policy.rows, obj, ontology.object_types)
+            problems += [
+                f"policy '{policy.name}' filters rows of '{obj.api_name}' by "
+                f"'{policy.rows.raw}': {refusal}"
+                for refusal in refusals
+            ]
+            if not refusals:
+                filters.setdefault(obj.api_name, []).append((policy.name, policy.rows))
+
     if problems:
         lines = ["governance policies do not fit this ontology:"]
         lines += [f"  - {p}" for p in problems]
@@ -352,7 +462,11 @@ def bind_policies(ontology: Ontology, policies: Sequence[Policy]) -> PolicySet:
         }
         for api_name, props in masks.items()
     }
-    return PolicySet(policies=tuple(policies), masks=ordered)
+    return PolicySet(
+        policies=tuple(policies),
+        masks=ordered,
+        filters={name: tuple(entries) for name, entries in filters.items()},
+    )
 
 
 def _link_uses(ontology: Ontology, object_type: str, property_name: str) -> list[str]:

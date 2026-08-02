@@ -245,8 +245,11 @@ def test_governance_policies_are_parsed(tmp_path: Path):
 
 def test_unenforceable_policy_keys_refuse_to_start(tmp_path: Path):
     """Silently ignoring an access policy is worse than not booting, and that did not change when
-    enforcement landed — it moved down to the key. A row predicate Loom cannot compile reads, to
-    whoever wrote it, exactly like one it obeyed."""
+    enforcement landed — it moved down to the key. An audit clause Loom cannot honour reads, to
+    whoever wrote it, exactly like one it obeyed.
+
+    `rows` used to be one of these and is now enforced, which is what a reservation is for: the
+    config that named it was refused, so nobody was running one when the meaning arrived."""
     _, diag = _load(
         tmp_path,
         """
@@ -257,11 +260,30 @@ def test_unenforceable_policy_keys_refuse_to_start(tmp_path: Path):
               objectType: Order
               mask: [notes]
               rows: "object.region == 'EU'"
+              audit: { retain: 30d }
               when: "principal.id == 'analyst'"
         """,
     )
-    assert any("'rows'" in e.message and "not enforced yet" in e.message for e in diag.errors)
+    assert any("'audit'" in e.message and "not enforced yet" in e.message for e in diag.errors)
     assert any("'when'" in e.message and "attest" in e.message for e in diag.errors)
+    assert not any("'rows'" in e.message for e in diag.errors)
+
+
+def test_a_malformed_mask_is_reported_rather_than_crashing(tmp_path: Path):
+    """The shape checks either side of "withholds nothing", which moved up a level when `rows:`
+    gave a policy a second way to withhold something."""
+    _, diag = _load(
+        tmp_path,
+        """
+        catalogs: { c: { type: iceberg-rest, uri: x } }
+        governance:
+          policies:
+            - { name: a, objectType: Customer, mask: ssn }
+            - { name: b, objectType: Customer, mask: ["", "ok"] }
+        """,
+    )
+    assert any("'mask' must be a list of property names" in e.message for e in diag.errors)
+    assert any("must be non-empty property names" in e.message for e in diag.errors)
 
 
 def test_a_policy_written_with_on_is_reported_not_crashed(tmp_path: Path):

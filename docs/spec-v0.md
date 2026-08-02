@@ -492,8 +492,9 @@ to describe — a competing writer coming through Loom has its own record in the
 ## 5. Expression mini-language
 
 Deliberately tiny so it stays portable across engines and safe to evaluate. Used in
-`validation[].rule` (must yield boolean) and effect value positions (must yield the target
-property's type). Written inline or inside `{{ … }}`.
+`validation[].rule` (must yield boolean), effect value positions (must yield the target property's
+type), and a governance policy's `rows:` predicate (§6.1, which narrows what it may contain but not
+what any of it means). Written inline or inside `{{ … }}`.
 
 - **References:** a bare identifier `paramName` resolves to a parameter; `object.propName`
   resolves to the *current* value of the target object's property (for `modify`/`delete`).
@@ -527,14 +528,24 @@ Type-checking happens offline (§4 rule 3); this is what the values themselves d
   rather than a silent choice of precision. `timestamp` is tz-aware. A number destined for an
   `int`/`long` property must be integral; it is never truncated to fit.
 - **Null is a value, not an unknown.** `null != 'gold'` is **true** and `null == null` is **true**.
-  This is deliberately not SQL's three-valued logic: the language is evaluated in process over one
-  already-fetched row and never reaches SQL, and an "unknown" precondition would leave the runtime
-  no safe option but to refuse — making `null` a hazard in every rule written about a nullable
-  property. A precondition is meant to be a decision.
+  This is deliberately not SQL's three-valued logic: an "unknown" precondition would leave the
+  runtime no safe option but to refuse, making `null` a hazard in every rule written about a
+  nullable property. A precondition is meant to be a decision.
+
+  This used to be argued from "the language never reaches SQL", and §6.1's row predicates make that
+  half false — one *is* compiled into a query. The rule survives the correction unchanged, and is
+  stronger for being argued from what it is for: equality means the same thing on both planes
+  because the lowering says `IS NOT DISTINCT FROM`, not because nothing was listening. What a
+  predicate does differently is not the meaning of an operator but the **disposition of "cannot
+  decide"**: a rule reports `expression_error` to the caller who can fix it, and a policy, having
+  nobody to tell, does not admit the row.
 - **But null cannot be ordered or computed with.** `<`, `<=`, `>`, `>=`, arithmetic, `!` and the
   boolean operators all fail on null rather than inventing an answer. `&&` and `||` short-circuit,
   which is what makes that workable — `object.ltv != null && object.ltv > 100` is the idiom, and
-  `coalesce` is in the allow-list for the same reason.
+  `coalesce` is in the allow-list for the same reason. (In a `rows:` predicate they do **not**
+  short-circuit: nothing there raises, so the only thing short-circuiting could still do is make
+  the answer depend on the order the operands were written in — which is exactly what SQL does not
+  do, and therefore what the two planes could disagree about.)
 - **A rule that cannot be evaluated is not a rule that returned false.** It is its own failure
   code (`expression_error`), because an agent should not retry the two the same way.
 
@@ -570,6 +581,7 @@ governance:                       # optional · row/column policies enforced in 
     - name: hide-ltv              # required, unique — a refusal names it
       objectType: Customer        # the objectType it governs
       mask: [ltv]                 # properties withheld from every read of that type
+      rows: "object.deletedAt == null"   # and the rows it will show · §5, narrowed
 ```
 
 ### 6.1 `governance.policies`
@@ -586,19 +598,24 @@ string about a deployment that reaches the edit log and nothing else, so nothing
 around a value that a per-call principal will replace.
 
 `when:` is the clause an attested caller turns on. It is **named and refused** — like every other
-key Loom cannot yet enforce (`rows:`, `audit:`) — because a config that is silently ignored reads,
-to whoever wrote it, exactly like one that was obeyed.
+key Loom cannot yet enforce (`audit:`) — because a config that is silently ignored reads, to
+whoever wrote it, exactly like one that was obeyed.
 
 **Two rules decide the rest.**
 
 *The schema is public; the data is not.* A **mask announces itself** — in `masked` on every read
 tool's result, and in the tool description — because the property names are already in the spec and
-in the JSON Schema, so saying "withheld" tells a caller nothing new. A row predicate will not
-announce itself, because the rows *are* the data. The same rule settles a question that looks
-unrelated: **filtering on a masked property is refused, not answered emptily**, since an empty
-result is an oracle (a substring filter on a withheld column binary-searches its value) while a
-refusal only repeats what the mask already said. A masked property also leaves the `filter` schema,
-for the reason `loom serve` refuses to start rather than advertise a tool that fails on every call.
+in the JSON Schema, so saying "withheld" tells a caller nothing new. A **row predicate does not**,
+because the rows *are* the data: a withheld row is simply **absent**, `get_` answers `found: false`
+in the same words it uses for a key that never existed, and no tool description gains a sentence.
+The same rule settles two questions that look unrelated. **Filtering on a masked property is
+refused, not answered emptily**, since an empty result is an oracle (a substring filter on a
+withheld column binary-searches its value) while a refusal only repeats what the mask already said;
+a masked property also leaves the `filter` schema, for the reason `loom serve` refuses to start
+rather than advertise a tool that fails on every call. And **a row predicate that cannot be
+evaluated over a row cannot report it** — per row there is no channel, and per call, "this row
+exists but I could not decide about it" is the existence oracle again. So it does not admit, which
+is the whole of the null question below.
 
 *Policies subtract, never add.* None can grant, and none can widen what the config already permits —
 which is why `writes` above stays a switch of its own rather than being subsumed. Masks union, so
@@ -618,12 +635,52 @@ declaration order cannot matter.
   reading a withheld property is an oracle the caller drives, and an effect writing one changes data
   the deployment says the caller may not see.
 
+**None of the last three carries over to `rows:`**, and that is a consequence rather than an
+oversight: each of them is a surface still trying to *use* a value it may not read. A predicate uses
+the value and shows nobody, so it may filter on a primary key, on a link's join property, or on a
+property an action reads. Only the first refusal survives — a predicate naming a property the spec
+does not declare is the same invisible typo a mask is.
+
 **Where it is enforced: the projection, on both planes.** A masked property is never *selected*, so
 it is not in the result set for any layer above to forget to drop, and `_loom_meta.edits` inherits
 the mask because `before`/`after` are built from the same projection. The physical row is untouched:
 a masked column is **carried across** a `modify` exactly as an unmapped one is (§4.1) — withheld
 from the account of the write, never from the write, or the policy would destroy the data it exists
 to protect.
+
+**`rows:` is §5, narrowed to what two evaluators can be made to agree on.** It is the same
+expression language a validation rule is written in — one grammar, one parser, `object.<prop>` for
+a property, and no parameters because a policy has none. What it may *contain* is smaller:
+comparisons between the row's own properties and literals, composed with `&&`, `||` and `!`, and
+nothing else. Arithmetic, `lower()`, `len()` and `coalesce()` are **refused at load, naming the
+node**, on one rule — *a predicate is lowerable when Loom, not the engine, decides what every
+operator means.* `now()` is refused with them, for the one reason that is not about engines: it
+puts a clock inside a filter, and *which instant, the read's or the run's* is a decision worth
+writing down rather than inheriting. The subset may only ever widen, which accepts predicates that
+used to be refused and cannot change one already written.
+
+It has to mean the same thing twice, because the two planes read differently: the read path
+**compiles it into the query** (it must filter before `LIMIT`/`OFFSET`, or `hasMore` lies), and the
+write path **evaluates it in process over one row**, because the action runtime reads through the
+catalog rather than the resolver and an agent that cannot see a row must not be able to act on it.
+
+*Null: three answers, one admission rule.* A predicate is true, false, or **undecided**, and a row
+is admitted **only on true**. `==` and `!=` never return undecided — §5's "null is a value" is kept
+exactly, which is what makes `object.deletedAt == null` expressible, and it is carried into SQL as
+`IS NOT DISTINCT FROM` rather than `=`. Ordering a null is undecided rather than an error, and
+`!`, `&&`, `||` propagate it by the rules SQL's own `NOT`/`AND`/`OR` already follow — so the two
+lowerings agree by construction, and negation stays fail-closed. The alternative that looks
+simpler — make every leaf definitely true or false on both planes — fails open: `!(object.ltv >
+100)` becomes `!false` for a null `ltv` and *admits* the row a policy was written to exclude.
+
+*Applied to every governed table a read touches*, so a link is not the way around a filter: you
+cannot traverse *from* a customer this deployment does not show you, and you cannot land on one.
+And *the write path gates the row it read, never the row it writes* — a `modify` may move a row out
+of the predicate, which is what a soft delete is. One consequence is deliberate and worth naming: a
+`create` still reports `object_exists` for a key held by a row the policy excludes, because that
+check has to be physical or two creates manufacture a duplicate primary key nothing can repair. On
+that one path a predicate hides rows and not keys, and what it discloses is confined to *something
+exists under the key you supplied*.
 
 **`engine.type` is negotiated against the ontology, not just resolved.** An adapter reports what it
 can do, and a spec implies what will be asked of it: declaring a link means a traverse joins two

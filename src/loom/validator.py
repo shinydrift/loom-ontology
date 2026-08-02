@@ -240,15 +240,7 @@ class _ExprChecker:
         return None
 
     def _literal_type(self, v) -> PropType | None:
-        if isinstance(v, bool):
-            return PropType("boolean")
-        if isinstance(v, int):
-            return PropType("long")
-        if isinstance(v, float):
-            return PropType("double")
-        if isinstance(v, str):
-            return PropType("string")
-        return None  # null
+        return PropType.of_literal(v)  # None for null, which has every type
 
     def _ref_type(self, ref: Ref) -> PropType | None:
         if len(ref.path) == 1:
