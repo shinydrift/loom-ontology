@@ -3,7 +3,13 @@
 These tests import no MCP SDK and open no transport — that's the reason the registry is separate
 from the server. The load-bearing assertion is `test_no_tool_can_take_a_query`: the framework's
 central claim is that an ontology compiles to typed verbs, so if a raw-SQL escape hatch ever
-appears in the generated surface, it fails here.
+appears in the generated surface, it fails here. The write tools widened that surface, so the
+assertion now walks every nested object in a schema rather than the two levels it knew about.
+
+The `run_` half is driven through the same `FakeRowCatalog` the runtime's own tests use, which is
+what lets one assertion here be about the *process* rather than the tool: that catalog implements
+`RowWriter` and `EditLogWriter` and deliberately not `CatalogWriter`, so a server built over it
+proves a serving process can change rows and no schema at all.
 """
 
 import datetime as dt
@@ -14,10 +20,18 @@ from pathlib import Path
 import pytest
 
 from loom import build
-from loom.mcp.registry import build_tools, json_safe, snake_case
-from loom.mcp.server import LoomMCPServer
+from loom.action import APPLIED, CONFLICT, PREVIEWED, REFUSED, UNKNOWN_ACTOR, ActionRuntime
+from loom.catalog.base import CatalogError, writer_for
+from loom.config import LoomConfig, McpConfig
+from loom.mcp.registry import DRY_RUN_ARG, PARAMETERS_ARG, RESERVED_RUN_ARGS, build_tools, json_safe, snake_case
+from loom.mcp.server import LoomMCPServer, build_server
 from loom.query.engine import Capabilities, CompiledQuery
 from loom.resolver import MAX_PAGE_SIZE, Resolver
+
+# The runtime's fakes, not a second pair of them: a fake catalog defined twice is two answers to
+# "what does a catalog do", and the interesting assertions below are about the *same* object the
+# action tests drive directly.
+from test_action import CUSTOMERS, FakeRowCatalog, Interloper
 
 VALID = Path(__file__).parent / "fixtures" / "valid"
 
@@ -46,9 +60,27 @@ def ontology():
     return ont
 
 
-def _tools(ontology, rows=()):
+def _tools(ontology, rows=(), runtime=None, actor=None):
     resolver = Resolver(ontology=ontology, engine=StubEngine(rows))
-    return {t.name: t for t in build_tools(resolver)}
+    return {t.name: t for t in build_tools(resolver, runtime, actor)}
+
+
+def _runtime(ontology, catalog=None):
+    """A runtime over the row-writable fake. `rest_main` is the catalog the fixture binds."""
+    return ActionRuntime(ontology=ontology, catalogs={"rest_main": catalog or FakeRowCatalog()})
+
+
+def _objects(schema):
+    """Every object schema inside one input schema, including the root.
+
+    The forbidden-field check has to walk rather than look in two known places: `run_` tools nest
+    the declared parameters, so a rule that only knew about `filter` would stop covering the surface
+    exactly as the surface grew a write half."""
+    found = [schema]
+    for child in (schema.get("properties") or {}).values():
+        if isinstance(child, dict) and child.get("type") == "object":
+            found.extend(_objects(child))
+    return found
 
 
 def test_the_generated_tool_set_is_exactly_the_spec_contract(ontology):
@@ -63,25 +95,52 @@ def test_the_generated_tool_set_is_exactly_the_spec_contract(ontology):
     }
 
 
-def test_no_action_tools_yet(ontology):
-    """The fixture declares two actions; the write surface arrives with the action runtime."""
+def test_actions_are_not_exposed_unless_the_deployment_asked_for_them(ontology):
+    """The spec declaring an action is not the same statement as a deployment serving it.
+
+    Before this slice the fixture's actions produced no tools because none existed. They produce
+    none here for a different and permanent reason: no runtime was supplied, which is what
+    `mcp.writes: false` does. The surface is what the deployment permits."""
     assert ontology.actions
     assert not [name for name in _tools(ontology) if name.startswith("run_")]
 
 
+def test_one_tool_per_action_named_from_the_api_name(ontology):
+    tools = _tools(ontology, runtime=_runtime(ontology))
+    assert {n for n in tools if n.startswith("run_")} == {
+        "run_upgrade_tier",
+        "run_create_order",
+        "run_forget_customer",
+    }
+    assert len(tools) == 7 + len(ontology.actions)
+
+
 def test_no_tool_can_take_a_query(ontology):
-    """The framework's central claim, as an assertion."""
-    for name, tool in _tools(ontology).items():
-        fields = set(tool.input_schema.get("properties", {}))
-        nested = tool.input_schema["properties"].get("filter", {}).get("properties", {})
-        assert not (fields & FORBIDDEN_FIELDS), f"{name} exposes {fields & FORBIDDEN_FIELDS}"
-        assert not (set(nested) & FORBIDDEN_FIELDS), f"{name}.filter exposes a query field"
+    """The framework's central claim, as an assertion — now over the write half too."""
+    for name, tool in _tools(ontology, runtime=_runtime(ontology)).items():
+        for schema in _objects(tool.input_schema):
+            fields = set(schema.get("properties") or {})
+            assert not (fields & FORBIDDEN_FIELDS), f"{name} exposes {fields & FORBIDDEN_FIELDS}"
+
+
+def test_a_run_tools_top_level_is_only_loom_s_own_argument_names(ontology):
+    """The other half of the no-query rule, and the one the write surface made necessary.
+
+    A declared parameter can be named anything — including `table` or `query` — so the check above
+    would fail on a spec nobody should be prevented from writing. What has to hold instead is that
+    spec-derived names never reach the top level of a tool, where Loom's own arguments live and mean
+    something. Nested, a parameter called `table` is a declared parameter of a declared action,
+    typed and bound, and no more a query surface than a column name is."""
+    for name, tool in _tools(ontology, runtime=_runtime(ontology)).items():
+        if name.startswith("run_"):
+            assert set(tool.input_schema["properties"]) == set(RESERVED_RUN_ARGS), name
 
 
 def test_every_input_schema_is_closed(ontology):
     """additionalProperties: false, so an unexpected argument is rejected rather than ignored."""
-    for name, tool in _tools(ontology).items():
-        assert tool.input_schema["additionalProperties"] is False, name
+    for name, tool in _tools(ontology, runtime=_runtime(ontology)).items():
+        for schema in _objects(tool.input_schema):
+            assert schema["additionalProperties"] is False, name
 
 
 def test_tool_names_are_derived_from_api_names():
@@ -204,3 +263,250 @@ def test_an_unknown_tool_name_lists_the_real_ones(ontology):
     text, is_error = server.call("run_sql", {"sql": "select 1"})
     assert is_error is True
     assert "unknown tool 'run_sql'" in text and "get_customer" in text
+
+
+# ---- run_<action>: shape ---------------------------------------------------------
+
+
+def test_run_input_schemas_come_from_the_declared_parameters(ontology):
+    """The whole argument for one tool per action: the schema *is* the action.
+
+    `upgradeTier` takes an objectRef and an enum of two values; `createOrder` takes a string, a
+    string and a `decimal(12,2)`. One generic `run(action, params)` could type neither."""
+    tools = _tools(ontology, runtime=_runtime(ontology))
+
+    upgrade = tools["run_upgrade_tier"].input_schema["properties"][PARAMETERS_ARG]
+    assert upgrade["properties"]["newTier"]["enum"] == ["silver", "gold"]
+    assert upgrade["properties"]["customer"]["description"] == "key of a Customer"
+    assert sorted(upgrade["required"]) == ["customer", "newTier"]
+
+    create = tools["run_create_order"].input_schema["properties"][PARAMETERS_ARG]
+    # A decimal travels as a string, for the reason it was declared a decimal at all.
+    assert create["properties"]["total"] == {"type": "string", "description": "decimal(12,2)"}
+
+
+def test_dry_run_sits_beside_the_parameters_not_among_them(ontology):
+    """Spec-derived names in a nested object, Loom's own names at the top — the rule that makes a
+    parameter called `dryRun` impossible to collide with."""
+    schema = _tools(ontology, runtime=_runtime(ontology))["run_upgrade_tier"].input_schema
+    assert schema["properties"][DRY_RUN_ARG]["type"] == "boolean"
+    assert DRY_RUN_ARG not in schema["properties"][PARAMETERS_ARG]["properties"]
+    assert schema["required"] == [PARAMETERS_ARG]
+
+
+def test_run_descriptions_come_from_the_spec_and_say_what_to_branch_on(ontology):
+    description = _tools(ontology, runtime=_runtime(ontology))["run_upgrade_tier"].description
+    assert description.startswith("Raise a customer to a higher membership tier.")
+    assert "Modifies exactly one Customer, addressed by customerId" in description
+    # The input schema cannot carry this, and an agent that doesn't know it will read a refusal as
+    # a broken call.
+    assert "`status`" in description and "`failures[].code`" in description
+
+
+def test_a_non_active_element_is_labelled_rather_than_hidden(ontology):
+    """`status` is read for the first time here. Hiding a deprecated action would leave `loom run`
+    able to run something the tool surface denies — the back door `loom run` exists to not be."""
+    from dataclasses import replace
+
+    actions = dict(ontology.actions)
+    actions["upgradeTier"] = replace(actions["upgradeTier"], status="deprecated")
+    objects = dict(ontology.object_types)
+    objects["Order"] = replace(objects["Order"], status="experimental")
+    labelled = type(ontology)(object_types=objects, link_types=ontology.link_types, actions=actions)
+
+    tools = _tools(labelled, runtime=_runtime(labelled))
+    assert tools["run_upgrade_tier"].description.startswith("DEPRECATED — ")
+    assert tools["get_order"].description.startswith("EXPERIMENTAL — ")
+    # Still there, and still runnable. The label is the mechanism, not the absence.
+    assert "run_upgrade_tier" in tools and "get_order" in tools
+
+
+# ---- run_<action>: dispatch ------------------------------------------------------
+
+
+def _server(ontology, catalog, actor=None):
+    resolver = Resolver(ontology=ontology, engine=StubEngine())
+    runtime = ActionRuntime(ontology=ontology, catalogs={"rest_main": catalog})
+    return LoomMCPServer.from_resolver(resolver, runtime=runtime, actor=actor)
+
+
+def _call(server, name, args):
+    text, is_error = server.call(name, args)
+    return json.loads(text), is_error
+
+
+def test_a_run_through_the_tool_writes_the_row(ontology):
+    catalog = FakeRowCatalog()
+    payload, is_error = _call(
+        _server(ontology, catalog),
+        "run_upgrade_tier",
+        {PARAMETERS_ARG: {"customer": "c2", "newTier": "gold"}},
+    )
+    assert is_error is False
+    assert payload["status"] == APPLIED
+    assert payload["after"]["tier"] == "gold"
+    assert catalog.row("crm.customers", "id", "c2")["tier"] == "gold"
+    # Carried across, not nulled — the full-row read reaching an MCP caller unchanged.
+    assert catalog.row("crm.customers", "id", "c2")["region"] == "amer"
+
+
+def test_a_dry_run_previews_and_writes_nothing(ontology):
+    catalog = FakeRowCatalog()
+    payload, is_error = _call(
+        _server(ontology, catalog),
+        "run_upgrade_tier",
+        {PARAMETERS_ARG: {"customer": "c2", "newTier": "gold"}, DRY_RUN_ARG: True},
+    )
+    assert is_error is False
+    assert payload["status"] == PREVIEWED
+    assert payload["after"]["tier"] == "gold"
+    assert catalog.row("crm.customers", "id", "c2")["tier"] == "silver"
+    assert catalog.writes == []
+    # A preview holds nothing, and the result says so rather than printing a bare snapshot id.
+    assert payload["concurrency"].startswith("not checked")
+    assert payload["editId"] == "" and catalog.edits == []
+
+
+def test_a_refusal_is_not_a_protocol_error(ontology):
+    """The rule: `isError` answers "did this call become a run?", not "did the run succeed?".
+
+    A validation rule returning false is the precondition doing its job. Flagging it would tell an
+    agent it used the tool wrong when it used the tool exactly right."""
+    payload, is_error = _call(
+        _server(ontology, FakeRowCatalog()),
+        "run_upgrade_tier",
+        {PARAMETERS_ARG: {"customer": "c1", "newTier": "gold"}},  # c1 is already gold
+    )
+    assert is_error is False
+    assert payload["status"] == REFUSED
+    assert [f["code"] for f in payload["failures"]] == ["validation_failed"]
+    # The spec author's own sentence, verbatim, over the wire.
+    assert payload["failures"][0]["message"] == "New tier must differ from current tier"
+    assert "retryable" not in payload["failures"][0]
+
+
+def test_a_conflict_arrives_as_content_and_says_it_is_retryable(ontology):
+    """The one retryable code. A boolean `isError` could not have said so."""
+    from loom.action import MAX_ATTEMPTS
+
+    catalog = Interloper(FakeRowCatalog(), strike_on=range(1, MAX_ATTEMPTS + 1))
+    payload, is_error = _call(
+        _server(ontology, catalog),
+        "run_upgrade_tier",
+        {PARAMETERS_ARG: {"customer": "c2", "newTier": "gold"}},
+    )
+    assert is_error is False
+    assert payload["status"] == REFUSED
+    failure = next(f for f in payload["failures"] if f["code"] == CONFLICT)
+    assert failure["retryable"] is True
+    assert failure["detail"]["attempts"] == MAX_ATTEMPTS
+    assert failure["detail"]["contended"] is False  # `region` moved; the action reads neither
+
+
+def test_an_applied_run_that_could_not_be_logged_is_still_not_an_error(ontology):
+    """The shape a boolean gets actively wrong: the write committed and a failure sits beside it.
+
+    `isError=True` would tell a caller the write did not happen."""
+    catalog = FakeRowCatalog(log_fails=True)
+    payload, is_error = _call(
+        _server(ontology, catalog),
+        "run_upgrade_tier",
+        {PARAMETERS_ARG: {"customer": "c2", "newTier": "gold"}},
+    )
+    assert is_error is False
+    assert payload["status"] == APPLIED
+    assert [f["code"] for f in payload["failures"]] == ["log_failed"]
+    assert catalog.row("crm.customers", "id", "c2")["tier"] == "gold"
+
+
+def test_a_call_that_never_became_a_run_is_an_error(ontology):
+    """The other side of the same rule. An `ActionError` — a catalog the config never bound — takes
+    the path a `ResolverError` takes: content an agent can read, flagged, and nothing recorded."""
+    resolver = Resolver(ontology=ontology, engine=StubEngine())
+    runtime = ActionRuntime(ontology=ontology, catalogs={})
+    server = LoomMCPServer.from_resolver(resolver, runtime=runtime)
+    text, is_error = server.call("run_upgrade_tier", {PARAMETERS_ARG: {"customer": "c2", "newTier": "gold"}})
+    assert is_error is True
+    assert "not declared in loom.yaml" in text
+
+
+def test_an_undeclared_parameter_is_a_refusal_rather_than_a_schema_crash(ontology):
+    """The schema says `additionalProperties: false`, but the runtime is not entitled to assume a
+    client enforced it — so an unknown parameter is a typed refusal, not an exception."""
+    payload, is_error = _call(
+        _server(ontology, FakeRowCatalog()),
+        "run_upgrade_tier",
+        {PARAMETERS_ARG: {"customer": "c2", "newTier": "gold", "sql": "drop table"}},
+    )
+    assert is_error is False
+    assert payload["status"] == REFUSED
+    assert [f["code"] for f in payload["failures"]] == ["unknown_parameter"]
+
+
+# ---- what a serving process is ---------------------------------------------------
+
+
+def test_a_served_run_records_the_actor_the_deployment_declared(ontology):
+    catalog = FakeRowCatalog()
+    _call(
+        _server(ontology, catalog, actor="agent:support-bot"),
+        "run_upgrade_tier",
+        {PARAMETERS_ARG: {"customer": "c2", "newTier": "gold"}},
+    )
+    assert [e["actor"] for e in catalog.edits] == ["agent:support-bot"]
+    # And into the commit that changed the row, which is the attribution that is atomic with it.
+    assert catalog.commits[("crm.customers", 2)]["loom.actor"] == "agent:support-bot"
+
+
+def test_without_a_declared_actor_a_served_run_says_unknown(ontology):
+    """Not `default_actor()`, which would name whoever started the process. stdio authenticates
+    nobody, and a log that says it does not know beats one that confidently names the wrong
+    principal."""
+    catalog = FakeRowCatalog()
+    _call(
+        _server(ontology, catalog),
+        "run_upgrade_tier",
+        {PARAMETERS_ARG: {"customer": "c2", "newTier": "gold"}},
+    )
+    assert [e["actor"] for e in catalog.edits] == [UNKNOWN_ACTOR]
+    # Everything else the record exists for is still there. The gap is the transport's, not the log's.
+    recorded = catalog.edits[0]
+    assert recorded["action"] == "upgradeTier" and recorded["object_key"] == "c2"
+    assert recorded["status"] == APPLIED and json.loads(recorded["parameters"])["newTier"] == "gold"
+
+
+def test_a_serving_process_can_change_rows_and_no_schema_at_all(ontology):
+    """The claim that replaced M3's sentence about handles, and the one a fake can prove.
+
+    `FakeRowCatalog` implements the read port, `RowWriter` and `EditLogWriter`, and deliberately not
+    `CatalogWriter`. A server built over it serves every tool and writes a row — so nothing the tool
+    surface reaches ever asked for a schema verb. No real catalog can demonstrate this, because a
+    real one implements every port at once."""
+    catalog = FakeRowCatalog()
+    server = _server(ontology, catalog)
+
+    with pytest.raises(CatalogError) as excinfo:
+        writer_for(catalog)
+    assert "does not support schema writes" in str(excinfo.value)
+
+    _, is_error = _call(
+        server, "run_upgrade_tier", {PARAMETERS_ARG: {"customer": "c2", "newTier": "gold"}}
+    )
+    assert is_error is False
+    assert catalog.row("crm.customers", "id", "c2")["tier"] == "gold"
+
+
+def test_build_server_builds_no_runtime_unless_mcp_writes_is_on(ontology):
+    """The default is the read-only process M1 shipped, with no runtime in it at all."""
+    catalogs = {"rest_main": FakeRowCatalog(rows=CUSTOMERS)}
+    off = LoomConfig(mcp=McpConfig(name="loom"))
+    server, _ = build_server(ontology, off, catalogs)
+    assert not [n for n in server.tools if n.startswith("run_")]
+
+    on = LoomConfig(mcp=McpConfig(name="loom", writes=True, actor="ci"))
+    server, _ = build_server(ontology, on, catalogs)
+    assert sorted(n for n in server.tools if n.startswith("run_")) == [
+        "run_create_order",
+        "run_forget_customer",
+        "run_upgrade_tier",
+    ]

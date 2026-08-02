@@ -404,6 +404,14 @@ the transaction, and what the prompt asks a person to approve is the *shape* of 
 also the only answer that can be true of both callers: `run_<action>` has no prompt at all, so a
 design in which the checked snapshot came from a preview is one the MCP caller could never join.
 
+That last sentence is still exactly true, and `run_<action>`'s `dryRun` (§7) does not soften it.
+A preview over MCP produces the same *shape* the CLI prints above its `y/N`, and reserves the same
+nothing: no state links it to a later call, no row is held, and a run after it reads again and
+asserts that read. What the CLI has and the tool does not is somebody to ask — and that is where it
+stays. Approval of an agent's tool call belongs to whatever the client puts in front of its user;
+Loom's part is to make the shape knowable before the write, which is what a preview is. Without one,
+`previewed` would be a status no MCP caller could ever observe.
+
 **The edit log.** Every run that named a row appends one record to `_loom_meta.edits` (§9.2) — the
 data-plane counterpart to what `_loom_meta.applied` records about schemas.
 
@@ -435,8 +443,23 @@ refused modify has no `after` and would otherwise record that somebody tried wit
 *The actor is supplied by the caller, never invented.* `$LOOM_ACTOR`-or-OS-user is honest for a
 command a person runs and a lie for a served tool, where it would name whoever started `loom serve`
 and stamp every caller in the deployment with one string. `loom run` passes it explicitly;
-`run_<action>` will pass what its transport authenticated; when nobody supplies one the record says
-`unknown`, which is worth more than a confident wrong answer.
+`run_<action>` passes `mcp.actor` (§6); when nobody supplies one the record says `unknown`, which is
+worth more than a confident wrong answer.
+
+The distinction that key rests on is *declared* versus *inferred*, not process versus caller. An
+operator writing `actor: agent:support-bot` is stating something true about a deployment, and over
+stdio it is exactly true — one client spawns one process, and the session has one principal. Loom
+falling back to the OS user would be inferring the same shape of answer without anyone having
+checked it. A client-supplied actor was the third option and is worse than `unknown`: an audit
+record whose subject fills in its own name is self-attestation, and MCP has no identity for it to
+attest with.
+
+So it is worth saying plainly what the log is worth over an unauthenticated transport. With no
+`mcp.actor` set, every served write records `unknown`, and the record still answers *what* was done,
+to *which row*, *when*, with *which parameters*, and *whether it refused* — it does not answer
+*who*. That is a gap in stdio, which has no authentication and no principal, rather than a gap in
+the log; the config key is the honest way to close it for a deployment, and an authenticated
+transport is the way to close it per call.
 
 *The write carries its own identity, and the log is written after it.* Iceberg has no transaction
 spanning two tables, so the row write and the log append are two commits and a crash can land between
@@ -525,9 +548,24 @@ engine:
 mcp:
   name: loom
   transport: stdio                # stdio | http
+  writes: false                   # expose run_<action> tools at all · default false
+  actor: null                     # who a served run is recorded as · declared, never inferred
 governance:                       # optional · row/column policies enforced in the resolver
   policies: []                    # (grammar TBD — forward reference, not in v0)
 ```
+
+**`writes` is off by default, and that is a decision.** Until the action runtime became a tool set,
+`loom serve` could not change anything, and deployments were pointed at real lakes on that basis.
+Defaulting it on would mean an upgrade plus a spec that declares an action — two things that happen
+for unrelated reasons — silently making a production lake mutable by any MCP client. So a deployment
+says so, in the file a deployment is configured by. It is deliberately not a CLI flag (a flag lets an
+invocation contradict the file an operator reviews) and deliberately not a governance policy: it
+names no principal and filters no row. It is a switch on a whole surface, which §6 owns and §7
+generates against — though M5 may end up subsuming it.
+
+**`actor` is what a served run is recorded as** in `_loom_meta.edits`. Unset, runs record `unknown`.
+See §4.1's "the actor is supplied by the caller, never invented" for why this is a config key rather
+than an inference or a tool parameter.
 
 ---
 
@@ -542,7 +580,46 @@ surface. Nothing here is hand-authored.
 |                                      | `search_customer(filter, page)`                         | `searchable` props + property types |
 |                                      | `list_customer(page)`                                   | pagination |
 | `linkType placedBy` (+ `reverseName`)| contributes `order` / `customer` directions to `traverse(object, link, direction)` | link mapping |
-| `action upgradeTier`                 | `run_upgradeTier(params…)`                              | `parameters` → JSON Schema; `description` → tool description |
+| `action upgradeTier`                 | `run_upgrade_tier(parameters, dryRun)`                  | `parameters` → JSON Schema; `description` → tool description |
+
+Tool names are the api name in `snake_case`, for every row of that table. This one used to read
+`run_upgradeTier`, which no other row's spelling would have produced — a slip, corrected, in the
+same class as the two §4/§5 bugs the action runtime turned up.
+
+**One tool per action, not one `run(action, params)`.** `traverse` is generic and an action is not,
+and the rule that decides both is about the *schema* rather than the name: a generic tool is right
+exactly when the varying element does not change the input schema. Every link takes the same
+`(objectType, key, link, page)`; every action takes something different — an objectRef and a
+two-value enum here, a string and a `decimal(12,2)` there. Collapsing them means typing `params` as
+a free-form object, which would be the one place in this table where an agent is handed an untyped
+bag and "declared types are honored on the way in" stops being structural. The cost is stated rather
+than hidden: a spec with forty actions generates forty tools.
+
+**Two argument namespaces, which never mix.** Names drawn from the spec's vocabulary go inside a
+nested object — `search_`'s declared property filters under `filter`, `run_`'s declared parameters
+under `parameters`. Names Loom chose stay at the top: `key`, `limit`, `offset`, `objectType`,
+`link`, `dryRun`. That is what makes `dryRun` addable at all, because an ontology may declare a
+parameter called `dryRun` and it can no more be shadowed than a property called `limit` can.
+
+**`dryRun` is an inspection verb, not an approval step.** It runs bind → read → validate and stops
+before the write, returning `previewed` — the same thing `loom run` prints above its `y/N`, and the
+only way an agent can learn what an action would do other than by doing it. It confers nothing on
+the run after it: no state is carried, no row is held, and the next run does its own read and
+asserts that one (§4.1). A design where a preview reserved anything for a later call is the one
+§4.1 rejected when it put the prompt outside the window.
+
+**Which actions become tools, and whether any do.** All of them, whatever their `status` — a
+non-`active` element is labelled in its description (`DEPRECATED — …`) rather than hidden, because
+hiding it would leave `loom run` able to run something the tool surface denies, and the runtime is
+deliberately one entry point for both. Whether the write half is generated at all is a *deployment*
+decision, not a spec one: `mcp.writes` (§6) is off by default, so declaring an action does not by
+itself make a lake mutable by an MCP client.
+
+**What a run returns.** `ActionResult` (§4.1) serialized — status, key, before/after, snapshot,
+attempts, `editId`, and typed `failures[]`. Never a protocol-level error: the transport's error flag
+answers *did this call become a run*, not *did the run succeed*, so a refused precondition, a
+conflict and a write failure all arrive as content an agent branches on. That is also the only
+encoding that can describe `applied` with a `log_failed` beside it, which a boolean gets backwards.
 
 Two invariants the compiler guarantees: **the LLM never receives raw SQL** (only these
 verbs), and **governance policies filter both the direct API and the MCP tools identically**
@@ -609,8 +686,8 @@ action:
 
 This validates clean, migrates two Iceberg tables, resolves `Customer.orders` as a reverse
 JOIN, and exposes `get_customer`, `search_customer`, `list_customer`, `get_order`,
-`search_order`, `list_order`, `traverse`, and `run_upgradeTier` over MCP — all from ~40 lines
-of YAML.
+`search_order`, `list_order`, `traverse` and — where the deployment sets `mcp.writes` —
+`run_upgrade_tier` over MCP, all from ~40 lines of YAML.
 
 ---
 
@@ -820,6 +897,12 @@ Named deliberately so they're conscious deferrals, not gaps:
   a read, records property *names* without values, or is expired on a retention window is the same
   question §6 faces and belongs to the same milestone. Nothing is deferred about the record's shape:
   the columns are fixed now (§9.2) because the table is only ever created.
+- **A per-caller identity over MCP** — §7's `run_<action>` records `mcp.actor`, which names a
+  *deployment* rather than a caller, because stdio has no authentication, no principal and nothing
+  in the protocol to carry one. Over an authenticated transport the actor becomes a per-call fact,
+  and nothing has to move to accommodate it: `ActionRuntime.run` already takes the argument per call
+  and the serve boundary already fills it in. Until then a served log answers everything except
+  *who*, and says `unknown` rather than guessing.
 - **Refusing to act when the log is unavailable** — a run whose record cannot be written still
   happens, and reports `log_failed`. "No log, no write" is a coherent audit posture and a *policy*,
   so it belongs with the other policies rather than wired in where no deployment could turn it off.

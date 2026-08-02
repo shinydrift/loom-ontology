@@ -40,10 +40,16 @@ Three boundaries this file is careful about:
   row by key.
 - **It holds a `RowWriter`, never a `CatalogWriter`.** It cannot alter a schema, because the port
   it asks for has no verb for it. The `EditLogWriter` it also holds does not weaken that: it takes
-  no table name, so the only thing it can reach is `_loom_meta.edits`.
+  no table name, so the only thing it can reach is `_loom_meta.edits`. This is the boundary that
+  survives being served: a process running `run_<action>` tools can change the rows the spec's
+  actions declare and no schema at all — see `mcp.server.build_server`, where the sentence about
+  handles is restated for a process that outlives a run.
 - **It never invents an actor.** `default_actor()` is not called from here — it is honest for
   `loom apply` and for `loom run`, and a lie for `run_<action>` over MCP, where it would name whoever
-  started `loom serve`. The actor is an argument, and when nobody supplies one the log says so.
+  started `loom serve`. The actor is an argument, and when nobody supplies one the log says so. The
+  MCP caller passes `mcp.actor`: a string an operator declared about a deployment, which is a
+  different kind of thing from one Loom inferred about a process, and `None` when they declared
+  none.
 """
 
 from __future__ import annotations
@@ -110,9 +116,11 @@ class ActionError(RuntimeError):
 class ActionRuntime:
     """Runs the actions of one ontology against one set of catalogs.
 
-    The entry point for both `loom run` and (in M4) `run_<action>`. There is deliberately only one:
-    a dev command that could do something the generated tool cannot would be a back door into the
-    write path, which is the argument that put `loom query` under the same rule on the read side."""
+    The entry point for both `loom run` and `run_<action>`. There is deliberately only one: a dev
+    command that could do something the generated tool cannot would be a back door into the write
+    path, which is the argument that put `loom query` under the same rule on the read side. It is
+    also why `status` gates neither caller — a runtime that refused a deprecated action would make
+    the two disagree in the other direction, so the tool surface labels rather than hides."""
 
     ontology: Ontology
     catalogs: Mapping[str, Catalog]
@@ -517,8 +525,11 @@ class _Run:
     ) -> None:
         """One verb, one transaction, and the snapshot the read saw carried into it.
 
-        The writer is asked for here rather than held, so nothing in this process keeps a
-        row-writable handle between actions.
+        The writer is asked for here rather than held, so this runtime keeps no row-writable typed
+        reference between actions and the plane it is asking for is visible at the call site. What
+        that does *not* claim, now that a serving process can reach this method: that the process
+        holds nothing capable of row writes. It holds catalogs, and a real catalog implements every
+        port. The claim that survives is the one above the class — no `CatalogWriter`, ever.
 
         **All three verbs are checked, and each earns it separately.**
 

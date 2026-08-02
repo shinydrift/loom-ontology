@@ -56,12 +56,13 @@ action:
 ```
 
 At serve time this exposes `get_customer`, `search_customer`, `list_customer`, and
-`run_upgradeTier` to any MCP client — with input schemas derived from the property/parameter
+`run_upgrade_tier` to any MCP client — with input schemas derived from the property/parameter
 types, and row/column governance enforced below the tool layer.
 
-*Today the read tools and `traverse` are live over MCP, and the action runtime behind
-`run_upgradeTier` runs through `loom run`; exposing it as a tool and governance are the next two
-milestones. See [Status](#status).*
+*Today the reads, `traverse` and the `run_` tools are all live over MCP. Writes are off by default:
+`mcp.writes: true` in `loom.yaml` is what turns a declared action into a tool, because declaring one
+and serving it to every client that connects are different decisions. Governance is the next
+milestone. See [Status](#status).*
 
 ## Architecture (5 layers)
 
@@ -95,7 +96,13 @@ inside that commit, so a competing write refuses the run rather than silently lo
 that named a row leaves a record in `_loom_meta.edits`, **including the ones that refused**, because
 an audit trail of successes cannot say who *tried*; and the write stamps that record's id into its
 own Iceberg commit, so the log is an index over facts the lake already carries rather than the only
-copy of them. That completes M3 — what's next is exposing the runtime as MCP tools, and governance.
+copy of them. That completed M3 — and the runtime is now **reachable by the thing it was built
+for**: `run_<action>` tools, one per declared action, with input schemas from the declared parameter
+types and typed results an agent branches on rather than protocol errors it can only retry. Writes
+are off unless `loom.yaml` says otherwise, and a served run is recorded as the actor a deployment
+declared, or as `unknown` — stdio authenticates nobody, and a log that says so beats one that names
+the wrong principal. What's left in M4 is a second transport and capability negotiation; after that,
+governance.
 
 | Component | State |
 |-----------|-------|
@@ -118,7 +125,8 @@ copy of them. That completes M3 — what's next is exposing the runtime as MCP t
 | Action runtime — single-object writeback (`action/`) | ✅ `loom run` |
 | Optimistic concurrency — snapshot check | ✅ asserted inside the commit |
 | Edit-log (audit) table | ✅ `_loom_meta.edits` |
-| MCP `run_<action>` tools + HTTP transport | ⏳ |
+| MCP `run_<action>` tools | ✅ `mcp.writes: true` |
+| HTTP transport + capability negotiation | ⏳ |
 | Governance (row/column policies) | ⏳ |
 
 `docs/spec-v0.md` is the full grammar — the framework's public contract.
@@ -130,7 +138,7 @@ copy of them. That completes M3 — what's next is exposing the runtime as MCP t
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 409 tests
+pytest                              # 436 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 3 action(s)
 ```
 
@@ -171,11 +179,26 @@ Point any MCP client at that last command and the ontology shows up as typed too
 $ loom serve examples/retail/ontology
 loom serve — 2 object type(s), 1 link type(s), 3 action(s) → 7 tool(s) over stdio
   get_customer  get_order  list_customer  list_order  search_customer  search_order  traverse
+  read-only · mcp.writes is false, so 3 declared action(s) are not exposed
+    (`loom run` still reaches them — the runtime is not what is switched off, the surface is)
 ```
 
-Three actions, no `run_` tools — the runtime is live but the MCP write surface is M4, and the
-banner counts what is actually exposed rather than what the spec declares. `loom run` reaches the
-same runtime in the meantime.
+Three actions and no `run_` tools, because **serving writes is a choice a deployment makes**, not
+one a spec makes. `loom serve` used to be incapable of changing anything and people pointed it at
+real lakes on that basis; letting an upgrade plus an unrelated spec edit quietly make one mutable is
+not a default worth having. Add two lines under `mcp:` in `loom.yaml` and the same command serves
+ten tools:
+
+```
+$ loom serve examples/retail/ontology     # mcp: { writes: true, actor: agent:support-bot }
+loom serve — 2 object type(s), 1 link type(s), 3 action(s) → 10 tool(s) over stdio
+  get_customer  get_order  list_customer  list_order  run_forget_customer  run_record_order
+  run_upgrade_tier  search_customer  search_order  traverse
+  writes enabled · 3 action(s) exposed, every run recorded as actor 'agent:support-bot'
+```
+
+The banner counts what is actually exposed rather than what the spec declares, and says which mode
+it is in either way — "how many tools" does not answer "can this change my lake".
 
 ```jsonc
 // traverse({"objectType": "Customer", "key": "c2", "link": "orders", "limit": 2})
@@ -189,10 +212,31 @@ same runtime in the meantime.
 }
 ```
 
+```jsonc
+// run_upgrade_tier({"parameters": {"customer": "c3", "newTier": "gold"}})
+{
+  "action": "upgradeTier", "objectType": "Customer", "operation": "modify",
+  "status": "applied", "key": "c3",
+  "before": { "customerId": "c3", "name": "Alan Turing", "tier": "bronze", "ltv": null },
+  "after":  { "customerId": "c3", "name": "Alan Turing", "tier": "gold",   "ltv": null },
+  "concurrency": "enforced — the write asserts the snapshot the read saw",
+  "attempts": 1, "editId": "5f2c…", "failures": []
+}
+```
+
+One tool per action rather than one `run(action, params)`, and the reason is the schema rather than
+the name: `upgradeTier` takes an objectRef and a two-value enum, `recordOrder` takes a string, an
+objectRef and a `decimal(12,2)`. A single generic tool would have to type `params` as a free-form
+object — the one place in the whole surface where an agent gets an untyped bag. The declared
+parameters sit under `parameters` so that Loom's own arguments (`dryRun`, and `limit`/`offset` on
+the read side) can never collide with a name a spec chose. Pass `dryRun: true` and the run stops
+before the write and reports what it would have done — the same thing `loom run` prints above its
+`y/N`, for a caller that has no prompt.
+
 Swapping the local warehouse for a production lake is a `loom.yaml` edit — `type: iceberg-rest`
 with a URI — not a spec or code change.
 
-Four properties of that generated surface are worth naming, because they're enforced rather than
+Five properties of that generated surface are worth naming, because they're enforced rather than
 documented:
 
 - **No raw SQL reaches the agent.** The resolver only emits plan nodes it built itself, so there is
@@ -205,7 +249,14 @@ documented:
 - **A write cannot alter a schema, and recording a write cannot reach a table.** Four ports, three
   planes: reads, a table's shape, a table's rows, and Loom's own record. The action runtime holds
   the last two, and neither has a verb for DDL — the edit-log port takes no table name at all.
-  Asserted against a fake catalog that implements exactly those ports and no others.
+  Asserted against a fake catalog that implements exactly those ports and no others, which is also
+  what proves the serving-process version of it: **a server can change the rows the spec's actions
+  declare and no schema at all.** Point an MCP client at a lake and it cannot migrate one.
+- **A refused write is a result, not a broken call.** The protocol's error flag answers *did this
+  call become a run*, never *did the run succeed* — so a failed validation rule, a conflict and a
+  write failure all arrive as content an agent branches on (`status`, then `failures[].code`, then
+  `retryable`). It is the only encoding that can describe a write that committed and then failed to
+  log itself, which a boolean gets backwards.
 
 ## Planning a schema change
 
@@ -393,8 +444,8 @@ last thing it writes and only if the run wasn't refused, so a rollback you decli
 
 An action is the only thing in Loom that changes a row. `loom run` is the write path's `loom query`
 — it takes an action apiName and named parameters, which is exactly the shape the generated
-`run_<action>` tool will take, and calls the same runtime. If the dev command could do something
-the tools can't, the ontology would have a back door:
+`run_<action>` tool takes, and calls the same runtime. If the dev command could do something the
+tools can't, the ontology would have a back door:
 
 ```
 $ loom run upgradeTier examples/retail/ontology --param customer=c3 --param newTier=gold
@@ -501,6 +552,20 @@ back `validation_failed` or `object_not_found`, the real reason.
 Note what the prompt above does *not* say. It doesn't hold the row while you decide: the run does its
 own read and asserts that one, so what you approve is the shape of the change. That's the only answer
 that can also be true of `run_<action>`, which has no prompt at all.
+
+Which is why the MCP tool's `dryRun` is an **inspection verb and not an approval step**. It produces
+the same shape the block above prints — bind, read, validate, stop — and reserves exactly nothing for
+the call after it: no state is carried, no row is held, and a real run reads again and asserts *that*
+read. Without it, `previewed` would be a status no MCP caller could ever see and an agent's only way
+to learn what an action does would be to do it. The approving, where there is any, happens where the
+human is: in whatever the MCP client puts in front of its user before it lets a tool call through.
+
+Over MCP the actor comes from `mcp.actor` in `loom.yaml` — declared by an operator, never inferred by
+Loom, which is the difference that keeps `$LOOM_ACTOR`-or-OS-user off this path: that would name
+whoever started `loom serve` while looking like a principal. Unset, a served run records `unknown`,
+and the edit log then answers what was done, to which row, when, with which parameters and whether it
+refused — everything except *who*. Over stdio there is no *who* to answer with; that gap closes with
+an authenticated transport, and `ActionRuntime.run` already takes the argument per call for it.
 
 The validator accumulates every problem and reports them in one pass with source locations:
 

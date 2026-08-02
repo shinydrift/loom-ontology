@@ -33,7 +33,7 @@ TRANSPORTS = frozenset({"stdio"})
 _TOP_KEYS = {"version", "catalogs", "engine", "mcp", "governance"}
 _CATALOG_KEYS = {"type", "uri", "warehouse", "auth", "properties"}
 _ENGINE_KEYS = {"type", "options"}
-_MCP_KEYS = {"name", "transport"}
+_MCP_KEYS = {"name", "transport", "writes", "actor"}
 _GOVERNANCE_KEYS = {"policies"}
 
 
@@ -57,8 +57,36 @@ class EngineConfig:
 
 @dataclass(frozen=True)
 class McpConfig:
+    """What `loom serve` exposes, and as whom.
+
+    `writes` is **off by default**, and that is a decision rather than caution. Until the action
+    runtime became a tool set, `loom serve` could not change anything, and people pointed it at real
+    lakes on that basis. Turning writes on with the arrival of the tools would mean an upgrade plus
+    a spec that declares an action — two things that happen for unrelated reasons — silently making
+    a production lake mutable by any MCP client. So a deployment says so, in the file a deployment
+    is configured by. It is the same posture as `loom apply` refusing to run unattended: don't write
+    to somebody's lake because nobody was there to object.
+
+    Deliberately not a CLI flag. A flag lets one `loom serve` invocation contradict the file an
+    operator reviews, and "is this server writable" is exactly the question that file should answer.
+    And deliberately not a governance policy: it names no principal and filters no row. It is a
+    switch on a whole surface, which is a different kind of thing from what §6's `policies` will be —
+    though M5 may well end up subsuming it.
+
+    `actor` is what the edit log records for a run that arrives through a tool. It is **declared,
+    never inferred**, which is the whole difference between it and `default_actor()`: that function
+    falls back to the OS user, so on this path it would name whoever started the process while
+    looking like a principal, and stamp every caller in the deployment with one string. An operator
+    writing `actor: agent:support-bot` is instead making a true statement about a deployment — and
+    over stdio it is exactly true, because one client spawns one process and the session has one
+    principal. Unset, runs record `unknown`; see `action.log.UNKNOWN_ACTOR` for why that beats a
+    confident wrong answer.
+    """
+
     name: str = "loom"
     transport: str = "stdio"
+    writes: bool = False
+    actor: str | None = None
 
 
 @dataclass(frozen=True)
@@ -225,7 +253,25 @@ def _parse_mcp(raw: object, loc: SourceLoc, diag: Diagnostics) -> McpConfig:
         hint = "http transport is not implemented yet (M4)" if transport == "http" else suggest(str(transport), TRANSPORTS)
         diag.error(f"unsupported mcp transport '{transport}'", loc, hint)
         transport = "stdio"
-    return McpConfig(name=str(raw.get("name") or "loom"), transport=str(transport))
+
+    writes = raw.get("writes", False)
+    if not isinstance(writes, bool):
+        # Not coerced. `writes: "no"` is truthy in Python and would turn writes *on* — the one
+        # misreading of this key that costs somebody a row.
+        diag.error(f"'mcp.writes' must be true or false, got {writes!r}", loc)
+        writes = False
+
+    actor = raw.get("actor")
+    if actor is not None and (not isinstance(actor, str) or not actor.strip()):
+        diag.error(f"'mcp.actor' must be a non-empty string, got {actor!r}", loc)
+        actor = None
+
+    return McpConfig(
+        name=str(raw.get("name") or "loom"),
+        transport=str(transport),
+        writes=writes,
+        actor=actor.strip() if isinstance(actor, str) else None,
+    )
 
 
 def _check_governance(raw: object, loc: SourceLoc, diag: Diagnostics) -> None:

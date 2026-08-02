@@ -48,6 +48,38 @@ def test_defaults_when_sections_are_absent(tmp_path: Path):
     assert diag.errors == []
     assert cfg.engine.type == "duckdb"
     assert cfg.mcp.name == "loom" and cfg.mcp.transport == "stdio"
+    # A config that says nothing about writes serves none. Declaring an action and serving it to
+    # every client that connects are different decisions, and only one of them is in the spec.
+    assert cfg.mcp.writes is False and cfg.mcp.actor is None
+
+
+def test_writes_and_actor_are_read_from_the_deployment_file(tmp_path: Path):
+    cfg, diag = _load(
+        tmp_path,
+        "catalogs:\n  c: { type: iceberg-rest, uri: http://x }\n"
+        "mcp: { writes: true, actor: 'agent:support-bot' }\n",
+    )
+    assert diag.errors == []
+    assert cfg.mcp.writes is True and cfg.mcp.actor == "agent:support-bot"
+
+
+def test_a_non_boolean_writes_is_refused_rather_than_coerced(tmp_path: Path):
+    """`writes: "no"` is truthy in Python — the one misreading of this key that costs a row."""
+    cfg, diag = _load(
+        tmp_path, "catalogs:\n  c: { type: iceberg-rest, uri: http://x }\nmcp: { writes: 'no' }\n"
+    )
+    assert "'mcp.writes' must be true or false" in " | ".join(e.message for e in diag.errors)
+    assert cfg.mcp.writes is False
+
+
+def test_an_empty_actor_is_refused_rather_than_recorded(tmp_path: Path):
+    """An actor is a claim about who writes. A blank one is not a smaller claim, it is a broken
+    record, and `unknown` already exists to mean "nobody said"."""
+    cfg, diag = _load(
+        tmp_path, "catalogs:\n  c: { type: iceberg-rest, uri: http://x }\nmcp: { actor: '  ' }\n"
+    )
+    assert "'mcp.actor' must be a non-empty string" in " | ".join(e.message for e in diag.errors)
+    assert cfg.mcp.actor is None
 
 
 def test_reports_every_problem_in_one_pass(tmp_path: Path):
