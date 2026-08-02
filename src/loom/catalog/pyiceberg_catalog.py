@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .base import CatalogError, Column, ConcurrencyError, SchemaEdit, TableSchema
+from .base import EDIT_LOG_TABLE, CatalogError, Column, ConcurrencyError, SchemaEdit, TableSchema
 
 _DECIMAL = re.compile(r"^decimal\((\d+),\s*(\d+)\)$")
 
@@ -276,11 +276,21 @@ class PyIcebergCatalog:
     # One row, addressed by key. No batch verb and no predicate: the spec's single-object boundary
     # is enforced here by the absence of a way to express anything wider. Every verb goes through
     # `_guarded`, so there is no path through this class that writes a row without asserting the
-    # snapshot its caller read.
+    # snapshot its caller read — and every verb passes `commit_properties` down to pyiceberg as
+    # `snapshot_properties`, so the record of *who* wrote and *why* lands in the summary of the very
+    # snapshot the write produces. That is the only attribution here that is atomic with the write;
+    # the edit-log row below is a separate commit and is honest about it.
 
-    def insert_row(self, table: str, row: Mapping[str, Any], *, expect_snapshot_id: int | None) -> None:
+    def insert_row(
+        self,
+        table: str,
+        row: Mapping[str, Any],
+        *,
+        expect_snapshot_id: int | None,
+        commit_properties: Mapping[str, str],
+    ) -> None:
         with self._guarded(table, expect_snapshot_id, "insert into") as (tbl, txn):
-            txn.append(self._batch(tbl, [row]))
+            txn.append(self._batch(tbl, [row]), snapshot_properties=dict(commit_properties))
 
     def replace_row(
         self,
@@ -290,6 +300,7 @@ class PyIcebergCatalog:
         row: Mapping[str, Any],
         *,
         expect_snapshot_id: int | None,
+        commit_properties: Mapping[str, str],
     ) -> None:
         with self._guarded(table, expect_snapshot_id, "replace a row in") as (tbl, txn):
             # `overwrite` inside a transaction *is* the equality-delete plus append: pyiceberg
@@ -297,14 +308,25 @@ class PyIcebergCatalog:
             # thing lands as one Iceberg commit. A reader sees the old row or the new one — never
             # neither, and never both.
             txn.overwrite(
-                self._batch(tbl, [row]), overwrite_filter=self._key_filter(key_column, key_value)
+                self._batch(tbl, [row]),
+                overwrite_filter=self._key_filter(key_column, key_value),
+                snapshot_properties=dict(commit_properties),
             )
 
     def delete_row(
-        self, table: str, key_column: str, key_value: Any, *, expect_snapshot_id: int | None
+        self,
+        table: str,
+        key_column: str,
+        key_value: Any,
+        *,
+        expect_snapshot_id: int | None,
+        commit_properties: Mapping[str, str],
     ) -> None:
         with self._guarded(table, expect_snapshot_id, "delete a row from") as (_tbl, txn):
-            txn.delete(delete_filter=self._key_filter(key_column, key_value))
+            txn.delete(
+                delete_filter=self._key_filter(key_column, key_value),
+                snapshot_properties=dict(commit_properties),
+            )
 
     @contextmanager
     def _guarded(self, table: str, expect_snapshot_id: int | None, doing: str):
@@ -389,6 +411,30 @@ class PyIcebergCatalog:
             expected=expected,
             found=found,
         )
+
+    # --- EditLogWriter -------------------------------------------------------------------
+
+    def append_edit(self, columns: Sequence[Column], row: Mapping[str, Any]) -> None:
+        """One record into `EDIT_LOG_TABLE`, which this method creates if it is not there.
+
+        Deliberately *not* routed through `_guarded`: there is no snapshot to assert, because the
+        caller read nothing and this appends over nothing. Routing it there to reuse the plumbing
+        would have manufactured an expectation nobody holds, and made the log table's own traffic
+        able to refuse a write.
+
+        The create is the one piece of DDL reachable from the action runtime, and it is bounded by
+        the port rather than by a check in here: the method takes no table name, so `EDIT_LOG_TABLE`
+        is the only thing it can ever create."""
+        if not self.table_exists(EDIT_LOG_TABLE):
+            self.ensure_namespace(EDIT_LOG_TABLE)
+            self.create_table(EDIT_LOG_TABLE, columns, properties={"loom.managed": "true"})
+        tbl = self._load(EDIT_LOG_TABLE)
+        try:
+            tbl.append(self._batch(tbl, [row]))
+        except Exception as e:
+            raise CatalogError(
+                f"could not record an edit in '{EDIT_LOG_TABLE}' in catalog '{self.name}': {e}"
+            ) from e
 
     @staticmethod
     def _key_filter(key_column: str, key_value: Any):

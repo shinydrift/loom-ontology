@@ -254,6 +254,9 @@ class Interloper:
             table, "id", "c1",
             {**row, "region": f"apac-{self.attempts}"},
             expect_snapshot_id=other.current_snapshot_id(table),
+            # Empty on purpose: this writer is not Loom. Its commit carries no `loom.edit_id`, which
+            # is exactly what distinguishes it from one of ours in the table's own history.
+            commit_properties={},
         )
 
     def table_exists(self, table):
@@ -262,14 +265,25 @@ class Interloper:
     def describe(self, table):  # pragma: no cover - the runtime never asks
         return self.inner.describe(table)
 
-    def insert_row(self, table, row, *, expect_snapshot_id):
-        self.inner.insert_row(table, row, expect_snapshot_id=expect_snapshot_id)
+    def insert_row(self, table, row, *, expect_snapshot_id, commit_properties):
+        self.inner.insert_row(
+            table, row, expect_snapshot_id=expect_snapshot_id, commit_properties=commit_properties
+        )
 
-    def replace_row(self, table, key_column, key_value, row, *, expect_snapshot_id):
-        self.inner.replace_row(table, key_column, key_value, row, expect_snapshot_id=expect_snapshot_id)
+    def replace_row(self, table, key_column, key_value, row, *, expect_snapshot_id, commit_properties):
+        self.inner.replace_row(
+            table, key_column, key_value, row,
+            expect_snapshot_id=expect_snapshot_id, commit_properties=commit_properties,
+        )
 
-    def delete_row(self, table, key_column, key_value, *, expect_snapshot_id):
-        self.inner.delete_row(table, key_column, key_value, expect_snapshot_id=expect_snapshot_id)
+    def delete_row(self, table, key_column, key_value, *, expect_snapshot_id, commit_properties):
+        self.inner.delete_row(
+            table, key_column, key_value,
+            expect_snapshot_id=expect_snapshot_id, commit_properties=commit_properties,
+        )
+
+    def append_edit(self, columns, row):
+        self.inner.append_edit(columns, row)
 
 
 def _contended(seeded, strike_on):
@@ -362,12 +376,13 @@ def test_the_snapshot_assertion_is_really_on_the_transaction(seeded):
     catalog.replace_row(
         "crm.customers", "id", "c1",
         {**next(r for r in catalog.scan("crm.customers").to_pylist() if r["id"] == "c1"), "region": "amer"},
-        expect_snapshot_id=stale,
+        expect_snapshot_id=stale, commit_properties={},
     )
 
     with pytest.raises(ConcurrencyError) as e:
         catalog.replace_row(
-            "crm.customers", "id", "c2", {**row, "tier": "gold"}, expect_snapshot_id=stale
+            "crm.customers", "id", "c2", {**row, "tier": "gold"},
+            expect_snapshot_id=stale, commit_properties={},
         )
 
     assert e.value.expected == stale

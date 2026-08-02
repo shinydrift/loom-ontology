@@ -1,16 +1,23 @@
 """The action runtime — the kinetic layer, one object at a time.
 
-`run_upgradeTier(...)` binds its parameters, evaluates the validation rules the spec declares, and
-mutates exactly one row. `runtime.py` is the loop, `evaluate.py` runs the expression language over
-real values, `result.py` is what comes back.
+`run_upgradeTier(...)` binds its parameters, evaluates the validation rules the spec declares,
+mutates exactly one row, and records that it did. `runtime.py` is the loop, `evaluate.py` runs the
+expression language over real values, `result.py` is what comes back, `log.py` is what stays behind.
 
-Eight rules shape the package. Each had an obvious-looking alternative:
+Ten rules shape the package. Each had an obvious-looking alternative:
 
-- **Rows go through a third port.** `Catalog` reads, `CatalogWriter` changes a table's shape,
-  `RowWriter` changes its rows — and none of them extends another. `loom apply` cannot delete a row
-  and an action cannot alter a schema, not by policy but because the port each holds has no verb
-  for it. The runtime asks for its writer per run, for the one catalog the target object binds, so
-  nothing in a serving process holds a row-writable handle between calls.
+- **Rows go through a third port, and Loom's own record through a fourth.** `Catalog` reads,
+  `CatalogWriter` changes a table's shape, `RowWriter` changes its rows, `EditLogWriter` appends to
+  `_loom_meta.edits` — and none of them extends another. `loom apply` cannot delete a row and an
+  action cannot alter a schema, not by policy but because the port each holds has no verb for it.
+  The runtime asks for its writers per run, for the one catalog the target object binds, so nothing
+  in a serving process holds a row-writable handle between calls.
+
+  The fourth port was the edit log's first question and the count is the honest thing to change:
+  writing the log through `insert_row` would have needed a snapshot expectation the append does not
+  hold and would let a busy log table refuse the very write it describes, and holding a
+  `CatalogWriter` for it would have handed the runtime `alter_table` to buy one append. So the port
+  takes **no table name** — there is nothing to point at the wrong table with.
 
 - **The read before the write is a full physical row.** A modify is an equality-delete plus an
   append, so it rewrites the row entirely and every column no property maps has to be carried
@@ -66,11 +73,37 @@ Eight rules shape the package. Each had an obvious-looking alternative:
   three-valued logic — see `evaluate.py` for why an "unknown" precondition would be worse than a
   decided one.
 
-- **A refusal changes nothing, and says everything.** Binding, the read, the uniqueness check and
-  every validation rule all run before the single write call, so a refused run is a no-op exactly
-  as a refused `loom apply` is. And every rule is evaluated, not just up to the first failure: an
-  agent fixing one precondition per call is as miserable as an author fixing one typo per run.
-  Nothing a caller, an author or the data can cause is an exception; it is a typed `Failure`.
+- **A refusal changes nothing it was asked to change, and says everything.** Binding, the read, the
+  uniqueness check and every validation rule all run before the single write call, so a refused run
+  writes no data, exactly as a refused `loom apply` does. And every rule is evaluated, not just up to
+  the first failure: an agent fixing one precondition per call is as miserable as an author fixing
+  one typo per run. Nothing a caller, an author or the data can cause is an exception; it is a typed
+  `Failure`.
+
+  The qualifier is the edit log's doing and is stated rather than slipped in. A refusal *is* recorded
+  — an audit trail of successes cannot answer "who tried to delete this customer", and a conflict is
+  a refusal too, so a contended row would otherwise leave no trace of the attempts it swallowed.
+  `loom apply` still refuses before it holds a writer and records nothing at all, which is a stronger
+  instance of the same rule rather than an exception to it.
+
+- **The record is written after the write, and the part that must be atomic travels inside it.**
+  Iceberg has no transaction spanning two tables, so a row write and a log append are two commits and
+  one of them can be lost. The one that can't be is the row write's own snapshot summary, which
+  carries `loom.edit_id` — so a crash in the gap leaves a stamped snapshot with no matching record,
+  which a reader can *find*, rather than the silence that makes a log evidence of nothing. That also
+  makes `failed` answerable for the first time. A failed append never fails the action: the row has
+  already committed, and reporting otherwise would tell a caller to retry a delete that happened.
+
+  What the record holds is the ontology's view — declared properties, the same projection `before`
+  and `after` use — extended to a new reader rather than excepted for one. The physical row was the
+  alternative, and it would have made this table an unabridged copy of the data that *outlives* the
+  row it copies, which is a worse leak than the one the never-report rule exists to prevent.
+
+- **The runtime never invents an actor.** `default_actor()` is honest for `loom apply` and for
+  `loom run`, which a person runs, and a lie for `run_<action>` over MCP, where it names whoever
+  started `loom serve` and stamps every caller with the same string. So the actor is an argument, the
+  CLI passes it in at the one call site where it is true, and when nobody supplies one the log
+  records `unknown` — which is worth more than a confident wrong answer.
 
 - **`operation: delete` does not contradict "Loom never drops".** Never-drop is about *inference* —
   Loom refusing to conclude a destruction from **silence** in a spec, because a column no property
@@ -84,12 +117,14 @@ Eight rules shape the package. Each had an obvious-looking alternative:
 from __future__ import annotations
 
 from .evaluate import EvalError, Scope, evaluate
+from .log import EDIT_COLUMNS, UNKNOWN_ACTOR, EditLog, EditRecord
 from .result import (
     AMBIGUOUS_KEY,
     APPLIED,
     CONFLICT,
     EXPRESSION_ERROR,
     FAILED,
+    LOG_FAILED,
     MISSING_PARAMETER,
     OBJECT_EXISTS,
     OBJECT_NOT_FOUND,
@@ -109,8 +144,10 @@ __all__ = [
     "AMBIGUOUS_KEY",
     "APPLIED",
     "CONFLICT",
+    "EDIT_COLUMNS",
     "EXPRESSION_ERROR",
     "FAILED",
+    "LOG_FAILED",
     "MAX_ATTEMPTS",
     "MISSING_PARAMETER",
     "OBJECT_EXISTS",
@@ -119,12 +156,15 @@ __all__ = [
     "REFUSED",
     "RETRYABLE",
     "TYPE_ERROR",
+    "UNKNOWN_ACTOR",
     "UNKNOWN_PARAMETER",
     "VALIDATION_FAILED",
     "WRITE_FAILED",
     "ActionError",
     "ActionResult",
     "ActionRuntime",
+    "EditLog",
+    "EditRecord",
     "EvalError",
     "Failure",
     "Scope",

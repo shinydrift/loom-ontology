@@ -255,15 +255,42 @@ def test_run_goes_through_the_same_runtime_entry_point_the_mcp_tool_will(tmp_pat
     calls: list[tuple] = []
     original = ActionRuntime.run
 
-    def spy(self, name, params, *, dry_run=False):
+    def spy(self, name, params, *, actor=None, dry_run=False):
         calls.append((name, dict(params), dry_run))
-        return original(self, name, params, dry_run=dry_run)
+        return original(self, name, params, actor=actor, dry_run=dry_run)
 
     monkeypatch.setattr(ActionRuntime, "run", spy)
     main(["run", "upgradeTier", str(ontology), "--param", "customer=c1",
           "--param", "newTier=gold", "--dry-run"])
 
     assert calls == [("upgradeTier", {"customer": "c1", "newTier": "gold"}, True)]
+
+
+def test_run_names_the_actor_itself_rather_than_letting_the_runtime_guess(tmp_path, capsys, monkeypatch):
+    """`default_actor()` lives at this call site and nowhere below it.
+
+    Here it is honest — a person at a terminal, or a CI job that set `LOOM_ACTOR`. Over MCP the same
+    call would name whoever started `loom serve`, so the runtime refuses to make it and takes an
+    argument instead. This asserts the CLI actually fills it in, because a runtime that records
+    `unknown` for every `loom run` would be the other way of getting this wrong."""
+    from loom.action import EditLog
+    from loom.catalog import open_catalogs
+    from loom.config import find_config, load_config
+    from loom.errors import Diagnostics
+
+    monkeypatch.setenv("LOOM_ACTOR", "release-pipeline")
+    ontology = _seeded(tmp_path)
+    assert main(["run", "createOrder", str(ontology), "--param", "orderId=o9",
+                 "--param", "customerId=c1", "--param", "total=1.00", "--yes"]) == 0
+
+    err = capsys.readouterr().err
+    assert "recorded in _loom_meta.edits as " in err
+
+    diag = Diagnostics()
+    config = load_config(find_config(ontology), diag)
+    history = EditLog(catalog=open_catalogs(config)["rest_main"]).history()
+    assert [r["actor"] for r in history] == ["release-pipeline"]
+    assert history[0]["action"] == "createOrder" and history[0]["object_key"] == "o9"
 
 
 def test_run_without_a_terminal_refuses_rather_than_assuming_yes(tmp_path, capsys):

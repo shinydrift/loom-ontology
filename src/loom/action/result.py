@@ -31,12 +31,31 @@ PREVIEWED = "previewed"
 """`--dry-run`: bound, read and validated, and then deliberately not written."""
 
 REFUSED = "refused"
-"""Something the caller, the spec or the data caused. **Nothing was written** — every check runs
-before the single write call, so a refusal is always a no-op, exactly as a refused `loom apply`
-is."""
+"""Something the caller, the spec or the data caused.
+
+**A refusal changes nothing it was asked to change.** No row is written, no column altered, no table
+touched on behalf of the work that was refused — every check runs before the single write call, and a
+conflict is declined inside the commit rather than undone after it.
+
+The sentence used to be "nothing was written", and the edit log is why it is not any more. A refusal
+*is* recorded, in Loom's own append-only log, once the run got as far as naming a row: an audit trail
+that holds only successes cannot answer "who tried to delete this customer", which is close to the
+only question audit trails exist for. So the promise is restated rather than quietly narrowed — what
+a refusal may leave behind is a record *of* the refusal, never a change to the data.
+
+Still true of `loom apply`, which refuses before it holds a writer and records nothing at all: a
+stronger instance of the same rule, not an exception to it. The asymmetry is deliberate. An `apply`
+refusal is local, printed to the operator, and reproducible from a file that is still on disk. A run
+refusal is remote, seen by nobody, and unreproducible — the row it was refused against has already
+moved on."""
 
 FAILED = "failed"
-"""The write itself failed after the runtime had decided to go ahead."""
+"""The write itself failed after the runtime had decided to go ahead.
+
+The one status where nobody knows whether the row changed, which is why it is also logged. The record
+carries the `edit_id`, and the row write stamps that same id into its own Iceberg commit — so the
+question `failed` leaves open is answerable from the table's history rather than only by inspection:
+if a snapshot carries the id, the write landed."""
 
 # --- failure codes --------------------------------------------------------------
 #
@@ -64,6 +83,20 @@ it carries `expectedSnapshotId`, `foundSnapshotId`, `attempts`, the declared pro
 `changed` under the run, and `contended` — whether any of those are properties this action reads or
 writes. A busy table and a contested row are different situations and the caller has to be able to
 tell them apart. See `_Run._conflict`."""
+
+LOG_FAILED = "log_failed"
+"""The run happened; recording it in `_loom_meta.edits` did not.
+
+Never changes the status beside it, and that is the decision rather than an oversight. Reporting
+`failed` for a write that committed is the worst lie available here — a caller would retry a delete
+that had already happened — so an applied run that could not be logged is still `applied`, still
+`ok`, and carries this. Not retryable either: retrying the *action* would perform it twice to fix a
+missing record.
+
+`loom apply` makes the opposite call (`ApplyResult` goes to `failed` when `_loom_meta` cannot be
+written) and the difference is what the caller can do with the answer. An apply's result lists the
+tables that landed, so `failed` there is unambiguous; an action has no such list, and `failed` on one
+means exactly "your row was not written"."""
 
 RETRYABLE = frozenset({CONFLICT})
 """Codes where running the same call again is a sensible response. Everything else needs the
@@ -115,7 +148,14 @@ class ActionResult:
 
     `before` and `after` are still the object as the ontology sees it, and so is everything the
     conflict path reports: `detail["changed"]` is diffed through the same projection, so the columns
-    no property maps are compared no more than they are shown."""
+    no property maps are compared no more than they are shown. The edit log extends that rule rather
+    than making an exception to it — see `action.log.EditRecord`, where the reader is an auditor and
+    the alternative (the physical row) would have been a worse leak than the one this rule prevents.
+
+    `edit_id` is the run's identity in `_loom_meta.edits`, minted before the write so the write can
+    stamp it into its own Iceberg commit. Empty when nothing was recorded: a preview, a refusal that
+    never named a row, or a catalog with no edit-log port. It is on the result so a caller can cite
+    the record — an agent that is told an edit applied should be able to say which one."""
 
     action: str
     object_type: str
@@ -126,6 +166,7 @@ class ActionResult:
     after: Mapping[str, Any] | None = None
     read_snapshot_id: int | None = None
     attempts: int = 1
+    edit_id: str = ""
     failures: tuple[Failure, ...] = ()
 
     @property
@@ -167,5 +208,8 @@ class ActionResult:
             "readSnapshotId": self.read_snapshot_id,
             "concurrency": self.concurrency,
             "attempts": self.attempts,
+            # Empty rather than omitted when nothing was recorded, so "this run was not logged" is a
+            # value a caller can read rather than a key it has to notice the absence of.
+            "editId": self.edit_id,
             "failures": [f.as_json() for f in self.failures],
         }

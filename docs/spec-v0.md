@@ -299,9 +299,14 @@ The grammar above is half the contract. The other half is the runtime, because a
 only thing in Loom that changes a row, and what it does to the columns the spec *doesn't* mention
 is as much a promise as what it does to the ones it does.
 
-**One row, four steps, one commit.** Bind the parameters → read the target row → evaluate every
-validation rule → one write. Everything that can refuse happens in the first three, so **a run that
-refuses changes nothing** — the same promise `apply` makes about a breaking plan.
+**One row, four steps, one commit, one record.** Bind the parameters → read the target row →
+evaluate every validation rule → one write → one row in the edit log. Everything that can refuse
+happens in the first three, so **a run that refuses changes nothing it was asked to change** — the
+same promise `apply` makes about a breaking plan.
+
+That sentence is deliberately narrower than "changes nothing", which is what it said before the edit
+log existed. A refused run writes no data — no row, no column, no table — and is *recorded*. See
+"The edit log" below for why the wording moved rather than the behaviour being quietly excused.
 
 **A `modify` is an equality-delete plus an append, and therefore a full-row rewrite.** This is why
 the read that precedes the write is a *whole physical row*, not the ontology's projection of one:
@@ -331,7 +336,7 @@ are still there and the fix is out of band.
 cause is an exception. A run comes back with a status (`applied` · `previewed` · `refused` ·
 `failed`) and a list of failures, each carrying a code from a closed set — `missing_parameter`,
 `unknown_parameter`, `type_error`, `validation_failed`, `expression_error`, `object_not_found`,
-`object_exists`, `ambiguous_key`, `write_failed`, `conflict`. A failed rule carries the spec's own
+`object_exists`, `ambiguous_key`, `write_failed`, `conflict`, `log_failed`. A failed rule carries the spec's own
 `message`, verbatim. Every rule is evaluated rather than stopping at the first failure, for the
 same reason `loom validate` reports every problem at once.
 
@@ -398,6 +403,55 @@ run does its own read, which is the one it asserts. A human's thinking time is t
 the transaction, and what the prompt asks a person to approve is the *shape* of the change. That is
 also the only answer that can be true of both callers: `run_<action>` has no prompt at all, so a
 design in which the checked snapshot came from a preview is one the MCP caller could never join.
+
+**The edit log.** Every run that named a row appends one record to `_loom_meta.edits` (§9.2) — the
+data-plane counterpart to what `_loom_meta.applied` records about schemas.
+
+*Refusals are recorded, and that is why the promise above is worded the way it is.* An audit trail
+holding only successes cannot answer *who tried to delete this customer*, which is close to the only
+question audit trails exist for — and since a conflict is a refusal, a contended row would otherwise
+leave no trace of the attempts it swallowed. So a refusal writes no data and does leave a record that
+it was attempted. `apply` still refuses before it holds a writer and records nothing at all: a
+stronger instance of the same rule, not an exception to it. The asymmetry is deliberate — an `apply`
+refusal is local, printed, and reproducible from a file still on disk; a run refusal is remote, seen
+by nobody, and unreproducible, because the row it was refused against has already moved on.
+
+*A run is recorded once it named a row.* A call that could not be bound — a missing parameter, a
+value outside a declared enum — never resolved a key, so its record would carry none and answer no
+audit question. That is a *request* log and belongs at the serve boundary. Previews are never
+recorded: a preview writes nothing, and `loom run` previews before every real run. A `failed` write
+**is** recorded; it is the one status where nobody knows whether the row changed.
+
+*The record holds declared properties only* — the same projection `before` and `after` use, and the
+same rule, extended to a new reader rather than excepted for one. The physical row was the
+alternative and it is worse than the leak that rule prevents: an unabridged second copy of the data,
+in a table nothing governs, retained forever, and the copy that *outlives* the row — which would make
+a `delete` action erase a customer into a permanent record of them. The objection that this is an
+incomplete account of a full-row rewrite is answered by the carry-across guarantee plus the snapshot
+check: every unmapped column was written back unchanged and nothing moved under the run, so **what
+the record does not name, the run did not change.** The bound parameters are recorded too, because a
+refused modify has no `after` and would otherwise record that somebody tried without recording what.
+
+*The actor is supplied by the caller, never invented.* `$LOOM_ACTOR`-or-OS-user is honest for a
+command a person runs and a lie for a served tool, where it would name whoever started `loom serve`
+and stamp every caller in the deployment with one string. `loom run` passes it explicitly;
+`run_<action>` will pass what its transport authenticated; when nobody supplies one the record says
+`unknown`, which is worth more than a confident wrong answer.
+
+*The write carries its own identity, and the log is written after it.* Iceberg has no transaction
+spanning two tables, so the row write and the log append are two commits and a crash can land between
+them. What survives that is the row write's **snapshot summary**, which carries `loom.edit_id`,
+`loom.action` and `loom.actor` inside the very commit that changed the data — the only attribution
+here that cannot be separated from the edit. A lost log row is therefore a stamped snapshot with no
+matching record: a gap a reader can find, rather than silence. It is also what makes `failed`
+answerable — if a snapshot carries the id, the write landed. The guarantee is asymmetric and worth
+stating: a lost record of a *refusal* is not detectable, because a refusal leaves nothing to stamp.
+A failed append never fails the action, which has already committed; it comes back as a
+non-retryable `log_failed` beside the real status.
+
+*A retried run is one record.* The attempts that lost wrote nothing, so they are not edits; they are
+one edit that took several tries, and `attempts` says so. The states they lost to are not this run's
+to describe — a competing writer coming through Loom has its own record in the same table.
 
 ---
 
@@ -560,12 +614,22 @@ of YAML.
 
 ---
 
-## 9. `_loom_meta` — what `apply` recorded
+## 9. `_loom_meta` — what Loom recorded
 
-Part of the contract because it is a table in *your* lake, not an implementation detail: anything
-with an Iceberg client can read it, and a later Loom must keep it readable.
+Part of the contract because these are tables in *your* lake, not implementation details: anything
+with an Iceberg client can read them, and a later Loom must keep them readable.
 
-One table per catalog the spec binds, created by the first `loom apply` that touches that catalog:
+The namespace holds two tables, one per catalog, and neither is ever named by a spec:
+
+| table | records | created by |
+|---|---|---|
+| `_loom_meta.applied` | what `apply` did to **schemas** | the first `loom apply` touching that catalog |
+| `_loom_meta.edits` (§9.2) | what an action did to **rows** | the first action run against that catalog |
+
+Neither is a planner input and neither can be planned *against*: `plan` only ever visits the tables
+the spec declares, so it proposes nothing for either of these and reports neither as unmanaged.
+
+`_loom_meta.applied`, created by the first `loom apply` that touches that catalog:
 
 ```
 _loom_meta.applied
@@ -672,6 +736,62 @@ confirmation prompt — the old spec plus whatever came after it is not the spec
 so leaving them would not be a rollback. Scope is what `spec` captured and no wider: `*.yaml` and
 `*.yml` under the ontology directory, never `loom.yaml`, never a file of any other kind.
 
+**Rollback does not touch `_loom_meta.edits`.** It reverses DDL and only DDL, and the edit log is
+rows — the same reason it leaves your data alone. This is not an exception carved out for a
+Loom-created table: `rollback` executes through `apply`, which holds a writer with no verb that can
+remove a row from anything.
+
+### 9.2 `edits` — what an action did
+
+One table per catalog, created by the **first action run against that catalog** — not by `apply`,
+which never creates it and does not know it exists. Making `apply` the creator would give the log a
+precondition the write does not have, and Loom writes to lakes it has never migrated, which are
+exactly the ones where an audit trail matters most. Per catalog rather than per backing table for the
+same reason `applied` is, plus one of its own: *what did this actor do today* is a cross-table
+question, and a per-table sidecar cannot answer it.
+
+```
+_loom_meta.edits
+  edit_id           string       required   # also stamped into the row write's own Iceberg commit
+  recorded_at       timestamptz  required
+  actor             string                  # supplied by the caller; `unknown` when nobody did
+  action            string                  # the action's apiName
+  object_type       string
+  operation         string                  # create | modify | delete
+  catalog           string
+  table_name        string                  # the backing table the row lives in
+  object_key        string                  # the primary key, rendered
+  status            string                  # applied | refused | failed
+  attempts          long                    # 1, or more when a conflict was retried
+  read_snapshot_id  long                    # the snapshot the write asserted
+  parameters        string                  # JSON: the bound call
+  before            string                  # JSON: declared properties, or empty
+  after             string                  # JSON: declared properties, or empty
+  failures          string                  # JSON: the run's typed failures, conflict detail and all
+  loom_version      string
+```
+
+`table_name` and `object_key` rather than `table` and `key`: this table is meant to be read from any
+SQL engine someone points at the lake, and both of the shorter spellings are reserved words in
+dialects Loom already targets. `edit_id` and `recorded_at` are the only required columns — this table
+is only ever *created*, never altered, so a column omitted today can never reach a log that already
+exists, and a required one is a column a future Loom can never add at all.
+
+**Append-only, one row per run**, oldest first by `recorded_at`. A run that retried is one row
+carrying `attempts`: the attempts that lost wrote nothing, so they are not edits.
+
+**`before`/`after` hold declared properties**, through the same projection §4.1 reports — so what the
+record does not name, the run did not change. Both are empty rather than null where there is nothing
+to record (a `create` has no before, a `delete` no after).
+
+**`read_snapshot_id` identifies the commit.** The write asserted it *inside* the commit, so on that
+table's ref exactly one snapshot has it as a parent. That snapshot — and, for a `modify`, the append
+that follows its equality-delete — carries `loom.edit_id`, `loom.action` and `loom.actor` in its
+Iceberg **snapshot summary**. The duplication is the one §9 already makes with table properties, one
+plane down: a table's history should say who changed it without the reader knowing a log table
+exists. It is also the only record of an edit that is atomic with the edit, which is what makes a lost
+log row a gap somebody can find rather than silence.
+
 ---
 
 ## Open edges (v0 → v1)
@@ -693,6 +813,16 @@ Named deliberately so they're conscious deferrals, not gaps:
   (§4.1), which is a superset of what §6's `governance.policies` will let a caller read. Whether a
   masked column is carried (it must be, or the write destroys it) or the write is refused is a
   question that belongs to the milestone that introduces masking.
+- **Edit-log retention, redaction and erasure** — §9.2 records declared properties and the bound
+  parameters, which is strictly less than the physical row and is still somebody's data, kept in an
+  append-only table that outlives the row it describes. A `delete` action erases a customer and
+  leaves the ontology's own account of them behind. Whether the log masks under the same policies as
+  a read, records property *names* without values, or is expired on a retention window is the same
+  question §6 faces and belongs to the same milestone. Nothing is deferred about the record's shape:
+  the columns are fixed now (§9.2) because the table is only ever created.
+- **Refusing to act when the log is unavailable** — a run whose record cannot be written still
+  happens, and reports `log_failed`. "No log, no write" is a coherent audit posture and a *policy*,
+  so it belongs with the other policies rather than wired in where no deployment could turn it off.
 - **Chained renames** — `renamedFrom` is one hop (§2.1). Widening it to a list of prior names
   would be backward-compatible with every spec written against v0, if a lake that routinely skips
   applies ever makes it worth the cost.
