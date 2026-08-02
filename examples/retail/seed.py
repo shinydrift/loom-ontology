@@ -8,8 +8,10 @@ Run once, then serve:
     loom serve examples/retail/ontology
 
 This script talks to pyiceberg directly rather than going through Loom, and that's deliberate:
-Loom's `Catalog` port is read-only until the action runtime lands (M3). Seeding is the *user's*
-data-loading concern — the framework's claim is only that it can serve what's already in the lake.
+Loom writes one row at a time, through a declared action. Bulk loading is the *user's* concern —
+the framework's claim is that it can serve, migrate and act on what's in the lake, not that it is
+the way data gets there. (`loom apply` would create these tables from the spec alone; this script
+also puts rows in them, and adds two columns the spec never mentions.)
 
 The schemas below are the physical side of the contract in `ontology/*.yaml`. Change one without
 the other and `loom validate --physical` will say so, which is the point.
@@ -39,6 +41,16 @@ CUSTOMERS_SCHEMA = pa.schema(
         pa.field("tier", pa.string(), nullable=False),
         # The only property the spec declares nullable.
         pa.field("lifetime_value", pa.float64(), nullable=True),
+        # Two columns the ontology never mentions, because a real lake always has some. An
+        # objectType maps a *subset* of a table's columns, so these are someone else's data:
+        # `loom plan` reports them as unmanaged and leaves them alone, and the action runtime
+        # carries them across a modify untouched — a modify rewrites the whole row, so anything it
+        # didn't carry it would silently null.
+        pa.field("region", pa.string(), nullable=True),
+        # And this one has a type Loom has no name for at all: `array<T>` is deferred in spec §1.
+        # It is carried the same way, because the carry-across is driven by the table's own schema
+        # rather than by anything the ontology knows about the value.
+        pa.field("segments", pa.list_(pa.string()), nullable=True),
     ]
 )
 
@@ -63,6 +75,8 @@ CUSTOMERS = pa.table(
         "full_name": ["Ada Lovelace", "Grace Hopper", "Alan Turing"],
         "tier": ["gold", "silver", "bronze"],
         "lifetime_value": [48210.50, 12750.00, None],
+        "region": ["emea", "amer", "apac"],
+        "segments": [["enterprise", "early-adopter"], ["smb"], None],
     },
     schema=CUSTOMERS_SCHEMA,
 )
@@ -127,6 +141,7 @@ def main() -> int:
     print("\nnext:")
     print("  loom validate --physical examples/retail/ontology")
     print("  loom query Customer examples/retail/ontology --key c1")
+    print("  loom run upgradeTier examples/retail/ontology --param customer=c3 --param newTier=gold")
     print("  loom serve examples/retail/ontology")
     return 0
 

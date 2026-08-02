@@ -1,0 +1,20 @@
+action:
+  apiName: recordOrder
+  displayName: Record order
+  description: Record a new order placed by a customer
+  targetObjectType: Order
+  operation: create
+  parameters:
+    - { name: orderId,  type: string }
+    - { name: customer, type: objectRef, objectType: Customer }
+    - { name: total,    type: decimal, precision: 12, scale: 2 }
+  effects:
+    - createObject:
+        # An effect value is a full expression, not just a parameter reference — `now()` is why
+        # that matters. The `{{ }}` around the others is punctuation the loader strips: both
+        # spellings are the same grammar.
+        set:
+          orderId:    "{{ orderId }}"
+          customerId: "{{ customer }}"
+          total:      "{{ total }}"
+          placedAt:   "now()"

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 
 from .errors import Diagnostics, SourceLoc
 from .expr import Expr
@@ -147,6 +149,125 @@ def physical_type(prop_type: PropType, object_types: Mapping[str, ObjectType]) -
         ref = object_types.get(prop_type.object_type or "")
         return ref.pk_property.type.iceberg_type() if ref is not None else None
     return prop_type.iceberg_type()
+
+
+def coerce_value(
+    prop_type: PropType,
+    value: object,
+    object_types: Mapping[str, ObjectType],
+    ctx: str = "value",
+) -> object:
+    """Bring a caller-supplied value to the Python type a declared Loom type is carried as.
+
+    One function for both directions, because both directions have the same problem and must not
+    answer it differently. On the way *in*, an LLM will happily send `"42"` for a `long` key: JSON
+    can't tell those apart, and the mismatch wouldn't fail loudly — it would push down as an
+    Iceberg predicate matching nothing, and the agent would be told the object doesn't exist. On
+    the way *out*, the same `"42"` has to become an int before it is written, or the row now holds
+    a string where the schema promised a number. A second implementation of this would be a second
+    set of answers to "is `42.0` a long?".
+
+    The value domain it produces is the one the read path already promises: `Decimal` for decimal
+    (never a float — that is the whole reason a spec writes `decimal(12,2)`), tz-aware `datetime`
+    for timestamp, `date`, and plain `str` / `int` / `float` / `bool` / `None` elsewhere.
+
+    Raises `ValueError`, fully worded, for callers to wrap in whatever their layer's failure is.
+    """
+    if value is None:
+        return None
+    kind = prop_type.kind
+    if kind == "objectRef":
+        # An objectRef travels as the referenced object's primary key, so it coerces as that key's
+        # type — not as a string.
+        ref = object_types.get(prop_type.object_type or "")
+        if ref is not None:
+            return coerce_value(ref.pk_property.type, value, object_types, ctx)
+        return str(value)
+    try:
+        if kind in ("int", "long"):
+            return _as_integer(value)
+        if kind == "double":
+            return float(value)  # type: ignore[arg-type]
+        if kind == "decimal":
+            return _as_decimal(prop_type, value)
+        if kind == "boolean":
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered not in ("true", "false"):
+                    raise ValueError(f"expected 'true' or 'false', got {value!r}")
+                return lowered == "true"
+            return bool(value)
+        if kind == "date":
+            return _as_date(value)
+        if kind == "timestamp":
+            return _as_timestamp(value)
+        if kind == "enum":
+            text = str(value)
+            if prop_type.values and text not in prop_type.values:
+                raise ValueError(f"'{text}' is not one of: {', '.join(prop_type.values)}")
+            return text
+    except (TypeError, ValueError, ArithmeticError) as e:
+        raise ValueError(f"{ctx}: cannot read {value!r} as {kind} ({e})") from e
+    return str(value)
+
+
+def _as_integer(value: object) -> int:
+    """Strict about floats. `int(42.7)` truncates silently, which on the read path turns a filter
+    into one that matches the wrong rows and on the write path stores a different number than the
+    caller sent. An integral float is fine; a fractional one is a mistake worth naming."""
+    if isinstance(value, bool):  # bool is an int subclass, and True would silently become 1
+        raise ValueError("boolean is not an integer")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError("a fractional number is not an integer — it would be truncated")
+        return int(value)
+    if isinstance(value, Decimal):
+        if value != value.to_integral_value():
+            raise ValueError("a fractional number is not an integer — it would be truncated")
+        return int(value)
+    return int(value)  # type: ignore[arg-type]
+
+
+def _as_decimal(prop_type: PropType, value: object) -> Decimal:
+    """`Decimal(str(value))`, then checked against the declared precision and scale.
+
+    Checked here rather than left to the storage layer because the storage layer's only options are
+    to round or to raise something unreadable, and rounding money is exactly what declaring a
+    `decimal` was meant to prevent."""
+    if isinstance(value, float):
+        raise ValueError("a float cannot be read as a decimal without losing precision — send a string")
+    try:
+        out = Decimal(str(value))
+    except InvalidOperation as e:
+        raise ValueError(str(e) or "not a decimal") from e
+    if not out.is_finite():
+        raise ValueError("not a finite decimal")
+    precision, scale = prop_type.precision or 0, prop_type.scale or 0
+    digits, exponent = out.as_tuple().digits, int(out.as_tuple().exponent)  # type: ignore[arg-type]
+    spelling = f"decimal({precision},{scale})"
+    if -exponent > scale:
+        raise ValueError(f"has more than {scale} decimal place(s), which {spelling} cannot hold")
+    # Significant digits once padded out to the declared scale: 1299.99 at scale 2 needs 6, and a
+    # 13-digit integer at scale 2 needs 15.
+    if len(digits) + scale + exponent > precision:
+        raise ValueError(f"has more digits than {spelling} can hold")
+    return out
+
+
+def _as_date(value: object) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
+
+
+def _as_timestamp(value: object) -> datetime:
+    """Always tz-aware. §1 says `timestamp` is `timestamptz`, UTC on the wire, so a naive value —
+    which is what `fromisoformat` produces for `2026-01-04T12:00:00` — is read as UTC rather than
+    handed on to a storage layer that would either reject it or guess a zone."""
+    out = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    return out if out.tzinfo is not None else out.replace(tzinfo=UTC)
 
 
 def check_renames(

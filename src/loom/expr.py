@@ -5,8 +5,12 @@ Deliberately tiny so it stays portable across query engines and safe to evaluate
 function allow-list. No loops, lambdas, assignment, or arbitrary code.
 
 This module only *parses and shape-checks* expressions into an AST. Binding references to real
-parameters/properties, and later lowering the AST to engine SQL, happen in the validator and
-resolver respectively — but they build on the `refs()` / `calls()` the AST exposes here.
+parameters/properties, evaluating the AST against a bound row, and later lowering it to engine SQL
+happen in the validator, the action runtime and the resolver respectively — but they build on the
+`refs()` / `calls()` the AST exposes here.
+
+The `{{ … }}` an effect writes its values in is *not* a second grammar. `parse()` strips it, so by
+the time anything runs there is only ever an `Expr`. See `parse()`.
 """
 
 from __future__ import annotations
@@ -238,11 +242,22 @@ class _Parser:
 
 def parse(text: str) -> Expr:
     """Parse an expression (with optional surrounding `{{ }}`) into an Expr AST.
-    Raises ExprError on malformed input."""
+    Raises ExprError on malformed input.
+
+    **There is one language, and this is where the braces stop existing.** `{{ customer }}` in an
+    effect and `newTier != object.tier` in a validation rule are the same grammar written two ways:
+    the wrapper is optional punctuation, stripped here at load, so nothing downstream — evaluator,
+    validator, or engine — ever sees a brace. What it is *not* is a template. `"tier-{{ x }}"` does
+    not interpolate; string building is the expression language's own `+`."""
     raw = text.strip()
     inner = raw
     if inner.startswith("{{") and inner.endswith("}}"):
         inner = inner[2:-2].strip()
+    if "{{" in inner or "}}" in inner:
+        raise ExprError(
+            f"{raw!r} looks like a template, and Loom has no string interpolation — '{{{{ }}}}' may "
+            f"only wrap a whole expression. Use the expression language's '+' to build a string"
+        )
     if not inner:
         raise ExprError("empty expression")
     root = _Parser(_tokenize(inner), raw).parse()

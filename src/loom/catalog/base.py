@@ -5,10 +5,16 @@ canonical spelling `PropType.iceberg_type()` produces, so physical validation is
 comparison against the type system's own output and nothing above this port needs pyiceberg
 imported to reason about types.
 
-Writes live in a *second* port, `CatalogWriter`, rather than as extra methods on `Catalog`. The
-read path — the resolver, the query engines, `loom serve` — is handed a `Catalog`, so it cannot
-execute DDL even by accident; only `loom apply` asks for a writer, and asking is an explicit
-`writer_for()` call that fails loudly against a backend that doesn't have one.
+**Three ports, two planes, and no supersets.** `Catalog` reads. `CatalogWriter` changes a table's
+*shape*. `RowWriter` changes a table's *rows*. The read path — the resolver, the query engines,
+`loom serve` — is handed a `Catalog` and cannot write at all. `loom apply` asks for a
+`CatalogWriter` and therefore cannot delete a row: the port has no verb for it. The action runtime
+asks for a `RowWriter` and therefore cannot alter a schema, for the same reason. Neither writer
+extends the other, because the argument that separated reads from writes points both ways at once
+one layer down — `apply` has no business touching rows and an action has no business touching DDL.
+
+Asking is explicit in every case: `writer_for()` / `row_writer_for()` fail loudly, naming the
+catalog, against a backend that doesn't implement what was asked for.
 """
 
 from __future__ import annotations
@@ -70,6 +76,20 @@ class Catalog(Protocol):
         """
         ...
 
+    def current_snapshot_id(self, table: str) -> int | None:
+        """The id of the table's current Iceberg snapshot, or None for a table with no history.
+
+        A *read* verb, on the read port, because it answers a question about what was read: which
+        version of this table did I just see. The action runtime records it alongside every
+        read-then-write so the concurrency slice has something to check the write against; nothing
+        enforces it yet, and the runtime says so rather than implying the two halves are one
+        transaction.
+
+        Callers that record it must read it **before** the rows, not after. That order makes the
+        recorded snapshot at-or-before the data, so a later check can report a conflict that wasn't
+        one — but can never miss one that was."""
+        ...
+
 
 @dataclass(frozen=True)
 class SchemaEdit:
@@ -96,10 +116,12 @@ class SchemaEdit:
 
 @runtime_checkable
 class CatalogWriter(Protocol):
-    """The write half of a catalog: create what the ontology needs, evolve what already exists.
+    """The *schema* half of a catalog: create what the ontology needs, evolve what already exists.
 
     Narrow on purpose. It cannot drop a table, drop a column, or narrow a type — not as a policy
-    check inside an implementation, but because the port has no verb for it.
+    check inside an implementation, but because the port has no verb for it. For the same reason it
+    cannot delete or replace a row: those verbs live on `RowWriter`, and `loom apply` never asks
+    for one.
     """
 
     name: str
@@ -134,20 +156,85 @@ class CatalogWriter(Protocol):
 
     def append_rows(self, table: str, rows: Sequence[Mapping[str, Any]]) -> None:
         """Append rows, each keyed by column name. Values are plain Python objects; the
-        implementation converts them to the table's own physical types."""
+        implementation converts them to the table's own physical types.
+
+        The one row verb on the schema port, and it stays here rather than moving to `RowWriter`
+        because it is how `_loom_meta` records history: purely additive, incapable of destroying
+        anything, the same shape as the DDL verbs beside it. `RowWriter` gets its own singular
+        `insert_row` instead of borrowing this, so an action can never append a batch to somebody's
+        history table."""
+        ...
+
+
+@runtime_checkable
+class RowWriter(Protocol):
+    """The *row* half of a catalog: the three things a single-object action can do to one row.
+
+    Every verb is singular and keyed. There is no batch write, no predicate, and no "update where"
+    — a multi-row write is not expressible through this port, which is how the spec's single-object
+    boundary (§4) is enforced at the bottom of the stack as well as at spec-load. And there is no
+    schema verb, so the action runtime cannot alter a table even by accident.
+
+    `replace_row` takes the **complete** new row rather than the changed columns. A row-level
+    modify is an equality-delete plus an append, which rewrites the whole row, so every column the
+    ontology does not map has to be carried across by the caller or it is silently nulled. Making
+    the port take the whole row keeps that carry-across visible in the runtime, where the policy
+    is and where a fake catalog can prove it, instead of hiding it in an implementation.
+
+    When the concurrency slice lands, `replace_row` and `delete_row` grow one optional argument —
+    the snapshot the row was read at — and the implementation turns it into a compare-and-swap.
+    Everything that argument will need is already captured (`Catalog.current_snapshot_id`); the
+    check is the only thing missing.
+    """
+
+    name: str
+
+    def insert_row(self, table: str, row: Mapping[str, Any]) -> None:
+        """Append exactly one row, keyed by column name."""
+        ...
+
+    def replace_row(
+        self, table: str, key_column: str, key_value: Any, row: Mapping[str, Any]
+    ) -> None:
+        """Delete the rows where `key_column` equals `key_value` and append `row`, in **one
+        transaction**: a reader sees the old row or the new one, never neither and never both.
+
+        `row` must be the whole row, including the columns no property maps."""
+        ...
+
+    def delete_row(self, table: str, key_column: str, key_value: Any) -> None:
+        """Delete the rows where `key_column` equals `key_value`.
+
+        A row, not a column and not a table: Loom's never-drop rule is about refusing to *infer* a
+        destruction from silence in a spec, and this verb only ever runs because an action declared
+        `operation: delete` and a caller named a key."""
         ...
 
 
 def writer_for(catalog: Catalog) -> CatalogWriter:
+    """Exchange a read handle for one that can change a table's shape. `loom apply` asks."""
+    return _port_for(catalog, CatalogWriter, "schema writes", "'loom apply' to execute against")
+
+
+def row_writer_for(catalog: Catalog) -> RowWriter:
+    """Exchange a read handle for one that can change a table's rows. The action runtime asks.
+
+    A sibling of `writer_for` rather than an argument to it: two named exchange points read better
+    than one that takes a port object, and the plane you are asking for should be visible at the
+    call site."""
+    return _port_for(catalog, RowWriter, "row writes", "an action to execute against")
+
+
+def _port_for(catalog: Catalog, port: type, plane: str, purpose: str):
     """The one place a read-only handle is exchanged for a writable one.
 
-    Structural rather than a registry: an implementation is writable if it has the verbs. The
-    error matters more than the check — a catalog backend that can only be read is a perfectly
-    reasonable thing to exist, and `apply` should say which one refused rather than raise an
-    AttributeError three frames down."""
-    if isinstance(catalog, CatalogWriter):
+    Structural rather than a registry: an implementation is writable if it has the verbs. The error
+    matters more than the check — a catalog backend that can only be read is a perfectly reasonable
+    thing to exist, and the caller should be told which one refused, and what it was being asked
+    for, rather than hit an AttributeError three frames down."""
+    if isinstance(catalog, port):
         return catalog
     raise CatalogError(
-        f"catalog '{getattr(catalog, 'name', '?')}' is read-only — it implements no write port, "
-        f"so there is nothing for 'loom apply' to execute against"
+        f"catalog '{getattr(catalog, 'name', '?')}' does not support {plane} — it implements no "
+        f"'{port.__name__}' port, so there is nothing for {purpose}"
     )

@@ -189,11 +189,96 @@ that same ontology as MCP tools, driven end to end over stdio.
 
 *Goal: `run_upgradeTier(...)` mutates one row atomically.*
 
-- [ ] Parameter binding + validation-rule evaluation (reuse `expr` AST → evaluator).
-- [ ] Effect compiler → Iceberg **catalog-level** write (equality-delete on PK + append), one txn.
+- [x] Parameter binding + validation-rule evaluation (reuse `expr` AST → evaluator).
+- [x] Effect compiler → Iceberg **catalog-level** write (equality-delete on PK + append), one txn.
+      All three operations: `create` / `modify` / `delete`, behind a third port (`RowWriter`).
+- [x] `loom run` — one declared action, through the same entry point `run_<action>` will call.
 - [ ] Optimistic concurrency — version/snapshot check; conflict → typed retryable error.
+      *The snapshot is already captured and reported; what is missing is the check.*
 - [ ] Edit-log (audit) table — actor, action, before/after, snapshot id.
-- [ ] Tests: create / modify / delete happy paths + a concurrent-conflict path.
+- [x] Tests: create / modify / delete happy paths, against the fake catalog and against live
+      pyiceberg. The concurrent-conflict path lands with the check.
+
+**Eight decisions taken in the first slice** (parameter binding, rule evaluation, one row written):
+
+- **Rows go through a *third* port, and none of the three is a superset.** M2's argument — the
+  resolver holds a `Catalog` and therefore cannot execute DDL — points both ways one level down.
+  `CatalogWriter` changes a table's shape and has no verb for deleting a row, so `loom apply`
+  cannot touch data. `RowWriter` changes its rows and has no verb for altering a schema, so an
+  action cannot touch DDL. `append_rows` stays on the schema port because it is how `_loom_meta`
+  records history: purely additive, incapable of destroying anything. `writer_for` grows a
+  *sibling* rather than an argument — `row_writer_for` — both over one exchange point whose error
+  names the catalog and the plane it refused. The handle is acquired per run, for the one catalog
+  the target object binds, so no serving process holds a row-writable catalog between calls.
+
+- **The read before the write is a full physical row, because of the columns nobody declared.**
+  A modify is an equality-delete plus an append, so it rewrites the row entirely: every column no
+  property maps is carried across or silently nulled. Those are exactly the columns `plan` reports
+  as unmanaged — the never-drop rule one level down, where the data is rather than the schema. It
+  is why the runtime reads through the `Catalog` port and not the resolver, which projects a row
+  down to precisely the set a modify must not be limited to. A column whose *type* the ontology has
+  no name for is carried the same way, untouched and unexamined: the conversion is driven by the
+  table's own schema, so `array<T>` being deferred in §1 costs the write path nothing. `before`
+  and `after` still report only declared properties — the unmapped columns travel, but reporting
+  them would leak someone else's data past a governance layer that doesn't exist yet.
+
+- **The snapshot is captured now and checked later, and the difference is said out loud.** Every
+  read-then-write records the Iceberg snapshot it read (`Catalog.current_snapshot_id`, a *read*
+  verb), and nothing enforces it. The result carries `concurrency: "recorded, not enforced"`, and
+  `CONFLICT` exists as the one retryable failure code with nothing raising it — so the next slice
+  is a check and one `Failure`, not a new result shape every caller would have to relearn. The
+  snapshot is read *before* the rows, which is the load-bearing half: that order makes the recorded
+  id at-or-before the data, so a later check can report a conflict that wasn't one but can never
+  miss one that was. Scan-then-snapshot silently blesses a lost update. No unused
+  `expect_snapshot_id=` was added to the port — a parameter nothing passes is not a seam.
+
+- **`{{ customer }}` and `newTier != object.tier` are one language, and always were.**
+  `expr.parse()` already stripped a whole-string `{{ … }}` wrapper; that is now the stated rule
+  rather than an implementation detail, so no evaluator, validator or engine ever sees a brace. Two
+  consequences: an effect value may hold **any** expression, not just a parameter reference (which
+  is what makes `placedAt: "now()"` work, and narrowing it would have made the most obvious thing a
+  create wants inexpressible); and there is **no interpolation** — `"tier-{{ x }}"` is a load error
+  with a message that says to use `+`. Two spec bugs fell out of settling this: §4 and §8 wrote the
+  rule as `customer.tier`, which the validator has always rejected, and §5 claimed bare enum values
+  were literals, which would have made `gold` a literal in one position and a parameter in another.
+
+- **Null is a value you can test, not one you can order.** `null != 'gold'` is true; `null == null`
+  is true. Deliberately not SQL's three-valued logic: this evaluates in process over one row and
+  never reaches SQL, and an "unknown" precondition would leave the runtime nothing to do but refuse
+  — making `null` a hazard in every rule about a nullable property, when a precondition is supposed
+  to be a decision. Ordering, arithmetic and the boolean operators still fail on null rather than
+  guessing, and `&&`/`||` short-circuit, which is what makes that livable:
+  `object.ltv != null && object.ltv > 100`. The value domain is the read path's own — one
+  `coerce_value`, shared, so "declared types are honored on the way in and out" is structural
+  rather than duplicated, and a decimal is still a decimal after a comparison.
+
+- **A failed rule is a typed result, not an exception — and every rule is evaluated.** M4 wants
+  "typed results an agent can act on", so the shape exists before it is wrapped: a status, and a
+  list of `Failure`s carrying a code from a closed set. Nothing an author, a caller or the data can
+  cause raises. All rules run rather than stopping at the first, the same bargain `Diagnostics`
+  makes with a spec author — an agent fixing one precondition per call is as miserable as a human
+  fixing one typo per run. And a rule that could not be *evaluated* is its own code, distinct from
+  one that returned false, because retrying them means different things.
+
+- **All three operations, because two of them already validate.** `modify` exercises the whole path
+  and shipping it alone was tempting — but the loader accepts all three effect kinds, the validator
+  type-checks all three, and `loom validate` says *ok*, so a modify-only slice would ship specs that
+  validate and cannot run. That is a worse seam than the two extra port verbs. On `delete` versus
+  never-drop: never-drop is about **inference**, Loom refusing to read a destruction into the
+  *silence* of a spec. `operation: delete` is the opposite of silence, and the scopes differ —
+  never-drop governs schema, and Loom still never drops a column or a table in any command.
+
+- **The uniqueness of the key is checked before the write.** The PK is single-property in v0 and
+  Loom doesn't own the table, so nothing guarantees it is unique, and an equality-delete on a key
+  matching two rows removes both and appends one. The *read* path already refuses this
+  (`Resolver.get`); refusing it on the write path matters more, and costs nothing because the read
+  is already happening by key. Loom cannot repair the table — it declines to make it worse, and
+  says so.
+
+  `loom run` exists for the same reason `loom query` does, and the test is stronger because this
+  one writes: if the dev command can do something the generated tools can't, the ontology has a
+  back door. It takes an action apiName and named parameters — the shape `run_<action>` will take —
+  and calls the same `ActionRuntime.run`, asserted rather than assumed.
 
 ---
 

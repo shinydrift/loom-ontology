@@ -21,8 +21,12 @@ Five rules shape the whole package:
   key stays in the spec after its migration lands and plans as a clean no-op — see `diff._renamed`
   for the three live shapes, and `diff._unmergeable` for the fourth, which Loom refuses.
 - **A breaking plan is refused whole.** Not partially applied. See `executor._refusal`.
-- **Writes go through a separate port.** `apply` asks the catalog layer for a `CatalogWriter`;
-  everything else in Loom holds a read-only `Catalog` and could not execute DDL if it tried.
+- **Writes go through a separate port — and DDL through its own.** `apply` asks the catalog layer
+  for a `CatalogWriter`; the read path holds a `Catalog` and could not execute DDL if it tried, and
+  the action runtime holds a `RowWriter`, which has no schema verb at all. The reverse also holds:
+  `CatalogWriter` cannot delete or replace a row, so nothing in this package can touch data. Its
+  one row verb is `append_rows`, which `_loom_meta` uses to add a history row and which cannot
+  destroy anything.
 
 The never-drop rule is the one that shapes `rollback` most: it means a rollback undoes renames and
 nothing else. Adds stay live and unmanaged, and reversing a promotion or a loosening is itself
