@@ -22,7 +22,18 @@ mcp:
   # basis. `loom run` reaches the same runtime either way.
   #
   # `actor` is what a served run is recorded as in `_loom_meta.edits`. Declared by you, never
-  # inferred by Loom — over stdio there is no authenticated caller to name, and a log that says
+  # inferred by Loom — neither transport has an authenticated caller to name, and a log that says
   # `unknown` beats one that confidently names whoever started the process.
   # writes: true
   # actor: agent:support-bot
+  #
+  # Switch `transport` to `http` to serve the same tools over a socket instead of a pipe. The
+  # address lives here rather than on the command line, for the reason `writes` does: a flag lets
+  # one invocation contradict the file you review. `host` defaults to 127.0.0.1 on purpose — and
+  # `writes: true` refuses to start on anything else, because `actor` above names a deployment
+  # rather than a caller, which is only honest while the callers are the people who could already
+  # run this binary.
+  # transport: http
+  # host: 127.0.0.1
+  # port: 8000
+  # path: /mcp

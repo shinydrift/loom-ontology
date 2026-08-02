@@ -19,6 +19,9 @@ iceberg = ["pyiceberg[sql-sqlite]>=0.9", "pyarrow>=15"]
 # column back to a Python datetime, which any spec with a `timestamp` property will hit.
 duckdb = ["duckdb>=1.0", "pytz"]
 # Agent layer. The 2.x lowlevel Server API (on_list_tools/on_call_tool) is what mcp/server.py uses.
+# Deliberately still one extra for both transports: starlette and uvicorn, which `serve_http` needs,
+# are hard dependencies of `mcp` itself, so serving over HTTP asks nothing more of a deployment than
+# serving over stdio already did.
 mcp = ["mcp>=2.0"]
 all = ["loom-ontology[iceberg,duckdb,mcp]"]
 

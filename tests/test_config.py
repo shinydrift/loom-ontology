@@ -82,6 +82,114 @@ def test_an_empty_actor_is_refused_rather_than_recorded(tmp_path: Path):
     assert cfg.mcp.actor is None
 
 
+# ---- the address, and the posture it decides ------------------------------------
+#
+# Every check below is an *error* rather than a warning, and lives here rather than in `cmd_serve`,
+# so `loom validate` reports it and the server never starts. That is the posture `cmd_serve` already
+# takes when a catalog will not open — and nobody reads the third line of a banner on a server that
+# came up anyway.
+
+
+def _mcp(tmp_path: Path, body: str):
+    return _load(tmp_path, f"catalogs:\n  c: {{ type: iceberg-rest, uri: http://x }}\nmcp:\n{body}")
+
+
+def test_http_is_a_transport_now_and_binds_to_loopback_by_default(tmp_path: Path):
+    """The default that matters. `0.0.0.0` and `127.0.0.1` are the same posture question `loom
+    apply` answers by refusing to run unattended, and the wrong answer is somebody's lake on the
+    internet."""
+    cfg, diag = _mcp(tmp_path, "  transport: http\n")
+    assert diag.errors == []
+    assert cfg.mcp.transport == "http"
+    assert cfg.mcp.host == "127.0.0.1" and cfg.mcp.port == 8000 and cfg.mcp.path == "/mcp"
+    assert cfg.mcp.is_loopback and cfg.mcp.address() == "http://127.0.0.1:8000/mcp"
+
+
+def test_the_whole_address_is_config_including_the_port(tmp_path: Path):
+    """No flags, for the reason the first M4 slice gave `writes` — a flag lets one invocation
+    contradict the file an operator reviews. A port is the weakest case that argument has to carry
+    and it goes here anyway: a file describing half an address does not describe the server."""
+    cfg, diag = _mcp(tmp_path, "  transport: http\n  host: ::1\n  port: 9001\n  path: /ontology/\n")
+    assert diag.errors == []
+    assert (cfg.mcp.host, cfg.mcp.port, cfg.mcp.path) == ("::1", 9001, "/ontology")
+    # A v6 literal is bracketed for the URL and the trailing slash is normalised away, so the
+    # banner, the route and the Host allow-list cannot disagree about which endpoint this is.
+    assert cfg.mcp.address() == "http://[::1]:9001/ontology"
+    assert cfg.mcp.is_loopback
+
+
+def test_a_bad_port_is_refused_rather_than_coerced(tmp_path: Path):
+    """`isinstance(True, int)` is True, and `port: yes` is a plausible YAML typo for a number."""
+    for value, in [("0",), ("70000",), ("'8000'",), ("yes",)]:
+        cfg, diag = _mcp(tmp_path, f"  transport: http\n  port: {value}\n")
+        assert any("'mcp.port' must be an integer" in e.message for e in diag.errors), value
+        assert cfg.mcp.port == 8000
+
+
+def test_a_path_that_is_not_a_path_is_refused(tmp_path: Path):
+    cfg, diag = _mcp(tmp_path, "  transport: http\n  path: mcp\n")
+    assert any("must be a string beginning with '/'" in e.message for e in diag.errors)
+    assert cfg.mcp.path == "/mcp"
+
+
+def test_an_address_under_stdio_is_refused_rather_than_ignored(tmp_path: Path):
+    """`_check_governance`'s rule, applied to a second set of keys. A stdio server that quietly
+    dropped `host: 0.0.0.0` would read, to whoever wrote it, exactly like one that honoured it."""
+    _, diag = _mcp(tmp_path, "  transport: stdio\n  host: 0.0.0.0\n  port: 9000\n")
+    error = next(e for e in diag.errors if "has no address" in e.message)
+    assert error.message == "mcp.host, mcp.port set but transport is 'stdio', which has no address"
+    assert "set 'transport: http'" in error.hint
+
+
+def test_a_non_loopback_bind_must_say_what_hostnames_it_answers_to(tmp_path: Path):
+    """DNS-rebinding protection stays on, and the allow-list is optional exactly where Loom can
+    derive it. Off the loopback it cannot know the name the world reaches this by, so it asks."""
+    _, diag = _mcp(tmp_path, "  transport: http\n  host: 0.0.0.0\n")
+    assert any("'mcp.allowed_hosts' is unset" in e.message for e in diag.errors)
+
+    cfg, diag = _mcp(tmp_path, "  transport: http\n  host: 0.0.0.0\n  allowed_hosts: [loom.internal:8000]\n")
+    assert diag.errors == []
+    assert cfg.mcp.host_allow_list() == ("loom.internal:8000",)
+
+
+def test_a_loopback_bind_derives_the_three_names_it_can_be_reached_by(tmp_path: Path):
+    cfg, diag = _mcp(tmp_path, "  transport: http\n  port: 9001\n")
+    assert diag.errors == []
+    assert cfg.mcp.host_allow_list() == ("127.0.0.1:9001", "localhost:9001", "[::1]:9001")
+
+
+def test_writes_over_a_network_are_refused_at_startup(tmp_path: Path):
+    """**Writes over a socket are not the same decision as writes over a pipe**, and the difference
+    is reachability rather than transport.
+
+    `mcp.actor` lives in `loom.yaml`, so it always named a deployment rather than a session — three
+    stdio clients reading one file already record one string. What a non-loopback bind changes is
+    who is *permitted to be* one of those callers: over stdio, whoever can run the binary; here,
+    whoever can reach the port. That is where `actor:` stops being a statement anybody checked, so
+    the combination refuses rather than warns."""
+    _, diag = _mcp(
+        tmp_path, "  transport: http\n  host: 0.0.0.0\n  allowed_hosts: [x:8000]\n  writes: true\n"
+    )
+    error = next(e for e in diag.errors if "'mcp.writes' is true on a non-loopback bind" in e.message)
+    assert "whoever can reach the port" in error.message
+    assert "names a deployment, not a caller" in error.hint
+
+
+def test_writes_on_a_loopback_bind_serve_normally(tmp_path: Path):
+    """The limit is drawn on the bind, so the local case is untouched — and it is the case an
+    agent runtime on somebody's laptop actually uses."""
+    cfg, diag = _mcp(tmp_path, "  transport: http\n  writes: true\n  actor: agent:support-bot\n")
+    assert diag.errors == []
+    assert cfg.mcp.writes is True and cfg.mcp.is_loopback
+
+
+def test_a_hostname_loom_cannot_prove_is_local_is_treated_as_remote(tmp_path: Path):
+    """Fails closed. Two refusals hang off this answer and both should err towards not starting."""
+    _, diag = _mcp(tmp_path, "  transport: http\n  host: loom.internal\n  writes: true\n")
+    assert any("not loopback" in e.message for e in diag.errors)
+    assert any("non-loopback bind" in e.message for e in diag.errors)
+
+
 def test_reports_every_problem_in_one_pass(tmp_path: Path):
     cfg, diag = _load(
         tmp_path,

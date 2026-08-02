@@ -456,20 +456,34 @@ M3):
 
 *Goal: the action runtime shows up as tools; serve over more than stdio.*
 
-The read tools, the registry, and stdio `loom serve` landed in M1; M2 and M3 are done, so what is
-left here is a transport and the surface over a runtime that already exists. Two seams M3 left
+The read tools, the registry, and stdio `loom serve` landed in M1; M2 and M3 are done, so what was
+left here was a transport and the surface over a runtime that already exists. Two seams M3 left
 pointing at this milestone: `ActionResult` is the shape `run_<action>` serializes rather than
 composes, and `ActionRuntime.run` takes the `actor` this transport has to supply — an unauthenticated
 one recording `unknown` is correct, and a served tool that never fills it in makes the edit log
 useless without failing anything, which is worth a test here rather than a hope.
 
+Both have landed. The surface came first (`run_<action>`), then the second transport — which turned
+out to be about neither the tools nor the runtime, both unchanged, but about everything that stops
+being true when a process stops belonging to the client that spawned it.
+
 - [x] Per action: `run_<action>` with JSON Schema from parameters, description from the spec.
 - [ ] Capability negotiation at serve — validate spec features vs. `engine.capabilities()`.
-- [ ] HTTP transport alongside stdio.
+- [x] HTTP transport alongside stdio. *`mcp.transport: http`, with an address in `loom.yaml` and a
+      write surface bounded by the bind. The tool set, the registry and the runtime are unchanged;
+      what changed is everything that stops being true when a process stops belonging to one caller.*
 - [x] Structured tool errors — surface validation-rule failures and write conflicts as typed
       results an agent can act on, not opaque strings. *Both seams paid out as predicted: the tool
       serializes `ActionResult` rather than composing anything, and the actor was already an
-      argument. The header stays ⏳ — the two transport boxes are untouched.*
+      argument.*
+
+**The header stays ⏳, and capability negotiation is the only thing holding it.** It is the one box
+left, and it was kept out of the transport slice on purpose: it has no transport content at all —
+the answer is identical over stdio and HTTP — so bundling it would mean a change about a port
+deciding whether an existing spec still serves. It also has an unresolved question of its own that
+deserves being answered rather than smuggled: `Capabilities` carries `joins`, `offset`,
+`case_insensitive_like` and `native_merge`, nothing validates a spec against any of them, and
+`native_merge` is a *write-path* field sitting on the read path's port.
 
 **Seven decisions taken in the first slice** (`run_<action>` — the surface over the runtime):
 
@@ -555,12 +569,102 @@ useless without failing anything, which is worth a test here rather than a hope.
 
   One thing this slice could not test the way it wanted to: a **conflict produced by a real race over
   the wire**. It needs a competing commit inside the window between the served read and the served
-  write, and nothing a client can schedule over the protocol reaches inside a spawned process. The
-  seam for interleaving is the catalog port (M3's decision, unchanged — a hook nothing in production
-  calls is a hook that drifts), so the conflict's wire form is asserted against `LoomMCPServer.call`,
-  which is the exact function the stdio adapter calls and whose `(text, is_error)` pair is what goes
-  on the wire. The transport test covers what only a transport can break: a refusal crossing it as
-  content, and a real row changing in a real Iceberg table because an MCP client asked.
+  write. The reason given here was "nothing a client can schedule over the protocol reaches inside a
+  spawned process" — *and the transport slice below found that reason wrong, so it is corrected
+  here rather than left standing.* The MCP SDK dispatches tool calls concurrently; HTTP
+  demonstrably can carry an interleave, and stdio was never what prevented one. What prevents one is
+  that Loom's own dispatch is synchronous top to bottom, so a served process answers one call at a
+  time whatever the transport — and a commit from *outside* the process would still have to land
+  inside a millisecond window, three attempts running, which nothing outside can schedule without
+  the hook M3 declined to add (a hook nothing in production calls is a hook that drifts). The
+  conclusion is unchanged and the argument for it is now the true one. The conflict's wire form
+  stays asserted against `LoomMCPServer.call`, which is the exact function both adapters call and
+  whose `(text, is_error)` pair is what goes on the wire.
+
+**Six decisions taken in the second slice** (the HTTP transport — the same tool set, reachable
+by anyone who can reach the port):
+
+- **A served process answers one tool call at a time, and it is proved rather than assumed.** This
+  was measured before it was decided: the MCP SDK dispatches `on_call_tool` concurrently, and two
+  clients on one HTTP server genuinely interleave. So the serialization is entirely Loom's, and it
+  comes from one rung down — dispatch is a plain function, every `ToolSpec.handler` is a plain
+  function, and a synchronous callable cannot be interleaved. That premise is asserted structurally
+  in `test_mcp_registry.py`, so making any handler `async` fails a test instead of quietly changing
+  what the process guarantees.
+
+  It stays serialized because the fix is not a transport's to make, and three pieces of shared state
+  say why. `DuckDBEngine` holds **one** connection and registers every scan under `t0` / `t1` /
+  `m0` — constants in `resolver.py`, so the *same three names* for every object type in every
+  ontology; two overlapping reads would not merely contend, the loser would answer with the winner's
+  rows. `build_server` builds one `Resolver` and one `ActionRuntime` for the process. And making
+  those per-caller is the same change M5 needs to filter by principal — an argument for doing it
+  once, there, rather than half of it here. The cost is real and is *said*, in the banner and the
+  README, rather than discovered: a slow query blocks the server instead of queueing beside another
+  call. An HTTP server that answers one request at a time is a scaling claim, and one that does it
+  silently is a support ticket.
+
+  A lock was the obvious alternative and is worse: over synchronous handlers it can never be
+  contended, so it is code with no behaviour whose only effect would be to keep the guarantee alive
+  the day somebody makes a handler `async` — turning a correctness question into an unexplained
+  performance one. The assertion fails loudly instead.
+
+- **`mcp.actor`'s justification was already weaker than it read, and gets corrected rather than
+  extended.** The first slice defended it with "over stdio it is exactly true, because one client
+  spawns one process and a session has one principal". But this key lives in `loom.yaml`, which
+  configures a *deployment*: three stdio clients reading one file already record one string for
+  three callers. One name for many callers is not what a socket introduces, and declared-versus-
+  inferred — the part that was load-bearing — survives untouched. What a socket changes is
+  **reachability**: who is permitted to *be* one of those callers.
+
+- **So the limit is drawn on the bind, not the transport — and `writes: true` on a non-loopback bind
+  refuses to start.** Over stdio the caller set is "whoever can run the binary and read the config";
+  over loopback HTTP it is very nearly the same set; over `0.0.0.0` it is not remotely the same set,
+  and there `actor:` names a deployment nobody bounded. A refusal rather than a warning, because
+  `cmd_serve` already refuses to start rather than advertise tools that will fail, and because
+  nobody reads the third line of a banner on a server that came up. It is honest about its own
+  limit: it constrains what Loom *binds*, not what *reaches* it, and a proxy in front of a loopback
+  bind is outside anything the config can see.
+
+  The third way out — an identity **attested** by a transport that checked it, which is neither
+  declared nor inferred and the only one of the three worth more than `unknown` — is named and not
+  built. MCP's authorization is an OAuth 2.1 resource-server profile, so attesting means validating
+  a bearer token on issuer, audience, expiry and signature; reading a header instead is the
+  client-supplied actor the first slice rejected by name, wearing a hat. That is a milestone, not a
+  slice, so spec-v0's open edge is **rewritten** rather than closed: it now names the three
+  categories, says what is missing (the validation, and config for an authorization server), and
+  records that a loopback server may write today because its callers are the set stdio's were.
+
+- **The address is all config, including the port, and defaults to loopback.** The first slice's
+  argument — a flag lets one invocation contradict the file an operator reviews — is weakest for a
+  port number, which is not a posture. It goes in config anyway: a file describing half an address
+  does not describe the server. The host is the strongest case rather than the weakest, and
+  `127.0.0.1` is the default for the reason `_confirmed()` refuses without a terminal — don't put
+  somebody's lake on a network because nobody said to. There is no TLS key; termination belongs in
+  front, which is a second reason the default bind is local. `allowed_hosts` backs DNS-rebinding
+  protection and is required exactly where it cannot be derived: a loopback bind knows its three
+  names, a public one does not know the name the world reaches it by.
+
+- **The stderr rule stays and its reason is replaced.** "stdout is the transport" is false the
+  moment a transport has an address instead of a pipe. The banner stays on stderr because it is
+  *diagnostics*, and one output shape is worth more than one that is right for two transports and
+  open again for the third — whatever collects those lines should not need to know how the tools are
+  being served. uvicorn's access log, the one thing that would have written to stdout, is off.
+
+- **An HTTP status never disagrees with `isError`.** A transport with real status codes invites
+  re-litigating a decision the first slice took, and it does not get to: the status answers *did
+  this exchange happen* and `isError` answers *did this call become a run* — different layers, never
+  two votes on one thing. Every tool outcome is a `200` carrying content; a non-`200` is only ever a
+  rejected `Host`, a rejected `Origin`, a malformed body or an unknown session. Mapping a refusal
+  onto a 4xx would make an agent's transport raise before its own branch on `status` ever ran.
+  Asserted with a raw HTTP client, because an SDK client hides the number.
+
+  Two things this slice deliberately did **not** move. The principal stops exactly where it did —
+  `mcp.actor` reaches the edit log and nothing else, and the resolver is handed no identity, because
+  inventing a per-call principal with no source and no reader is the mistake `expect_snapshot_id`
+  was kept out of `RowWriter` to avoid. And the surface does not branch on transport: both adapters
+  are handed one assembled server from `build_mcp_server`, which is asserted with no socket in
+  sight, and `test_no_tool_can_take_a_query`'s walk is re-run over the schemas as received across
+  the wire.
 
 ---
 
