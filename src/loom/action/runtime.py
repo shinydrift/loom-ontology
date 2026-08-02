@@ -39,9 +39,12 @@ Three boundaries this file is careful about:
   semantic read (projected, paged, and governed); this is a physical read of one row by key. Which
   is why governance had to arrive here as well as there: a policy enforced on the resolver alone
   would be one `dryRun` away from being read out of `before`, so `_project` withholds exactly what
-  `Resolver._projection` does. What a policy *cannot* reach is refused at bind time instead — an
-  action that reads or writes a masked property makes the deployment refuse to start, so nothing in
-  the four steps below has to branch on a policy.
+  `Resolver._projection` does, and `_admitted` withholds exactly the rows the compiled query would
+  not have returned — an agent that cannot see a row must not be able to run an action on it, and a
+  read that does not go through the resolver never meets the predicate the resolver compiled. What a
+  *mask* cannot reach is refused at bind time instead — an action that reads or writes a masked
+  property makes the deployment refuse to start. So of a policy's two halves only the row half is a
+  branch in the four steps below, and it is one line, in step 2.
 - **It holds a `RowWriter`, never a `CatalogWriter`.** It cannot alter a schema, because the port
   it asks for has no verb for it. The `EditLogWriter` it also holds does not weaken that: it takes
   no table name, so the only thing it can reach is `_loom_meta.edits`. This is the boundary that
@@ -70,9 +73,10 @@ from ..catalog.base import (
     edit_log_writer_for,
     row_writer_for,
 )
+from ..evaluate import EvalError, Scope, evaluate
 from ..governance import PolicySet
 from ..model import Action, ObjectType, Ontology, coerce_value, properties_in_play
-from .evaluate import EvalError, Scope, evaluate
+from ..predicate import admits
 from .log import (
     UNKNOWN_ACTOR,
     EditLog,
@@ -331,9 +335,15 @@ class _Run:
         # `ActionRuntime.run` — they are a consequence of the decision, not a defect in it.
         snapshot = catalog.current_snapshot_id(table) if catalog.table_exists(table) else None
         row = self._read(catalog, table, pk.column, key)
-        before = self._project(row)
         if self.failures:  # an ambiguous key — the read itself contradicted the spec
             return self._result(REFUSED, key=key, snapshot=snapshot)
+        if row is not None and not creating and not self._admitted(row):
+            # Absent, not forbidden. The row leaves by the same door a concurrent delete leaves by,
+            # and the next two lines say `object_not_found` in the same words — which is the point:
+            # a caller cannot tell a row this deployment withholds from one that is not there, and
+            # a refusal that could be told apart would be the existence oracle §6.1 refuses.
+            row = None
+        before = self._project(row)
         if creating and row is not None:
             self._fail(OBJECT_EXISTS, f"a {self.target.api_name} with {pk.name} {key!r} already exists",
                        {"key": key})
@@ -450,6 +460,45 @@ class _Run:
             return None
         return rows[0] if rows else None
 
+    def _admitted(self, row: Mapping[str, Any]) -> bool:
+        """Whether this deployment shows this row — the write plane's half of a `rows:` predicate.
+
+        **An agent that cannot see a row must not be able to act on it**, and the runtime has to
+        answer that for itself: it reads through the `Catalog` port rather than the resolver (it
+        needs the whole physical row to carry unmapped columns across a modify), so the predicate
+        compiled into the read path's SQL never reaches here. `predicate.py` holds both lowerings
+        and the argument for why they agree.
+
+        Evaluated over the row as the *ontology* sees it and not as a caller does — masked
+        properties included. The policy is the deployment; withholding from itself makes no sense,
+        and a policy may legitimately filter on a property it also masks.
+
+        **The gate is on `before`, never on the result.** A modify that moves a row *out* of the
+        predicate is exactly a soft delete — `deletedAt: now()` against `rows: "object.deletedAt ==
+        null"`, the most ordinary policy there is and its most ordinary companion action — so
+        refusing it would break the pair this feature exists for. `create` has no `before` and is
+        therefore not gated at all: a created row may land outside the policy and be unreadable a
+        moment later, which is visibly the same thing as a soft delete and is the caller's own
+        doing, with values the caller supplied.
+
+        What a `create` *does* still report is `object_exists` for a row the policy excludes, and
+        that is one deliberate existence oracle rather than an oversight. The check above has to be
+        physical or two creates on one key both pass it and append, manufacturing the duplicate
+        primary key `_read` refuses forever after and Loom can never repair. So on this one path a
+        row predicate hides rows and not keys, and what leaks is confined to *something exists under
+        the key you supplied* — no property of it, and a key the caller chose."""
+        expr = self.rt.policies.predicate_for(self.target.api_name)
+        return expr is None or admits(expr, self._properties(row))
+
+    def _properties(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        """The physical row as the ontology sees it: declared properties, nothing withheld.
+
+        The unmapped columns stay behind — they are carried across the write, but they are not the
+        ontology's to show and nothing above reads a row by column name. This is what `_project`
+        subtracts a mask from and what a row predicate is evaluated over, one definition rather
+        than two views of a row that could disagree about what a property is called."""
+        return {name: row.get(prop.column) for name, prop in self.target.properties.items()}
+
     def _project(self, row: Mapping[str, Any] | None) -> dict[str, Any] | None:
         """The physical row as the ontology sees it, minus what this deployment withholds.
 
@@ -468,9 +517,7 @@ class _Run:
             return None
         masked = self.rt.policies.masked(self.target.api_name)
         return {
-            name: row.get(prop.column)
-            for name, prop in self.target.properties.items()
-            if name not in masked
+            name: value for name, value in self._properties(row).items() if name not in masked
         }
 
     # ---- 3. evaluate -----------------------------------------------------------

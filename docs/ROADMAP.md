@@ -766,9 +766,9 @@ change when it lands.
 - [x] Enforce in the **resolver** (below MCP) so direct + agent calls filter the same way. *In the
       projection, and in the action runtime's own projection, which is the half a read-only reading
       of that sentence would have missed.*
-- [ ] Column masking + row predicates; policy tests over both paths. *Masking landed with the
-      grammar; row predicates are the next slice — and the two questions they turn on are written
-      into the grammar's refusal rather than discovered later.*
+- [x] Column masking + row predicates; policy tests over both paths. *Masking landed with the
+      grammar; `rows:` landed in the slice below, compiled into the query on one plane and
+      evaluated in process on the other, with the agreement of the two asserted differentially.*
 - [ ] What the **edit log** holds under a policy. M3 deliberately left three questions here rather
       than answering them where nobody could turn the answer off: whether `_loom_meta.edits` masks
       under the same policies as a read (it records declared properties and the bound parameters —
@@ -776,7 +776,8 @@ change when it lands.
       describes); whether a retention window expires it; and whether "no log, no write" is
       expressible, since today an unloggable run still happens and reports `log_failed`. The record's
       *shape* is not deferred — the columns are fixed, because the table is only ever created.
-      *The first is answered by the slice below; the other two are the third slice.*
+      *The first is answered by the first slice below; the other two are the next slice, and
+      `audit:` is the last key still reserved and refused.*
 
 **Eight decisions taken in the first slice** (the grammar, and column masking end to end):
 
@@ -863,6 +864,99 @@ change when it lands.
   — a policy written the obvious way arrives with a key no grammar can name. `objectType` is also
   Loom's own vocabulary for the same thing (§7's `traverse` takes one). `_shape.check_keys` was
   hardened in passing: it used to hand a non-string key to `difflib` and raise instead of reporting.
+
+**Six decisions taken in the second slice** (`rows:`, lowered two ways):
+
+- **Neither way out of the null question was available, and the third one is what the first slice's
+  own refusal already implied.** A `rows:` predicate is parsed by `expr.parse()` — one language —
+  but lowered twice: compiled into the query on the read path (it must filter before paging, or
+  `hasMore` and `offset` lie), and evaluated in process over one row on the write path, because
+  `ActionRuntime` reads through the `Catalog` port and an agent that cannot see a row must not be
+  able to act on it. M3's evaluator is two-valued and SQL is three-valued, so the same predicate
+  could admit on one plane and drop on the other.
+
+  *Emulating two-valued semantics in the lowering* — totalize every leaf so it is definitely true
+  or false on both planes — **fails open under negation**: `!(object.ltv > 100)` becomes `!false`
+  for a null `ltv`, and a predicate written to exclude admits. *Refusing any predicate that touches
+  null* costs `object.deletedAt == null`, the most ordinary policy there is, and still does not
+  close the question, because a table can hold a null in a column the spec declares non-nullable —
+  Loom already knows tables contradict specs, which is why `ambiguous_key` exists.
+
+  So: **three answers, one admission rule.** True, false, or **undecided**, and a row is admitted
+  only on true. `==` and `!=` never return undecided — §5's *null is a value* is kept exactly and
+  carried into SQL as `IS NOT DISTINCT FROM`, which is the one operator where §5 and SQL genuinely
+  disagree and the one place we intervene. Ordering a null is undecided rather than an error, and
+  `!`, `&&`, `||` propagate it by the rules SQL's own connectives already follow, so the two
+  lowerings agree by construction rather than by emulation, and negation stays fail-closed. What
+  forced *undecided* over M3's `expression_error` is the first slice's argument, not a new one: a
+  policy predicate has nobody to tell. Per row there is no channel, and per call, "this row exists
+  but I could not decide about it" is the existence oracle that slice refused. So M3's rule is
+  untouched where it applies, and what differs between a rule and a policy is not the meaning of an
+  operator but **the disposition of "cannot decide"** — which is now written into `evaluate.py`
+  beside the two-valued argument it qualifies. The agreement is a claim, so it is an assertion:
+  every predicate in a corpus against every row of a null-saturated table, through real DuckDB and
+  through the in-process evaluator, admitted sets compared.
+
+- **The lowerable subset is a rule, not a list.** *A predicate is lowerable when Loom, not the
+  engine, decides what every operator means.* Operands are `object.<prop>` references and literals,
+  operators are the six comparisons, composition is `&&`/`||`/`!`. Arithmetic and string `+` are
+  refused because the engine computes them and engines disagree — integer division, and the
+  decimal/float mixing `evaluate.py` deliberately *refuses* while SQL silently coerces; `lower()`,
+  `upper()` and `len()` because case folding and length are the engine's answers; `coalesce()`
+  because it is the null tool and what null means here is precisely what Loom owns rather than
+  borrows per row. `now()` is refused for the one reason that is not about engines — it never
+  reaches one — but it puts a clock inside a filter, and *which instant, the read's or the run's*
+  is a decision worth writing down rather than inheriting. A bare identifier is refused too: it is
+  a *parameter* reference in §5 and a policy has none, so one language keeps one meaning for each
+  reference form. `LOWERABLE` and `NOT_LOWERABLE` partition `expr`'s whole operator and function
+  set under a test — `ENFORCED_KEYS`' device applied to an expression language — and the set may
+  only ever **grow**, which accepts what used to be refused and cannot change one already written.
+  Two refusals are about the predicate rather than the grammar: ordering against a `null` literal
+  (undecided for every row, so it withholds the object type while reading like a filter) and a
+  predicate that names no property (the same answer for every row, either way).
+
+- **The predicate rides on `ir.TableRef`, so both ends of a traverse are governed by one line.**
+  `Resolver._table` is the only place an object type becomes a table, so a governed type cannot
+  enter a plan without its filter — *you cannot search a customer but you can traverse to one* is
+  not a rule anybody has to keep, because there is nowhere to write it. `GetByKey` is governed for
+  free and a `through` table correctly carries none, standing for no object type. A `TableRef` with
+  a predicate is a **view**: the read-path twin of a projection that never selects a masked column.
+  Rejected: a `predicate` field on each of `GetByKey`/`Search`/`Traverse` — three places to
+  remember, one of them with two ends. It is never a `ScanRequest` predicate, because that channel
+  is a documented pushdown *hint* an adapter may ignore, and a governance filter must not be
+  advisory anywhere; it contributes only its **columns** to the scan, since a policy may filter on
+  a property it also masks.
+
+- **A filtered row is absent on the write path too, and that survived contact.** `_Run` gates on
+  the row it *read* — not admitted becomes `object_not_found`, in the words a concurrent delete
+  already produces. The gate is on `before` and never on the result, because a `modify` that moves
+  a row out of the predicate is exactly a soft delete (`deletedAt: now()` against
+  `rows: "object.deletedAt == null"` — the most ordinary policy's most ordinary companion action),
+  so refusing it would break the pair the feature exists for. `create` has no `before` and is
+  ungated. Of a policy's two halves only the row half is a branch in the four steps, and it is one
+  line. The refusal is still recorded: the run named a row, which is `_record`'s existing gate, and
+  an audit trail that dropped these could not answer *who tried to act on a row this deployment
+  does not show them*.
+
+- **One existence oracle, named rather than discovered.** A `create` reports `object_exists` for a
+  key held by a row the policy excludes. The check has to be physical, or two creates that both
+  read past an excluded row both append and manufacture the duplicate primary key `_read` refuses
+  forever after and Loom can never repair. So on exactly one path a row predicate hides rows and
+  not keys, and what discloses is confined to *something exists under the key you supplied* — no
+  property of it, and a key the caller chose. Where it is safe to say a policy's shape out loud is
+  the mirror of this: the serve banner names a filtered type, because the operator starting the
+  process holds the `loom.yaml` it describes; no tool description does.
+
+- **The evaluator moved out of `action/`, and two predictions were corrected where they were
+  written.** `evaluate.py` sat under the action package while it had one consumer; a governance
+  predicate is evaluated over a row by the same rules and is not an action, so it is `loom.evaluate`
+  now and the leaves of a policy go through the same `==` a rule does. §5.2 argued its null rule
+  from *the language never reaches SQL*, which a compiled row predicate makes half false — the rule
+  survives, argued from what it is for rather than from what was not listening. And `ir.py`
+  predicted that ranges would arrive "with the filter grammar"; they arrived with governance
+  instead, as a node set deliberately separate from `Eq`/`Contains` — those two are what a
+  *caller's* `filter` argument compiles to, which is why `searchable` makes one of them a substring
+  match, and `name == 'x'` in a policy is equality and never `ILIKE`.
 
 ---
 

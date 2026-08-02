@@ -326,3 +326,58 @@ def test_a_governed_read_never_asks_the_warehouse_for_the_column(project, catalo
     (compiled,) = resolver.engine.compiled
     assert "lifetime_value" not in compiled.sql
     assert all("lifetime_value" not in scan.columns for scan in compiled.scans)
+
+
+def test_a_row_predicate_withholds_the_row_from_every_surface(project, catalogs):
+    """The row half of M5's claim at the altitude that settles it: real Iceberg, real Arrow, real
+    DuckDB SQL, and a real `run_<action>` — with `c2` absent from every one of them.
+
+    `c2` is the anchor worth choosing: it has three seeded orders, so *traverse from a customer you
+    cannot get* is a claim with something to return if the anchor end were left ungoverned. That is
+    the hole a predicate applied only to the landing type leaves — you cannot search a customer but
+    you can traverse to one — and the reverse hop pins the other end."""
+    from dataclasses import replace
+
+    from loom.action import OBJECT_NOT_FOUND, build_runtime
+    from loom.expr import parse as parse_expr
+    from loom.governance import Policy
+    from loom.mcp.server import build_server
+    from loom.resolver import build_resolver
+
+    ontology, config = project
+    governed = replace(
+        config,
+        mcp=replace(config.mcp, writes=True),
+        policies=(
+            Policy(name="no-silver", object_type="Customer", rows=parse_expr("object.tier != 'silver'")),
+        ),
+    )
+
+    resolver = build_resolver(ontology, governed, catalogs)
+    assert resolver.get("Customer", "c2") is None
+    assert [row["customerId"] for row in resolver.list("Customer")] == ["c1", "c3"]
+    # The anchor end: c2 has o3, o4 and o5, and none of them comes back.
+    assert resolver.traverse("Customer", "c2", "orders") == []
+    assert [o["orderId"] for o in resolver.traverse("Customer", "c1", "orders")] == ["o1", "o2"]
+    # The landing end: o3 was placed by c2.
+    assert resolver.traverse("Order", "o3", "placedBy") == []
+    assert resolver.traverse("Order", "o1", "placedBy") == [resolver.get("Customer", "c1")]
+
+    server, _ = build_server(ontology, governed, catalogs)
+    payload = json.loads(server.call("get_customer", {"key": "c2"})[0])
+    # Absent, not forbidden — and the envelope is the one a key that never existed produces.
+    assert payload["found"] is False and payload["object"] is None
+    assert json.loads(server.call("get_customer", {"key": "c9"})[0])["found"] is False
+    # No tool mentions the filter: the rows are the data, so saying "some are withheld" is an
+    # existence oracle over them.
+    assert not any("no-silver" in tool.description for tool in server.tools.values())
+
+    # And an agent cannot act on the row it cannot see.
+    result = build_runtime(ontology, governed, catalogs).run(
+        "upgradeTier", {"customer": "c2", "newTier": "gold"}, actor="ci"
+    )
+    assert result.failures[0].code == OBJECT_NOT_FOUND
+
+    # The ungoverned build of the same project still reads c2 — and still reads it as `silver`, so
+    # the refusal above changed nothing it was asked to change.
+    assert build_resolver(ontology, config, catalogs).get("Customer", "c2")["tier"] == "silver"

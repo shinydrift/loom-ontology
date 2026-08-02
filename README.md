@@ -61,10 +61,10 @@ types, and row/column governance enforced below the tool layer.
 
 *Today the reads, `traverse` and the `run_` tools are all live over MCP. Writes are off by default:
 `mcp.writes: true` in `loom.yaml` is what turns a declared action into a tool, because declaring one
-and serving it to every client that connects are different decisions. Governance has begun: a
-`governance.policies` entry withholds a property from every caller — `loom query` included, because
-the mask is applied to the projection below both of them — and row predicates are next. See
-[Status](#status).*
+and serving it to every client that connects are different decisions. Governance withholds both
+halves now: a `governance.policies` entry withholds a property from every caller and filters the
+rows every caller sees — `loom query` included, because the mask is applied to the projection and
+the predicate to the table, below both of them. See [Status](#status).*
 
 ## Architecture (5 layers)
 
@@ -131,12 +131,12 @@ them, and a governance grammar written against an authenticated caller would lea
 of "a direct call and an agent call filter identically" ungovernable. So a policy names no
 principal: it is a fact about a **deployment**, you serve two audiences by running two deployments,
 and the clause an attested caller would turn on is reserved in the grammar and refused rather than
-approximated against the deployment-wide `mcp.actor`. Column masking is live:
+approximated against the deployment-wide `mcp.actor`. Both halves of a policy are live:
 
 ```yaml
 governance:
   policies:
-    - { name: hide-ltv, objectType: Customer, mask: [ltv] }
+    - { name: hide-ltv, objectType: Customer, mask: [ltv], rows: "object.tier != 'bronze'" }
 ```
 
 The property is withheld by never being *selected* — not in the SQL, not in the Arrow batch, not in
@@ -146,6 +146,18 @@ what a policy withheld. It is still carried across a write, untouched, because t
 destroys the data the policy exists to protect. And masking a property some action reads or writes
 refuses the deployment at startup rather than resolving it per call: Loom would rather not start
 than serve a mask that an action can read around.
+
+A **mask announces itself** and a **row predicate does not**, on one rule: the schema is public and
+the data is not. The property names are already in the spec, so `masked: ["ltv"]` on every result
+tells a caller nothing new; the rows *are* the data, so a withheld row is simply absent and `get_`
+answers `found: false` in the words it uses for a key that never existed. The predicate is §5 — the
+same expression language a validation rule is written in — narrowed to comparisons between the row's
+own properties and literals, because that is the whole of what Loom rather than the engine decides
+the meaning of. It is compiled into the query on the read path and evaluated in process on the write
+path, so an agent that cannot see a row cannot run an action on it either, and the agreement of the
+two is asserted differentially against real DuckDB over a table full of nulls. A row a predicate
+cannot decide about is never admitted: negation stays fail-closed, and there is no way to report an
+undecided row that is not an existence oracle over it.
 
 | Component | State |
 |-----------|-------|
@@ -172,7 +184,8 @@ than serve a mask that an action can read around.
 | HTTP transport | ✅ `mcp.transport: http` |
 | Capability negotiation | ✅ refused at wiring, not narrowed |
 | Governance — column masking | ✅ `governance.policies` |
-| Governance — row predicates | ⏳ |
+| Governance — row predicates | ✅ `rows:`, compiled on one plane and evaluated on the other |
+| Governance — the edit log under a policy | ⏳ retention + "no log, no write" |
 
 `docs/spec-v0.md` is the full grammar — the framework's public contract.
 `docs/ROADMAP.md` tracks what's next, milestone by milestone.

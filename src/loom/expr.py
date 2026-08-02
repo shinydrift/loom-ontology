@@ -26,7 +26,15 @@ FUNCTIONS: dict[str, tuple[int, int | None]] = {
     "coalesce": (1, None),
 }
 
-_BINARY = {"||", "&&", "==", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/"}
+BINARY_OPS = frozenset({"||", "&&", "==", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/"})
+UNARY_OPS = frozenset({"!", "-"})
+"""Every operator the grammar has, named here so a *subset* of it can be declared elsewhere and
+checked against the whole.
+
+`predicate.py` lowers part of this language into SQL and must account for the rest key by key;
+`ENFORCED_KEYS`/`RESERVED_KEYS` do the same thing for the policy grammar. `-` appears in both sets
+because one symbol is two operators, and a reason to refuse it covers both."""
+
 _KEYWORD_LITERALS = {"true": True, "false": False, "null": None}
 
 
@@ -194,7 +202,7 @@ class _Parser:
 
     def parse_unary(self) -> object:
         k, v = self.peek()
-        if k == "op" and v in ("!", "-"):
+        if k == "op" and v in UNARY_OPS:
             self.next()
             return Unary(v, self.parse_unary())
         return self.parse_primary()
