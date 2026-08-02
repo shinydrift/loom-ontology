@@ -15,7 +15,7 @@ from __future__ import annotations
 from .diff import LABELS, ColumnChange, MigrationPlan, Severity, TableChange
 from .executor import APPLIED, REFUSED, UP_TO_DATE, ApplyResult, TableOutcome
 
-_COLUMN_SYMBOL = {"add": "+", "promote": "~", "loosen": "~", "retype": "!", "tighten": "!"}
+_COLUMN_SYMBOL = {"add": "+", "rename": "~", "promote": "~", "loosen": "~", "retype": "!", "tighten": "!"}
 _BREAKING_SYMBOL = "!"
 _TABLE_SYMBOL = {"create": "+", "alter": "~"}
 

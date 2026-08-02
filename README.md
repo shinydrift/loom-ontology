@@ -103,7 +103,8 @@ warehouse from nothing but a spec. The action runtime (row-level writeback) is n
 | MCP **read** tools + `loom serve` (`mcp/`) | ✅ |
 | Migration diff + dry run (`migrate/`) | ✅ `loom plan` |
 | Migration executor + `_loom_meta` state store | ✅ `loom apply` |
-| `renamedFrom` remap · rollback | ⏳ |
+| `renamedFrom` — column renames as field-id remaps | ✅ |
+| Migration rollback | ⏳ |
 | Action runtime — single-object writeback | ⏳ |
 | MCP `run_<action>` tools + HTTP transport | ⏳ |
 | Governance (row/column policies) | ⏳ |
@@ -117,7 +118,7 @@ warehouse from nothing but a spec. The action runtime (row-level writeback) is n
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 217 tests
+pytest                              # 264 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 2 action(s)
 ```
 
@@ -252,6 +253,52 @@ Every apply appends to `_loom_meta.applied`, an ordinary Iceberg table in the la
 source, its content hash, a version, who ran it, and what it did. It lives in the lake rather than
 beside the YAML because a state file only ever describes the checkout it sits in — and it is
 history, never the planner's input.
+
+## Renaming a column
+
+Change a property's `column` and the planner has no way to know the old one and the new one are
+the same column: it adds the new one and leaves the old sitting there full of data. `renamedFrom`
+says they're the same column, and the migration becomes an Iceberg **rename** — the field id is
+unchanged, so nothing is rewritten and nothing is stranded:
+
+```yaml
+- { name: ltv, type: double, column: ltv_usd, renamedFrom: lifetime_value, nullable: true }
+```
+
+```
+$ loom plan ./ontology
+  ~ local.crm.customers — 1 change(s) · Customer
+      ~ ltv_usd  renamed from lifetime_value  safe
+          the column keeps field id 4, so no data file is rewritten; readers outside the
+          ontology that select 'lifetime_value' by name will need updating
+```
+
+The spec states the intent; **the live catalog decides what it currently means.** That same
+property, unchanged, plans four ways: the rename if only the old column is there, *nothing at all*
+if only the new one is, a warning and a plain add if neither is — and a refusal if both are.
+
+That last one is a rename target that already exists: a mistake, or a migration somebody finished
+by hand halfway. Loom can't merge the two columns, because merging means dropping one:
+
+```
+$ loom apply ./ontology
+  ! local.crm.customers — 1 change(s) · Customer
+      ! ltv_usd  renamed from lifetime_value  breaking
+          'lifetime_value' and 'ltv_usd' both exist in 'crm.customers' — Loom never drops a
+          column, so it cannot merge them; move the values across and drop 'renamedFrom', or
+          remove 'lifetime_value' out of band
+
+refusing to apply: the plan contains breaking changes
+  nothing was applied — no table is left half-migrated
+```
+
+Two things follow from the second row of that table. Applying is **idempotent for free** — the
+rename lands, and every plan after it is clean without anything being ticked off in the spec.  And
+`renamedFrom` **stays in the file afterwards**; Loom will never tell you to remove it, because one
+spec is deployed to more than one lake, and after a rename ships to production, staging is still on
+the other side of it. "You can delete this now" would be true of one catalog and false of another
+from the same file. `_loom_meta` records which version did the rename, which is the honest place
+for that answer.
 
 The validator accumulates every problem and reports them in one pass with source locations:
 

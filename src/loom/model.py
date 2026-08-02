@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from .errors import SourceLoc
+from .errors import Diagnostics, SourceLoc
 from .expr import Expr
 from .types import PropType
 
@@ -23,6 +23,10 @@ class Property:
     nullable: bool = False
     unique: bool = False
     description: str | None = None
+    # The column `column` used to be. Migration scaffolding: it turns a rename into a field-id
+    # remap instead of an add next to stranded data. Outlives its migration on purpose — see
+    # spec-v0 §2 — because the same spec is deployed to lakes that are at different versions.
+    renamed_from: str | None = None
     loc: SourceLoc | None = None
 
 
@@ -57,6 +61,10 @@ class ThroughTable:
     table: str
     from_column: str
     to_column: str
+    # Per-side `renamedFrom`, same meaning as `Property.renamed_from`. A mapping table is planned
+    # by the same machinery as a backing table, so it can be renamed by the same one.
+    from_renamed_from: str | None = None
+    to_renamed_from: str | None = None
 
 
 @dataclass(frozen=True)
@@ -139,3 +147,43 @@ def physical_type(prop_type: PropType, object_types: Mapping[str, ObjectType]) -
         ref = object_types.get(prop_type.object_type or "")
         return ref.pk_property.type.iceberg_type() if ref is not None else None
     return prop_type.iceberg_type()
+
+
+def check_renames(
+    columns: Mapping[str, tuple[str | None, str]],
+    diag: Diagnostics,
+    loc: SourceLoc | None = None,
+    ctx: str = "",
+) -> None:
+    """The two `renamedFrom` rules that need more than one column in scope (spec §2 rules 10-11).
+
+    `columns` maps each mapped column name to `(renamedFrom or None, the declaration that wants
+    it)`. Shared — like `physical_type` above — because it is applied at two scopes that must not
+    drift: the validator applies it per declaration so `loom validate` catches the common case
+    offline and with a source location, and the migration planner applies it again across every
+    declaration bound to one table, which is the scope the rules are really about. Only the second
+    has no `loc` to render, which is what `ctx` is for.
+
+    The first rule is what makes renames independent of each other within a table, and therefore
+    what lets the planner order edits per column instead of hoisting every rename to the front: no
+    rename's source can be another rename's target, so neither a chain nor a swap is expressible."""
+    prefix = f"{ctx}: " if ctx else ""
+    renamed_by: dict[str, str] = {}
+    for column, (old, source) in columns.items():
+        if old is None:
+            continue
+        if old in columns:
+            diag.error(
+                f"{prefix}{source} renames column '{column}' from '{old}', which "
+                f"{columns[old][1]} already maps",
+                loc,
+                "Loom never drops a column, so a rename cannot take one another property is live on",
+            )
+        if old in renamed_by:
+            diag.error(
+                f"{prefix}{renamed_by[old]} and {source} both rename from column '{old}'",
+                loc,
+                "one column cannot become two — only one of them is the rename",
+            )
+        else:
+            renamed_by[old] = source

@@ -21,7 +21,7 @@ from ..types import promotable
 from .schema import DesiredColumn, DesiredTable, desired_tables
 
 if TYPE_CHECKING:  # type-only, as in the validator: planning a spec needs no catalog imported
-    from ..catalog.base import Catalog, TableSchema
+    from ..catalog.base import Catalog, Column, TableSchema
 
 
 class Severity(IntEnum):
@@ -43,8 +43,8 @@ LABELS = {Severity.SAFE: "safe", Severity.PHYSICAL_SAFE: "physical-safe", Severi
 
 @dataclass(frozen=True)
 class ColumnChange:
-    kind: str  # add | promote | retype | loosen | tighten
-    column: str
+    kind: str  # add | rename | promote | retype | loosen | tighten
+    column: str  # the name the column ends up with — for a rename, the new one
     severity: Severity
     detail: str  # the change itself, e.g. "int -> long" or "optional -> required"
     reason: str = ""  # why it carries that severity; rendered for anything not plainly safe
@@ -54,6 +54,7 @@ class ColumnChange:
     # was shown rather than re-deriving a desired state that could differ from the printed one.
     iceberg_type: str = ""
     required: bool = False
+    renamed_from: str = ""  # `rename` only: the live column being renamed
 
 
 @dataclass(frozen=True)
@@ -163,12 +164,16 @@ def _diff_table(
     except Exception as e:
         diag.error(f"could not introspect '{desired.table}': {e}")
         return None, None
-    return _alteration(desired, live)
+    return _alteration(desired, live, diag)
 
 
 def _creation(desired: DesiredTable) -> TableChange:
     """A table that doesn't exist yet. Every column is safe regardless of its constraints —
-    there are no existing rows for a required column or a narrow type to invalidate."""
+    there are no existing rows for a required column or a narrow type to invalidate.
+
+    `renamedFrom` is ignored here, silently: a table that does not exist has no old column, and a
+    spec carrying scaffolding from a migration that shipped long ago is the normal state of a
+    mature spec. Warning about it would fire on every bootstrap of an empty warehouse."""
     columns = tuple(
         ColumnChange(
             kind="add",
@@ -185,11 +190,30 @@ def _creation(desired: DesiredTable) -> TableChange:
 
 
 def _alteration(
-    desired: DesiredTable, live: TableSchema
+    desired: DesiredTable, live: TableSchema, diag: Diagnostics
 ) -> tuple[TableChange | None, Unmanaged | None]:
     columns: list[ColumnChange] = []
     for col in desired.columns.values():
         current = live.columns.get(col.name)
+        old = live.columns.get(col.renamed_from) if col.renamed_from else None
+
+        if old is not None and current is not None:
+            columns.append(_unmergeable(col, old, desired.table))
+        elif old is not None:
+            # The rename goes first, ahead of anything else this column needs: every edit after it
+            # names the column by the name the rename gives it. From here the column that exists is
+            # `old` under a new label, so the comparisons below run against `old` — a rename
+            # preserves the type and the nullability along with the field id.
+            columns.append(_renamed(col, old))
+            current = old
+        elif col.renamed_from and current is None:
+            diag.warn(
+                f"'{col.source}' renames column '{col.name}' from '{col.renamed_from}', but "
+                f"'{desired.table}' has neither — planning '{col.name}' as a new column",
+                hint="check the spelling of 'renamedFrom'; a lake that skipped the apply which "
+                "created the old column will see this too",
+            )
+
         if current is None:
             columns.append(_added(col))
             continue
@@ -200,7 +224,10 @@ def _alteration(
         if current.required != col.required:
             columns.append(_renullabled(col, currently_required=current.required))
 
-    extra = tuple(name for name in live.columns if name not in desired.columns)
+    # A column some property is renaming *from* is the one live column that isn't unmanaged and
+    # isn't someone else's data: the plan names it on its own line, and after `apply` it is gone.
+    renamed = {col.renamed_from for col in desired.columns.values() if col.renamed_from}
+    extra = tuple(name for name in live.columns if name not in desired.columns and name not in renamed)
     return (
         TableChange(desired.catalog, desired.table, "alter", tuple(columns), desired.sources)
         if columns
@@ -227,6 +254,60 @@ def _added(col: DesiredColumn) -> ColumnChange:
         source=col.source,
         iceberg_type=col.iceberg_type,
         required=col.required,
+    )
+
+
+def _renamed(col: DesiredColumn, old: Column) -> ColumnChange:
+    """A rename is name-only, and that is why it is `safe` rather than `physical-safe`.
+
+    `physical-safe` is the label that means *the stored type moved, and the only reason existing
+    files still read is that Iceberg addresses columns by field id*. None of that applies here: the
+    field id, the type and the nullability all survive untouched, so the stored column is the same
+    column wearing a different label. What a rename does break is readers outside the ontology that
+    select by name — that is a contract change rather than a data-safety one, so it goes in the
+    reason rather than inflating the severity."""
+    held = f"field id {old.field_id}" if old.field_id is not None else "its field id"
+    return ColumnChange(
+        kind="rename",
+        column=col.name,
+        severity=Severity.SAFE,
+        detail=f"renamed from {old.name}",
+        reason=(
+            f"the column keeps {held}, so no data file is rewritten; readers outside the ontology "
+            f"that select '{old.name}' by name will need updating"
+        ),
+        source=col.source,
+        # The end state of *this* edit: the new name, carrying the type and nullability it already
+        # had. Anything the spec wants changed about them arrives as its own edit, just below.
+        iceberg_type=old.iceberg_type,
+        required=old.required,
+        renamed_from=old.name,
+    )
+
+
+def _unmergeable(col: DesiredColumn, old: Column, table: str) -> ColumnChange:
+    """Both the old column and the new one are live — a mistake, or a rename somebody finished by
+    hand halfway.
+
+    Reported as a breaking change rather than a diagnostic error on purpose. The spec is not wrong;
+    the *lake* is in a shape this plan cannot resolve, which is exactly what breaking means here.
+    Routing it that way also keeps the rest of the diff on the page — an error would abort the plan
+    and print nothing — and hands it to the executor's existing whole-plan refusal, which is the
+    right outcome: merging two columns means dropping one, and Loom never drops."""
+    return ColumnChange(
+        kind="rename",
+        column=col.name,
+        severity=Severity.BREAKING,
+        detail=f"renamed from {old.name}",
+        reason=(
+            f"'{old.name}' and '{col.name}' both exist in '{table}' — Loom never drops a column, so "
+            f"it cannot merge them; move the values across and drop 'renamedFrom', or remove "
+            f"'{old.name}' out of band"
+        ),
+        source=col.source,
+        iceberg_type=col.iceberg_type,
+        required=col.required,
+        renamed_from=old.name,
     )
 
 

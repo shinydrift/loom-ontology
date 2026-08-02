@@ -88,6 +88,7 @@ objectType:
     - name: ltv
       type: double
       column: lifetime_value
+      renamedFrom: legacy_ltv     # optional · the column `column` used to be — see below
       nullable: true
 
   searchable: [name, tier]        # optional · property names powering search_<type>
@@ -108,6 +109,61 @@ objectType:
    `backing.table` exists, every `column` exists on it, and every property type is compatible
    with its column's Iceberg type per §1. Missing table/column → error; incompatible type →
    error; extra columns on the table that no property maps → warning (not an error).
+8. `renamedFrom` (if set) is a non-empty column name and is **not** the property's own `column`.
+9. No property's `renamedFrom` may equal any property's `column` **on the same table** — including
+   columns contributed by a *different* declaration bound to that table. This is what makes
+   renames independent of one another: neither a chain (`a→b` and `b→c`) nor a swap is
+   expressible, which is in turn what lets the planner order edits per column.
+10. Two columns on one table may not declare the same `renamedFrom`. One column cannot become two.
+11. Two declarations mapping the same column may not name *different* `renamedFrom` sources.
+    Silence is **no opinion**, not "there was no rename", so only one of them has to say it.
+
+### 2.1 `renamedFrom` — a moved column, not a new one
+
+Without it, changing a property's `column` reads to the planner as "add the new one" and leaves
+the old one sitting there as unmanaged data. `renamedFrom` says the two are the same column, so
+`apply` issues an Iceberg **rename** — the field id is unchanged, so no data file is rewritten and
+nothing is stranded.
+
+The spec says what it wants; **the live catalog decides what that currently means.** The same
+property, unchanged, plans four different ways:
+
+| live table has | `loom plan` |
+|---|---|
+| the old column only | the rename · **safe** |
+| the new column only | nothing — the rename already landed |
+| neither | a warning, then an ordinary `add` of the new column |
+| **both** | the rename · **breaking**, and `apply` refuses the whole plan |
+
+*Both* is the only loud one. A rename target that already exists is either a mistake or a
+half-finished migration, and Loom cannot merge the two columns because merging means dropping one.
+It is a breaking *change* rather than a load error on purpose: the spec is fine, the lake is in a
+shape this plan can't resolve — so the rest of the diff still prints, and the refusal comes from
+the same whole-plan machinery as every other breaking change. Fix it by moving the values across
+and dropping `renamedFrom`, or by removing the old column out of band.
+
+A rename is classified **safe**, not physical-safe. Physical-safe is the label that means *the
+stored type moved, and existing files only still read because Iceberg addresses columns by field
+id*. A rename moves nothing: field id, type and nullability all survive. What it does break is
+readers **outside** the ontology that select the column by name — a contract change rather than a
+data-safety one, so it is stated in the plan's reason line rather than raised to a louder severity.
+
+If a rename is combined with a promotion or a loosening on the same column, they are one
+`alter_table` — one Iceberg transaction — and the rename is ordered first.
+
+**Lifetime.** `renamedFrom` outlives its migration and Loom will never tell you to remove it. One
+spec is deployed to more than one lake, and after the rename ships to production, staging and every
+fresh developer warehouse are still on the other side of it; "you can delete this now" would be
+true of one catalog and false of another *from the same file*. So it stays, planning as a clean
+no-op wherever it is spent. When it is safe to delete is a question `_loom_meta` answers (§9): it
+records the version that performed the rename.
+
+**Chains are deliberately not expressible.** `renamedFrom` is one hop. A chain `a→b→c` only ever
+arises across separate applies — within a single edit, `column: c, renamedFrom: a` is how you say
+it — and the lake that would need the chain is one that skipped an intermediate apply, where the
+answer is to apply the intermediate versions rather than to teach one spec every name a column has
+ever had. A list would also make the *both* case combinatorial. A lake that skipped a hop lands in
+the *neither* row above: warned, not silently stranded.
 
 ---
 
@@ -137,6 +193,8 @@ linkType:
     table: crm.order_customer
     fromColumn: order_id
     toColumn: customer_id
+    renamedFrom:                  # optional · §2.1, per side
+      fromColumn: order_ref       # `order_id` used to be `order_ref`
 ```
 
 **Validation rules**
@@ -145,7 +203,10 @@ linkType:
 2. `from.property` and `to.property` exist on their respective object types, and their
    canonical types are comparable (equal after promotion).
 3. `through` is **required iff** `cardinality == many_to_many`, and **forbidden otherwise**.
-   When present, its columns are physically checked like any backing table.
+   When present, its columns are physically checked like any backing table — and planned like
+   one, which is why `through.renamedFrom` exists: a mapping table is a real table, and leaving it
+   out would make it the one table Loom plans but cannot rename a column on. Its keys are exactly
+   `fromColumn` / `toColumn`, both optional, each following §2.1 and its rules.
 4. `reverseName` (if set) collides with nothing on the `to` object — not a property name, not
    another link's `apiName`, not another link's `reverseName`.
 5. **Cardinality sanity** (advisory warnings, not errors): for `many_to_one`, `to.property`
@@ -414,3 +475,6 @@ Named deliberately so they're conscious deferrals, not gaps:
 - **Complex types** — `array`/`struct`/`map` (see §1).
 - **Computed / derived properties** — properties backed by an expression rather than a column.
 - **Multi-object actions** — the explicit post-v1 feature the §4 boundary reserves room for.
+- **Chained renames** — `renamedFrom` is one hop (§2.1). Widening it to a list of prior names
+  would be backward-compatible with every spec written against v0, if a lake that routinely skips
+  applies ever makes it worth the cost.

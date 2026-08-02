@@ -81,12 +81,17 @@ class SchemaEdit:
     the planner's concerns, and importing it here would point the catalog layer at the layer
     above it.
 
-    The three ops are exactly the ones that are safe to execute (see `migrate.Severity`); there is
+    `rename` is the one op that needs a second name: `column.name` is what the column becomes and
+    `renamed_from` is what it is called right now. It is a remap rather than an add-and-abandon —
+    the field id survives, so every existing data file keeps being read under the new name.
+
+    The four ops are exactly the ones that are safe to execute (see `migrate.Severity`); there is
     no `drop` and no incompatible retype, because Loom never proposes either.
     """
 
-    op: str  # add | promote | relax
+    op: str  # add | rename | promote | relax
     column: Column
+    renamed_from: str = ""  # `rename` only
 
 
 @runtime_checkable
@@ -117,6 +122,11 @@ class CatalogWriter(Protocol):
         self, table: str, edits: Sequence[SchemaEdit], properties: Mapping[str, str] = {}
     ) -> None:
         """Apply every edit to `table` in a **single transaction**: all of them commit, or none.
+
+        `edits` is **ordered**, and a `rename` precedes any other edit to the column it renames.
+        Implementations may rely on that: it is what lets an implementation whose schema-update API
+        resolves names against the pre-transaction schema translate the later edits back to the old
+        name. Callers must not reorder.
 
         `properties` are set in that same transaction, so a table's recorded provenance can never
         drift from the schema it describes."""

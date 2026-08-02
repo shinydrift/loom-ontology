@@ -70,7 +70,7 @@ that same ontology as MCP tools, driven end to end over stdio.
 
 ---
 
-## ⏳ M2 — Migration engine (`plan` / `apply`) — *in progress: `plan` and `apply` have landed*
+## ⏳ M2 — Migration engine (`plan` / `apply`) — *in progress: only rollback is left*
 
 *Goal: edit the YAML, run `loom plan`, see a classified diff; `loom apply` evolves Iceberg.*
 
@@ -80,9 +80,39 @@ that same ontology as MCP tools, driven end to end over stdio.
 - [x] `_loom_meta` state store — serialized applied spec + version + content-hash + history.
 - [x] `loom apply` — write port + namespace creation; executes physical DDL in an Iceberg
       transaction; bumps version; idempotent.
-- [ ] `renamedFrom:` handling — treat as a field-id remap, not drop+add.
+- [x] `renamedFrom:` handling — treat as a field-id remap, not drop+add. Property-level and on
+      `through` columns; a `rename` change kind classified safe; the old column no longer reported
+      as unmanaged.
 - [ ] Rollback path — restore prior spec + point physical schema at an earlier snapshot.
       (`_loom_meta` already stores the spec source verbatim, which is what this restores.)
+
+**Four decisions taken in the `renamedFrom` slice:**
+- **The spec says what it wants; the live catalog decides what that currently means.** One
+  unchanged property plans four ways depending on which columns exist: the rename (old only),
+  nothing at all (new only), a warned plain add (neither), and a refusal (both). The second is
+  where idempotency comes from, and it needed no new mechanism — the baseline was already the
+  live catalog, so a landed rename simply has nothing left to say about itself.
+- **Both columns live is a breaking change, not a load error.** The spec isn't wrong; the *lake*
+  is in a shape the plan can't resolve, which is what breaking already means here. Making it a
+  change rather than a diagnostic keeps the rest of the diff on the page — an error aborts the
+  plan and prints nothing — and routes it into the existing whole-plan refusal, which is the
+  right outcome, since merging two columns means dropping one and Loom never drops.
+- **`renamedFrom` outlives its migration, and Loom never suggests removing it.** One spec is
+  deployed to lakes at different versions: after a rename ships to production, staging is still
+  on the other side of it, so "you can delete this now" would be true of one catalog and false of
+  another from the same file. Chained renames are deliberately not expressible for the same
+  reason a state file isn't — a lake several versions behind should apply the versions it missed,
+  not be modelled inside the spec.
+- **A rename is `safe`, not `physical-safe`.** Physical-safe is the label meaning *the stored type
+  moved and only field ids keep the files readable*; a rename moves neither type, nullability nor
+  field id. What it does break is readers outside the ontology that select by name, and that goes
+  in the plan's reason line rather than inflating a severity that means data safety.
+
+  One implementation note worth recording, because it inverts the obvious: pyiceberg's
+  `UpdateSchema` resolves every `path=` against the schema the transaction *opened* with, so a
+  promotion following a rename in the same transaction must still name the **old** column. The
+  plan therefore orders renames first and `alter_table` documents that ordering as part of its
+  contract — it is what lets the adapter translate the later edits back.
 
 **Three decisions taken in the `apply` slice:**
 - **A breaking plan is refused whole.** Not "apply the safe parts and report the rest": a

@@ -100,6 +100,11 @@ class FakeWritableCatalog:
             col = edit.column
             if edit.op == "add":
                 live[col.name] = Column(col.name, col.iceberg_type, required=False, field_id=len(live) + 1)
+            elif edit.op == "rename":
+                # Keyed by name but carrying the field id, which is the whole point of the op:
+                # rebuilt in place so a later edit in the same batch finds it under the new name.
+                was = live.pop(edit.renamed_from)
+                live[col.name] = Column(col.name, was.iceberg_type, was.required, was.field_id)
             elif edit.op == "promote":
                 live[col.name] = Column(col.name, col.iceberg_type, live[col.name].required, live[col.name].field_id)
             elif edit.op == "relax":
@@ -228,6 +233,78 @@ def test_a_promotion_is_applied_as_a_type_update(ontology, snapshot):
     assert catalog.tables["crm.customers"]["lifetime_value"].iceberg_type == "double"
     # Promotion is by field id: the id must survive, or existing data files stop matching.
     assert catalog.tables["crm.customers"]["lifetime_value"].field_id == 4
+
+
+def test_a_rename_reaches_the_port_ahead_of_the_edits_that_depend_on_it(tmp_path, snapshot):
+    """The ordering guarantee `alter_table` documents, asserted where it is produced.
+
+    Everything after the rename addresses the column by the name the rename gives it, so an
+    implementation whose schema-update API resolves against the pre-transaction schema — pyiceberg's
+    does — can only translate them back if it sees the rename first. One call, so one transaction:
+    a rename committed apart from the promotion that follows it is a window where the table matches
+    neither spec."""
+    (tmp_path / "widget.yaml").write_text(
+        """
+objectType:
+  apiName: Widget
+  primaryKey: id
+  title: id
+  backing: { catalog: rest_main, table: demo.widgets }
+  properties:
+    - { name: id, type: string, column: id, unique: true }
+    - { name: score, type: long, column: score, nullable: true, renamedFrom: old_score }
+"""
+    )
+    built, _ = build(tmp_path)
+    live = {
+        "id": Column("id", "string", required=True, field_id=1),
+        "old_score": Column("old_score", "int", required=True, field_id=2),
+    }
+    catalog = FakeWritableCatalog(tables={"demo.widgets": live})
+
+    result = apply_plan(_plan(built, catalog), {catalog.name: catalog}, snapshot_spec(tmp_path))
+
+    assert result.status == APPLIED, result.error
+    assert [entry for entry in catalog.log if entry[0] == "alter"] == [
+        ("alter", "demo.widgets", (("rename", "score"), ("promote", "score"), ("relax", "score"))),
+    ]
+    after = catalog.tables["demo.widgets"]
+    assert "old_score" not in after
+    # The field id is the whole point: it is what keeps the existing data files readable.
+    assert (after["score"].field_id, after["score"].iceberg_type, after["score"].required) == (2, "long", False)
+
+
+def test_a_rename_loom_cannot_resolve_refuses_the_run_and_writes_nothing(tmp_path, snapshot):
+    """Both columns live. Merging them means dropping one, so it goes through the same whole-plan
+    refusal as any other breaking change — no `--force`, and the table is left exactly as found."""
+    (tmp_path / "widget.yaml").write_text(
+        """
+objectType:
+  apiName: Widget
+  primaryKey: id
+  title: id
+  backing: { catalog: rest_main, table: demo.widgets }
+  properties:
+    - { name: id, type: string, column: id, unique: true }
+    - { name: score, type: double, column: score, nullable: true, renamedFrom: old_score }
+"""
+    )
+    built, _ = build(tmp_path)
+    live = {
+        "id": Column("id", "string", required=True, field_id=1),
+        "old_score": Column("old_score", "double", required=False, field_id=2),
+        "score": Column("score", "double", required=False, field_id=3),
+    }
+    catalog = FakeWritableCatalog(tables={"demo.widgets": dict(live)})
+
+    result = apply_plan(_plan(built, catalog), {catalog.name: catalog}, snapshot_spec(tmp_path))
+
+    assert result.status == REFUSED
+    assert catalog.writes == []
+    assert catalog.tables["demo.widgets"] == live, "both columns still there, untouched"
+    assert not catalog.table_exists(META_TABLE)
+    assert "demo.widgets.score: renamed from old_score" in result.error
+    assert "cannot merge them" in result.error
 
 
 # --- refusal -------------------------------------------------------------------------------
