@@ -242,7 +242,7 @@ action:
       required: true
 
   validation:                     # optional · preconditions, checked before the write
-    - rule: "newTier != customer.tier"
+    - rule: "newTier != object.tier"     # `object.<prop>` is the row as it is *now* — see §5
       message: New tier must differ from the current tier
 
   effects:                        # required · exactly one entry (single-object)
@@ -287,9 +287,59 @@ effects:
 5. Parameters: `objectRef` params name an existing `objectType`; `enum` params declare
    `values`; a `default` (if present) type-checks and implies `required: false`.
 6. `validation[].rule` and every `<expr>` reference **only** declared parameters and
-   properties of the target object (see §5) — no free variables.
+   properties of the target object (see §5) — no free variables. `object.<prop>` is in scope for
+   `modify`/`delete` only: a `create` has no prior object.
 7. **Concurrency is implicit:** `modify`/`delete` are read-modify-write under optimistic
    concurrency (version/snapshot check). No YAML expresses it; the runtime always does it.
+
+### 4.1 What running an action actually does
+
+The grammar above is half the contract. The other half is the runtime, because an action is the
+only thing in Loom that changes a row, and what it does to the columns the spec *doesn't* mention
+is as much a promise as what it does to the ones it does.
+
+**One row, four steps, one commit.** Bind the parameters → read the target row → evaluate every
+validation rule → one write. Everything that can refuse happens in the first three, so **a run that
+refuses changes nothing** — the same promise `apply` makes about a breaking plan.
+
+**A `modify` is an equality-delete plus an append, and therefore a full-row rewrite.** This is why
+the read that precedes the write is a *whole physical row*, not the ontology's projection of one:
+every column no property maps has to be carried across, or the write silently nulls it. Those are
+the same columns `plan` reports as unmanaged and leaves alone (§2 rule 7) — the never-drop rule one
+level down, where the data is rather than the schema.
+
+A column whose **type** the ontology has no name for — an `array`, a `struct`, a `map`, anything
+§1 defers — is carried the same way: untouched and unexamined. The runtime builds no type for it
+and never inspects the value; the conversion is driven by the table's own schema. Only the columns
+an effect `set`s pass through the type system.
+
+**A `delete` is one row, and it does not contradict "Loom never drops."** Never-drop is about
+*inference*: Loom refusing to read a destruction into the **silence** of a spec, because a column
+nothing declares is someone else's data rather than a deleted property. `operation: delete` is the
+opposite of silence — a person wrote the word, named the object type, and the key arrives as a
+declared parameter. The scopes differ too. Never-drop governs **schema**: Loom never drops a column
+or a table, in any command. This removes **one row**, addressed by primary key.
+
+**The key is checked for uniqueness before the write.** The primary key is single-property in v0
+and Loom does not own the table, so nothing physically guarantees it is unique — and an
+equality-delete on a key matching two rows would remove both and append one. A key matching more
+than one row is refused (`ambiguous_key`), naming the table. Loom cannot repair it: the two rows
+are still there and the fix is out of band.
+
+**Failures are typed, and all of them are reported.** Nothing a caller, an author or the data can
+cause is an exception. A run comes back with a status (`applied` · `previewed` · `refused` ·
+`failed`) and a list of failures, each carrying a code from a closed set — `missing_parameter`,
+`unknown_parameter`, `type_error`, `validation_failed`, `expression_error`, `object_not_found`,
+`object_exists`, `ambiguous_key`, `write_failed`, `conflict`. A failed rule carries the spec's own
+`message`, verbatim. Every rule is evaluated rather than stopping at the first failure, for the
+same reason `loom validate` reports every problem at once.
+
+**Concurrency, honestly.** The *write* is one Iceberg transaction. The read and the write together
+are two, and rule 7 above is not yet true: the runtime **records** the snapshot each read saw and
+does not check it. It says so — a result carries `concurrency: "recorded, not enforced"`, and
+`conflict` is the one retryable code, defined and raised by nothing until the check lands. The
+snapshot is read *before* the rows, so the recorded id is at-or-before the data: a check against it
+can report a conflict that wasn't one, but can never miss one that was.
 
 ---
 
@@ -301,13 +351,46 @@ property's type). Written inline or inside `{{ … }}`.
 
 - **References:** a bare identifier `paramName` resolves to a parameter; `object.propName`
   resolves to the *current* value of the target object's property (for `modify`/`delete`).
-- **Literals:** string `'...'`, number, `true`/`false`/`null`, and bare enum values.
+- **Literals:** string `'...'`, number, `true`/`false`/`null`. An enum value is a string, so it is
+  quoted: `'gold'`, never bare — a bare word is always a reference.
 - **Operators:** comparison `== != < <= > >=`, boolean `&& || !`, arithmetic `+ - * /`,
   string `+` (concat).
 - **Function allow-list (only these):** `now()`, `lower(s)`, `upper(s)`, `len(s)`,
   `coalesce(a, b, …)`.
 - **No** loops, lambdas, property assignment, external calls, or arbitrary code. Anything
   richer belongs in a future custom-function extension point, not the expression language.
+
+### 5.1 `{{ … }}` is punctuation, not a second language
+
+`key: "{{ customer }}"` and `rule: "newTier != object.tier"` are the **same grammar**. The braces
+are optional and are stripped at load, so nothing downstream — evaluator, validator, engine — ever
+sees one. Two things follow, and both are load-bearing:
+
+- **An effect value may be any expression**, not only a parameter reference. That is what makes
+  `placedAt: "now()"` and `tier: "upper(newTier)"` expressible. `{{ customer }}` is the degenerate
+  case of the general thing, not a different thing.
+- **There is no string interpolation.** `"tier-{{ newTier }}"` is a load error, not a template.
+  Building a string is the expression language's own `+`.
+
+### 5.2 What the evaluator does with values
+
+Type-checking happens offline (§4 rule 3); this is what the values themselves do at run time.
+
+- **The value domain is the read path's.** `decimal` is a decimal all the way through and never
+  passes through binary floating point — mixing a decimal and a float in arithmetic is an error
+  rather than a silent choice of precision. `timestamp` is tz-aware. A number destined for an
+  `int`/`long` property must be integral; it is never truncated to fit.
+- **Null is a value, not an unknown.** `null != 'gold'` is **true** and `null == null` is **true**.
+  This is deliberately not SQL's three-valued logic: the language is evaluated in process over one
+  already-fetched row and never reaches SQL, and an "unknown" precondition would leave the runtime
+  no safe option but to refuse — making `null` a hazard in every rule written about a nullable
+  property. A precondition is meant to be a decision.
+- **But null cannot be ordered or computed with.** `<`, `<=`, `>`, `>=`, arithmetic, `!` and the
+  boolean operators all fail on null rather than inventing an answer. `&&` and `||` short-circuit,
+  which is what makes that workable — `object.ltv != null && object.ltv > 100` is the idiom, and
+  `coalesce` is in the allow-list for the same reason.
+- **A rule that cannot be evaluated is not a rule that returned false.** It is its own failure
+  code (`expression_error`), because an agent should not retry the two the same way.
 
 ---
 
@@ -405,7 +488,7 @@ action:
     - { name: customer, type: objectRef, objectType: Customer }
     - { name: newTier,  type: enum, values: [silver, gold] }
   validation:
-    - { rule: "newTier != customer.tier", message: New tier must differ from current tier }
+    - { rule: "newTier != object.tier", message: New tier must differ from current tier }
   effects:
     - modifyObject:
         key: "{{ customer }}"
@@ -544,6 +627,11 @@ Named deliberately so they're conscious deferrals, not gaps:
 - **Complex types** — `array`/`struct`/`map` (see §1).
 - **Computed / derived properties** — properties backed by an expression rather than a column.
 - **Multi-object actions** — the explicit post-v1 feature the §4 boundary reserves room for.
+- **Optimistic concurrency** — §4.1 records the snapshot each read saw and does not yet check it.
+- **Governance and the carry-across** — a `modify` carries every column the ontology does not map
+  (§4.1), which is a superset of what §6's `governance.policies` will let a caller read. Whether a
+  masked column is carried (it must be, or the write destroys it) or the write is refused is a
+  question that belongs to the milestone that introduces masking.
 - **Chained renames** — `renamedFrom` is one hop (§2.1). Widening it to a list of prior names
   would be backward-compatible with every spec written against v0, if a lake that routinely skips
   applies ever makes it worth the cost.

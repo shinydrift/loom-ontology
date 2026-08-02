@@ -9,7 +9,8 @@ def test_worked_example_builds():
     ontology, diag = build(VALID)
     assert set(ontology.object_types) == {"Customer", "Order"}
     assert set(ontology.link_types) == {"placedBy"}
-    assert set(ontology.actions) == {"upgradeTier", "createOrder"}
+    # One action per operation, so the fixture exercises all three effect kinds.
+    assert set(ontology.actions) == {"upgradeTier", "createOrder", "forgetCustomer"}
     assert diag.warnings == []  # many_to_one target is unique → no fan-out warning
     assert "2 object type(s)" in ontology.summary()
 

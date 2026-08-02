@@ -1,0 +1,10 @@
+action:
+  apiName: forgetCustomer
+  description: Erase a customer record on request
+  targetObjectType: Customer
+  operation: delete
+  parameters:
+    - { name: customer, type: objectRef, objectType: Customer }
+  effects:
+    - deleteObject:
+        key: "{{ customer }}"

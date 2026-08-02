@@ -5,15 +5,26 @@ Everything above this package (physical validation, the query engines, the resol
 SQLite-backed warehouse in a test and a REST catalog in production, and it's where a
 non-Iceberg backing store would eventually plug in.
 
-The read port is deliberately narrow: introspect a table's columns, and scan it. Writes are a
-*separate* port, `CatalogWriter`, so that holding a `Catalog` — which is all the resolver, the
-engines and `loom serve` are ever given — carries no ability to execute DDL. `loom apply` reaches
-for `writer_for()` explicitly; row-level writes join it with the action runtime (M3).
+The read port is deliberately narrow: introspect a table's columns, scan it, and ask which snapshot
+you just read. Writes are two *separate* ports, so holding a `Catalog` — which is all the resolver,
+the engines and `loom serve` are ever given — carries no ability to write at all, and holding one
+writer carries no ability to do the other's job. `loom apply` reaches for `writer_for()` and gets
+schema verbs only; the action runtime reaches for `row_writer_for()` and gets row verbs only.
 """
 
 from __future__ import annotations
 
-from .base import Catalog, CatalogError, CatalogWriter, Column, SchemaEdit, TableSchema, writer_for
+from .base import (
+    Catalog,
+    CatalogError,
+    CatalogWriter,
+    Column,
+    RowWriter,
+    SchemaEdit,
+    TableSchema,
+    row_writer_for,
+    writer_for,
+)
 from .factory import open_catalog, open_catalogs
 
 __all__ = [
@@ -21,9 +32,11 @@ __all__ = [
     "CatalogError",
     "CatalogWriter",
     "Column",
+    "RowWriter",
     "SchemaEdit",
     "TableSchema",
     "open_catalog",
     "open_catalogs",
+    "row_writer_for",
     "writer_for",
 ]

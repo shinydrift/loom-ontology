@@ -198,3 +198,127 @@ linkType:
     out, err = capsys.readouterr()
     assert "possible fan-out" in err
     assert "warning" not in out
+
+
+# --- loom run -------------------------------------------------------------------------------
+
+
+def _seeded(tmp_path: Path) -> Path:
+    """The valid fixture applied to a real local warehouse, with one Customer in it.
+
+    Seeded through `loom run` itself rather than through pyiceberg: an action is how a row gets
+    into a Loom-managed table, and using anything else here would leave the CLI's own write path
+    only half exercised."""
+    pytest.importorskip("pyiceberg", reason="needs the [iceberg] extra")
+    ontology = _project(tmp_path)
+    assert main(["apply", str(ontology), "--yes"]) == 0
+    return ontology
+
+
+def test_run_is_the_write_paths_query_and_takes_no_table_column_or_predicate():
+    """`loom query` mirrors the generated read tools deliberately — if the dev command can do
+    something the tools can't, the ontology has a back door. The same test, and a stronger one,
+    because this command writes: `run` takes an action apiName and named parameters, which is
+    exactly the shape M4's `run_<action>` tool takes."""
+    args = vars(_parsed(["run", "upgradeTier", "ontology", "--param", "a=b"]))
+    assert set(args) - {"command", "func"} == {"action", "path", "param", "dry_run", "yes"}
+    for forbidden in ("table", "column", "filter", "where", "sql", "query", "predicate", "limit"):
+        assert forbidden not in args
+
+
+def _parsed(argv: list[str]):
+    """The CLI's own parser, without running the command."""
+    import loom.cli as cli
+
+    holder: dict = {}
+
+    def capture(args):
+        holder["args"] = args
+        return 0
+
+    original = cli.cmd_run
+    cli.cmd_run = capture
+    try:
+        # `main` rebuilds the parser on each call, so patching the function is enough.
+        cli.main(argv)
+    finally:
+        cli.cmd_run = original
+    return holder["args"]
+
+
+def test_run_goes_through_the_same_runtime_entry_point_the_mcp_tool_will(tmp_path, monkeypatch):
+    """One entry point, asserted rather than assumed. A second code path for the dev command is
+    how a back door gets built without anyone deciding to build one."""
+    from loom.action import ActionRuntime
+
+    ontology = _seeded(tmp_path)
+    calls: list[tuple] = []
+    original = ActionRuntime.run
+
+    def spy(self, name, params, *, dry_run=False):
+        calls.append((name, dict(params), dry_run))
+        return original(self, name, params, dry_run=dry_run)
+
+    monkeypatch.setattr(ActionRuntime, "run", spy)
+    main(["run", "upgradeTier", str(ontology), "--param", "customer=c1",
+          "--param", "newTier=gold", "--dry-run"])
+
+    assert calls == [("upgradeTier", {"customer": "c1", "newTier": "gold"}, True)]
+
+
+def test_run_without_a_terminal_refuses_rather_than_assuming_yes(tmp_path, capsys):
+    """The same safety property as `apply`, and for the same reason: a write in a pipeline has to
+    be a deliberate `--yes`. The preview is still printed — you can read what it would do."""
+    ontology = _seeded(tmp_path)
+    assert main(["run", "createOrder", str(ontology), "--param", "orderId=o1",
+                 "--param", "customerId=c1", "--param", "total=1.00"]) == 1
+    captured = capsys.readouterr()
+    assert "Loom run — createOrder" in captured.err
+    assert "pass --yes" in captured.err and "aborted" in captured.err
+
+
+def test_run_writes_a_row_and_prints_a_typed_result(tmp_path, capsys):
+    import json
+
+    ontology = _seeded(tmp_path)
+    capsys.readouterr()  # drop the apply output the fixture produced
+    assert main(["run", "createOrder", str(ontology), "--param", "orderId=o1",
+                 "--param", "customerId=c1", "--param", "total=42.50", "--yes"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "applied" and result["key"] == "o1"
+    # A decimal reaches the caller as a string, never through a float — the same rule the read
+    # tools follow, because it is the same `json_safe`.
+    assert result["after"]["total"] == "42.50"
+    assert result["concurrency"] == "recorded, not enforced"
+
+    assert main(["query", "Order", str(ontology), "--key", "o1"]) == 0
+    assert '"total": "42.50"' in capsys.readouterr().out
+
+
+def test_run_exits_nonzero_on_a_refusal_and_names_the_rule(tmp_path, capsys):
+    import json
+
+    ontology = _seeded(tmp_path)
+    main(["run", "createOrder", str(ontology), "--param", "orderId=o1",
+          "--param", "customerId=c1", "--param", "total=1.00", "--yes"])
+    capsys.readouterr()
+
+    assert main(["run", "createOrder", str(ontology), "--param", "orderId=o1",
+                 "--param", "customerId=c1", "--param", "total=1.00", "--yes"]) == 1
+    captured = capsys.readouterr()
+    assert "! object_exists" in captured.err
+    assert "nothing was written." in captured.err
+    assert json.loads(captured.out)["failures"][0]["code"] == "object_exists"
+
+
+def test_run_names_an_unknown_action_without_a_traceback(tmp_path, capsys):
+    ontology = _seeded(tmp_path)
+    assert main(["run", "noSuchAction", str(ontology)]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and "upgradeTier" in err
+
+
+def test_a_malformed_param_is_caught_before_any_catalog_is_opened(tmp_path, capsys):
+    ontology = _project(tmp_path, config=UNREACHABLE_CONFIG)
+    assert main(["run", "upgradeTier", str(ontology), "--param", "customer"]) == 1
+    assert "--param expects NAME=VALUE" in capsys.readouterr().err

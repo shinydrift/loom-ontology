@@ -14,11 +14,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
-from decimal import Decimal
 from typing import Any
 
-from .model import LinkType, ObjectType, Ontology, Property
+from .model import LinkType, ObjectType, Ontology, Property, coerce_value
 from .query.engine import Engine
 from .query.ir import Column, Comparison, Contains, Eq, GetByKey, Project, Search, TableRef, ThroughRef, Traverse
 
@@ -229,50 +227,13 @@ class Resolver:
     def _coerce(self, prop: Property, value: Any, ctx: str) -> Any:
         """Bring a caller-supplied value to the property's declared Python type.
 
-        Load-bearing for the agent path: an LLM will happily send `"42"` for a `long` key. JSON
-        can't distinguish those, and the mismatch would not fail loudly — it would push down as an
-        Iceberg predicate that matches nothing, and the agent would be told the object doesn't
-        exist. So coercion happens once, here, where the declared type is known.
-        """
-        if value is None:
-            return None
-        kind = prop.type.kind
-        if kind == "objectRef":
-            # An objectRef travels as the referenced object's primary key, so it coerces as that
-            # key's type — not as a string.
-            ref = self.ontology.object_types.get(prop.type.object_type or "")
-            if ref is not None:
-                return self._coerce(ref.pk_property, value, ctx)
+        Delegates to `model.coerce_value`, which the action runtime uses on the way *out* for
+        exactly the same reason this uses it on the way in — see its docstring. Only the failure
+        type is this layer's business."""
         try:
-            if kind in ("int", "long"):
-                # bool is an int subclass, and True would silently become 1.
-                if isinstance(value, bool):
-                    raise ValueError("boolean is not an integer")
-                return int(value)
-            if kind == "double":
-                return float(value)
-            if kind == "decimal":
-                return Decimal(str(value))
-            if kind == "boolean":
-                if isinstance(value, str):
-                    lowered = value.strip().lower()
-                    if lowered not in ("true", "false"):
-                        raise ValueError(f"expected 'true' or 'false', got {value!r}")
-                    return lowered == "true"
-                return bool(value)
-            if kind == "date":
-                return value if isinstance(value, date) else date.fromisoformat(str(value))
-            if kind == "timestamp":
-                return value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
-            if kind == "enum":
-                text = str(value)
-                if prop.type.values and text not in prop.type.values:
-                    allowed = ", ".join(prop.type.values)
-                    raise ValueError(f"'{text}' is not one of: {allowed}")
-                return text
-        except (TypeError, ValueError, ArithmeticError) as e:
-            raise ResolverError(f"{ctx}: cannot read {value!r} as {kind} ({e})") from e
-        return str(value)  # string, and an objectRef whose target could not be resolved
+            return coerce_value(prop.type, value, self.ontology.object_types, ctx)
+        except ValueError as e:
+            raise ResolverError(str(e)) from e
 
     # ---- paging ----------------------------------------------------------------
 

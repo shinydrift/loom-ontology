@@ -59,7 +59,8 @@ At serve time this exposes `get_customer`, `search_customer`, `list_customer`, a
 `run_upgradeTier` to any MCP client — with input schemas derived from the property/parameter
 types, and row/column governance enforced below the tool layer.
 
-*Today the read tools and `traverse` are live; `run_<action>` and governance are the next two
+*Today the read tools and `traverse` are live over MCP, and the action runtime behind
+`run_upgradeTier` runs through `loom run`; exposing it as a tool and governance are the next two
 milestones. See [Status](#status).*
 
 ## Architecture (5 layers)
@@ -78,15 +79,18 @@ Two decisions shape the framework:
   that per-engine adapters lower to dialect SQL.
 - **Writes** are single-object and bypass the compute engine entirely — an equality-delete +
   append committed as one atomic Iceberg transaction — which keeps the write path uniform
-  across engines.
+  across engines. They also go through their own ports: one for a table's *shape*, one for its
+  *rows*, so a migration cannot touch data and an action cannot touch DDL.
 
 ## Status
 
 Early, but the **read path works end to end**: a YAML spec over real Iceberg tables, served to an
-MCP client as typed tools. The **migration path** is now complete — `loom plan` classifies what a
-spec change would do to the physical tables, `loom apply` executes it (bootstrapping an empty
-warehouse from nothing but a spec), and `loom rollback` puts an earlier spec back. The action
-runtime (row-level writeback) is next.
+MCP client as typed tools. The **migration path** is complete — `loom plan` classifies what a spec
+change would do to the physical tables, `loom apply` executes it (bootstrapping an empty warehouse
+from nothing but a spec), and `loom rollback` puts an earlier spec back. And the **action runtime**
+now writes: `loom run` binds an action's parameters, evaluates the validation rules the spec
+declares, and mutates one row as one Iceberg commit. Optimistic concurrency and the edit log are
+the two pieces still to come.
 
 | Component | State |
 |-----------|-------|
@@ -106,7 +110,9 @@ runtime (row-level writeback) is next.
 | Migration executor + `_loom_meta` state store | ✅ `loom apply` |
 | `renamedFrom` — column renames as field-id remaps | ✅ |
 | Migration rollback | ✅ `loom rollback` |
-| Action runtime — single-object writeback | ⏳ |
+| Action runtime — single-object writeback (`action/`) | ✅ `loom run` |
+| Optimistic concurrency — snapshot check | ⏳ recorded, not yet enforced |
+| Edit-log (audit) table | ⏳ |
 | MCP `run_<action>` tools + HTTP transport | ⏳ |
 | Governance (row/column policies) | ⏳ |
 
@@ -119,8 +125,8 @@ runtime (row-level writeback) is next.
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 290 tests
-loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 2 action(s)
+pytest                              # 355 tests
+loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 3 action(s)
 ```
 
 Then run the whole stack against a real Iceberg table. `examples/retail` ships the worked example
@@ -132,6 +138,8 @@ python examples/retail/seed.py                        # create + populate the Ic
 loom validate --physical examples/retail/ontology     # check the spec against live metadata
 loom query Customer examples/retail/ontology --key c1 # → one row, through DuckDB
 loom query Customer examples/retail/ontology --key c2 --link orders   # → a link traversal
+loom run upgradeTier examples/retail/ontology \
+  --param customer=c3 --param newTier=gold            # → one row, rewritten
 loom serve examples/retail/ontology                   # → 7 MCP tools over stdio
 ```
 
@@ -139,9 +147,13 @@ Point any MCP client at that last command and the ontology shows up as typed too
 
 ```
 $ loom serve examples/retail/ontology
-loom serve — 2 object type(s), 1 link type(s), 0 action(s) → 7 tool(s) over stdio
+loom serve — 2 object type(s), 1 link type(s), 3 action(s) → 7 tool(s) over stdio
   get_customer  get_order  list_customer  list_order  search_customer  search_order  traverse
 ```
+
+Three actions, no `run_` tools — the runtime is live but the MCP write surface is M4, and the
+banner counts what is actually exposed rather than what the spec declares. `loom run` reaches the
+same runtime in the meantime.
 
 ```jsonc
 // traverse({"objectType": "Customer", "key": "c2", "link": "orders", "limit": 2})
@@ -350,6 +362,87 @@ the chain if there were several).
 snapshot rollback, no expiry. Rows written since are not Loom's to throw away. Spec files are the
 last thing it writes and only if the run wasn't refused, so a rollback you decline leaves the lake
 *and* the working tree exactly as they were.
+
+## Running an action
+
+An action is the only thing in Loom that changes a row. `loom run` is the write path's `loom query`
+— it takes an action apiName and named parameters, which is exactly the shape the generated
+`run_<action>` tool will take, and calls the same runtime. If the dev command could do something
+the tools can't, the ontology would have a back door:
+
+```
+$ loom run upgradeTier examples/retail/ontology --param customer=c3 --param newTier=gold
+Loom run — upgradeTier on examples/retail/ontology
+
+  modify Customer "c3"
+      ~ tier  "bronze" -> "gold"
+
+  read at snapshot 3071900788344075695 — recorded, not yet enforced:
+  the write is one Iceberg transaction; the read before it is not.
+
+Run these changes? [y/N] y
+```
+```jsonc
+{
+  "action": "upgradeTier", "objectType": "Customer", "operation": "modify",
+  "status": "applied", "key": "c3",
+  "before": { "customerId": "c3", "name": "Alan Turing", "tier": "bronze", "ltv": null },
+  "after":  { "customerId": "c3", "name": "Alan Turing", "tier": "gold",   "ltv": null },
+  "readSnapshotId": 3071900788344075695,
+  "concurrency": "recorded, not enforced",
+  "failures": []
+}
+```
+
+Four rules shape it.
+
+**A modify carries across the columns nobody declared.** A row-level modify is an equality-delete
+plus an append committed as one transaction, which means it rewrites the *whole* row — so every
+column no property maps has to be carried or it is silently nulled. Those are the same columns
+`loom plan` reports as unmanaged: someone else's data. `crm.customers` in the example has two of
+them, and the second has a type Loom has no name for at all:
+
+```
+# before                                       # after — one column moved, nothing else
+id  tier    region  segments                    id  tier  region  segments
+c3  bronze  apac    null                        c3  gold  apac    null
+c1  gold    emea    [enterprise, early-adopter] c1  gold  emea    [enterprise, early-adopter]
+```
+
+`segments` is an `array<string>`, and `array<T>` is deferred in the spec's type system — the
+runtime never builds a type for it, never looks at the value, and hands it straight back, because
+the conversion is driven by the table's own schema rather than by anything the ontology knows.
+
+**A refusal changes nothing, and comes back typed.** Binding, the read, the uniqueness check and
+every validation rule run before the single write call. A failed rule carries the spec author's own
+message, verbatim, under a code from a closed set — not an opaque string an agent has to parse:
+
+```
+$ loom run upgradeTier examples/retail/ontology --param customer=c3 --param newTier=gold
+  ! validation_failed: New tier must differ from the current tier
+  nothing was written.
+```
+
+Every rule is evaluated, not just up to the first failure — the same bargain `loom validate` makes
+with a spec author, because an agent fixing one precondition per call is as miserable as a human
+fixing one typo per run.
+
+**Rows and schemas are different ports.** `loom apply` holds a `CatalogWriter` and has no verb for
+deleting a row; the action runtime holds a `RowWriter` and has no verb for altering a schema.
+Neither extends the other, so neither can do the other's job by accident — the same reasoning as
+"no raw-SQL tool is ever exposed", applied twice more.
+
+**`operation: delete` is not in tension with "Loom never drops."** Never-drop is about *inference*:
+Loom refusing to read a destruction into the **silence** of a spec, which is why a column no
+property mentions is left alone rather than dropped. A declared `delete` action is the opposite of
+silence — someone wrote the word and named the key. The scopes differ too: never-drop governs
+schema, and Loom still never drops a column or a table, in any command.
+
+One thing this slice deliberately does *not* do: close the gap between the read and the write. The
+write is one Iceberg transaction; the read before it is a separate one, and between them the row
+can move. So the snapshot each read saw is **recorded and not checked**, the result says exactly
+that, and `conflict` exists as the one retryable failure code with nothing yet raising it. A
+snapshot id printed without that sentence would read as a guarantee.
 
 The validator accumulates every problem and reports them in one pass with source locations:
 

@@ -68,7 +68,12 @@ def _namespace_of(table: str) -> str:
 
 @dataclass
 class PyIcebergCatalog:
-    """Adapts a constructed pyiceberg catalog to the `Catalog` and `CatalogWriter` ports."""
+    """Adapts a constructed pyiceberg catalog to the `Catalog`, `CatalogWriter` and `RowWriter`
+    ports.
+
+    One class implements all three because pyiceberg can do all three; that is not the same as the
+    ports being one port. What each *caller* is handed is decided by which of `writer_for` /
+    `row_writer_for` it asked, and the type it holds is what bounds what it can do."""
 
     name: str
     _impl: Any
@@ -122,6 +127,10 @@ class PyIcebergCatalog:
             return tbl.scan(**kwargs).to_arrow()
         except Exception as e:  # pragma: no cover - depends on live storage
             raise CatalogError(f"scan of '{table}' in catalog '{self.name}' failed: {e}") from e
+
+    def current_snapshot_id(self, table: str) -> int | None:
+        snapshot = self._load(table).current_snapshot()
+        return snapshot.snapshot_id if snapshot is not None else None
 
     def _row_filter(self, predicates: Sequence[tuple[str, Any]]):
         """Lower equality pairs to a pyiceberg expression for file/row-group pruning.
@@ -238,19 +247,72 @@ class PyIcebergCatalog:
     def append_rows(self, table: str, rows: Sequence[Mapping[str, Any]]) -> None:
         if not rows:
             return
+        tbl = self._load(table)
+        try:
+            tbl.append(self._batch(tbl, rows))
+        except Exception as e:
+            raise CatalogError(f"could not append to '{table}' in catalog '{self.name}': {e}") from e
+
+    @staticmethod
+    def _batch(tbl: Any, rows: Sequence[Mapping[str, Any]]):
+        """Rows to an Arrow table, against the table's *own* schema.
+
+        Never one inferred from the values: inference would turn an all-null column into a
+        null-typed one and an int into an int64, and the write would be rejected for a mismatch
+        that says nothing about what the caller got wrong. It is also what carries a column whose
+        type Loom has no name for — a `list`, a `struct` — straight back out again, because the
+        conversion is driven by the physical schema rather than by anything the ontology knows."""
         import pyarrow as pa
         from pyiceberg.io.pyarrow import schema_to_pyarrow
 
+        return pa.Table.from_pylist([dict(r) for r in rows], schema=schema_to_pyarrow(tbl.schema()))
+
+    # --- RowWriter -----------------------------------------------------------------------
+    # One row, addressed by key. No batch verb and no predicate: the spec's single-object boundary
+    # is enforced here by the absence of a way to express anything wider.
+
+    def insert_row(self, table: str, row: Mapping[str, Any]) -> None:
         tbl = self._load(table)
-        # The table's own schema, converted — not one inferred from the values. Inference would
-        # turn an all-null column into a null-typed one and an int into an int64, and the append
-        # would be rejected for a mismatch that says nothing about what the caller got wrong.
-        arrow_schema = schema_to_pyarrow(tbl.schema())
         try:
-            batch = pa.Table.from_pylist([dict(r) for r in rows], schema=arrow_schema)
-            tbl.append(batch)
+            tbl.append(self._batch(tbl, [row]))
         except Exception as e:
-            raise CatalogError(f"could not append to '{table}' in catalog '{self.name}': {e}") from e
+            raise CatalogError(f"could not insert into '{table}' in catalog '{self.name}': {e}") from e
+
+    def replace_row(
+        self, table: str, key_column: str, key_value: Any, row: Mapping[str, Any]
+    ) -> None:
+        tbl = self._load(table)
+        try:
+            batch = self._batch(tbl, [row])
+            # `overwrite` inside a transaction *is* the equality-delete plus append: pyiceberg
+            # drops or rewrites the files matching the filter and adds the new row, and the whole
+            # thing lands as one Iceberg commit. A reader sees the old row or the new one — never
+            # neither, and never both.
+            with tbl.transaction() as txn:
+                txn.overwrite(batch, overwrite_filter=self._key_filter(key_column, key_value))
+        except Exception as e:
+            raise CatalogError(
+                f"could not replace a row in '{table}' in catalog '{self.name}': {e}"
+            ) from e
+
+    def delete_row(self, table: str, key_column: str, key_value: Any) -> None:
+        tbl = self._load(table)
+        try:
+            with tbl.transaction() as txn:
+                txn.delete(delete_filter=self._key_filter(key_column, key_value))
+        except Exception as e:
+            raise CatalogError(
+                f"could not delete a row from '{table}' in catalog '{self.name}': {e}"
+            ) from e
+
+    @staticmethod
+    def _key_filter(key_column: str, key_value: Any):
+        """`IsNull` rather than `EqualTo` for None, for the same reason `_row_filter` does it: an
+        Iceberg equality against null never matches, so a null key would delete nothing and the
+        append beside it would then duplicate the row instead of replacing it."""
+        from pyiceberg.expressions import EqualTo, IsNull
+
+        return IsNull(key_column) if key_value is None else EqualTo(key_column, key_value)
 
 
 def build(name: str, ctype: str, uri: str, warehouse: str | None, properties: Mapping[str, object]):

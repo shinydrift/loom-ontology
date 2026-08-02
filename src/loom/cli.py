@@ -4,6 +4,8 @@
 dev command for exercising the read path by hand, and `serve` exposes those same reads as MCP
 tools. `plan` dry-runs the migration engine, `apply` executes exactly what `plan` printed, and
 `rollback` restores a spec out of `_loom_meta` and re-plans it — the same loop, an older spec.
+`run` is `query`'s counterpart on the write path: one declared action, through the same runtime
+M4's `run_<action>` tool will call.
 """
 
 from __future__ import annotations
@@ -132,6 +134,107 @@ def cmd_query(args) -> int:
     print(json.dumps(json_safe(rows), indent=2, default=str))
     print(f"({len(rows)} row(s))", file=sys.stderr)
     return 0
+
+
+def cmd_run(args) -> int:
+    """Run one declared action. The write path's `loom query`, and under the same rule.
+
+    `loom query` mirrors the generated read tools deliberately — if the dev command can do
+    something the tools can't, the ontology has a back door. That test is stronger here, because
+    this one writes: so it takes an action apiName and named parameters, exactly the shape M4's
+    `run_<action>` tool will take, and calls the same `ActionRuntime.run`. It cannot name a table,
+    a column, or a predicate, because the runtime has no argument for one."""
+    diag = Diagnostics()
+    try:
+        ontology, config = _load_project(args.path, diag)
+    except SpecErrors as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    from .action import ActionError, ActionRuntime
+    from .catalog import CatalogError, open_catalogs
+    from .mcp.registry import json_safe
+
+    # Argument shape before anything opens a catalog, as `loom query` does — a typo'd flag should
+    # not need a reachable metastore to be reported.
+    parameters: dict[str, str] = {}
+    for pair in args.param or []:
+        if "=" not in pair:
+            print(f"error: --param expects NAME=VALUE, got '{pair}'", file=sys.stderr)
+            return 1
+        name, value = pair.split("=", 1)
+        parameters[name] = value
+
+    try:
+        runtime = ActionRuntime(ontology=ontology, catalogs=open_catalogs(config))
+        # Always previewed first, even for a real run: it is the same four steps minus the write,
+        # so what the prompt shows is what is about to happen rather than a second guess at it. It
+        # is a preview and not a recording — an effect holding `now()` gets a fresh value on the
+        # run, for the same reason `loom apply` re-plans instead of replaying a saved plan.
+        preview = runtime.run(args.action, parameters, dry_run=True)
+    except ActionError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except CatalogError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    print(_render_run(preview, str(args.path)), file=sys.stderr)
+    if not preview.ok or args.dry_run:
+        print(json.dumps(json_safe(preview.as_json()), indent=2, default=str))
+        return 0 if preview.ok else 1
+
+    if not _confirmed(args.yes, "run"):
+        print("aborted — nothing was written", file=sys.stderr)
+        return 1
+
+    try:
+        result = runtime.run(args.action, parameters)
+    except CatalogError as e:  # pragma: no cover - the runtime folds these into WRITE_FAILED
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(json.dumps(json_safe(result.as_json()), indent=2, default=str))
+    for failure in result.failures:
+        print(f"error: {failure.code}: {failure.message}", file=sys.stderr)
+    print(f"{result.status} · {result.object_type} {result.key!r}", file=sys.stderr)
+    return 0 if result.ok else 1
+
+
+def _render_run(result, title: str) -> str:
+    """What is about to happen, before the prompt. Deliberately shaped like `render_plan`: an
+    action is a one-row migration, and the reader's job is the same one — decide whether to run it,
+    so the symbols carry the same meanings (`+` adds, `~` changes in place, `-` goes away).
+
+    The shape comes from the *operation*, not from whether there is an `after`: a refused modify
+    also has no `after`, and rendering it as a delete would be the most alarming possible way to
+    say "nothing happened"."""
+    from .mcp.registry import json_safe
+
+    def show(value) -> str:
+        return json.dumps(json_safe(value), default=str)
+
+    lines = [f"Loom run — {result.action} on {title}", ""]
+    lines.append(f"  {result.operation} {result.object_type} {show(result.key)}")
+    before, after = result.before or {}, result.after or {}
+    if result.operation == "delete":
+        for name in sorted(before):
+            lines.append(f"      - {name}  {show(before[name])}")
+    elif result.operation == "create":
+        for name in sorted(after):
+            lines.append(f"      + {name}  {show(after[name])}")
+    else:
+        for name in sorted(set(before) | set(after)):
+            if result.after is not None and before.get(name) != after.get(name):
+                lines.append(f"      ~ {name}  {show(before.get(name))} -> {show(after.get(name))}")
+    if result.read_snapshot_id is not None:
+        # Said out loud, because a snapshot id printed on its own would read as something checked.
+        lines.append(f"\n  read at snapshot {result.read_snapshot_id} — recorded, not yet enforced:")
+        lines.append("  the write is one Iceberg transaction; the read before it is not.")
+    for failure in result.failures:
+        lines.append(f"\n  ! {failure.code}: {failure.message}")
+    if result.failures:
+        lines.append("  nothing was written.")
+    return "\n".join(lines)
 
 
 def cmd_serve(args) -> int:
@@ -392,6 +495,14 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--filter", action="append", metavar="PROP=VALUE", help="repeatable search filter")
     q.add_argument("--limit", type=int, default=None)
     q.set_defaults(func=cmd_query)
+
+    r_ = sub.add_parser("run", help="run one declared action (dev tool)")
+    r_.add_argument("action", help="action apiName, e.g. upgradeTier")
+    r_.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")
+    r_.add_argument("--param", action="append", metavar="NAME=VALUE", help="repeatable action parameter")
+    r_.add_argument("--dry-run", action="store_true", help="bind and validate, but write nothing")
+    r_.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    r_.set_defaults(func=cmd_run)
 
     s = sub.add_parser("serve", help="serve the ontology as MCP tools over stdio")
     s.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")

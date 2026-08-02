@@ -349,7 +349,11 @@ def test_a_read_only_catalog_is_refused_before_anything_runs(ontology, snapshot)
     result = apply_plan(_plan(ontology, catalog), {"rest_main": catalog}, snapshot)
 
     assert result.status == REFUSED
-    assert "read-only" in result.error
+    # Names the catalog, the plane it couldn't write, and what was asking — not an AttributeError
+    # three frames down. "Schema writes" specifically: a catalog that can write rows but not DDL is
+    # a perfectly coherent thing, and this message has to be true of it too.
+    assert "'rest_main'" in result.error
+    assert "schema writes" in result.error
 
 
 # --- failure partway through ----------------------------------------------------------------
