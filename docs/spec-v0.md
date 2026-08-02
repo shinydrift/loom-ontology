@@ -447,19 +447,30 @@ and stamp every caller in the deployment with one string. `loom run` passes it e
 worth more than a confident wrong answer.
 
 The distinction that key rests on is *declared* versus *inferred*, not process versus caller. An
-operator writing `actor: agent:support-bot` is stating something true about a deployment, and over
-stdio it is exactly true — one client spawns one process, and the session has one principal. Loom
+operator writing `actor: agent:support-bot` is stating something true about a deployment. Loom
 falling back to the OS user would be inferring the same shape of answer without anyone having
 checked it. A client-supplied actor was the third option and is worse than `unknown`: an audit
 record whose subject fills in its own name is self-attestation, and MCP has no identity for it to
 attest with.
 
+This used to carry a second clause — *and over stdio it is exactly true, because one client spawns
+one process and the session has one principal.* That was **already doing less work than it looked
+like**, and the HTTP transport is where it gets corrected rather than extended. `mcp.actor` lives in
+`loom.yaml`, which configures a *deployment*, so three stdio clients reading one file already record
+one string for three callers. One name for many callers is not something a socket introduced, and
+declared-versus-inferred — the part that was load-bearing — is untouched by either transport.
+
+What a socket does change is **reachability**: not how many callers share the name, but who is
+permitted to be one of them. §6 draws the limit there, on the bind address rather than on the
+transport, and refuses `writes: true` on a non-loopback bind.
+
 So it is worth saying plainly what the log is worth over an unauthenticated transport. With no
 `mcp.actor` set, every served write records `unknown`, and the record still answers *what* was done,
 to *which row*, *when*, with *which parameters*, and *whether it refused* — it does not answer
-*who*. That is a gap in stdio, which has no authentication and no principal, rather than a gap in
-the log; the config key is the honest way to close it for a deployment, and an authenticated
-transport is the way to close it per call.
+*who*. That is a gap in the transports Loom currently speaks, neither of which authenticates
+anybody, rather than a gap in the log; the config key is the honest way to close it for a
+deployment, and an authenticated transport is the way to close it per call. What "authenticated"
+has to mean there is not a header Loom reads — see the open edge on per-caller identity.
 
 *The write carries its own identity, and the log is written after it.* Iceberg has no transaction
 spanning two tables, so the row write and the log append are two commits and a crash can land between
@@ -550,9 +561,18 @@ mcp:
   transport: stdio                # stdio | http
   writes: false                   # expose run_<action> tools at all · default false
   actor: null                     # who a served run is recorded as · declared, never inferred
+  host: 127.0.0.1                 # http only · the bind, and the posture
+  port: 8000                      # http only
+  path: /mcp                      # http only
+  allowed_hosts: []               # http only · Host allow-list; derived on a loopback bind
 governance:                       # optional · row/column policies enforced in the resolver
   policies: []                    # (grammar TBD — forward reference, not in v0)
 ```
+
+The four address keys mean nothing without an address, so setting any of them under
+`transport: stdio` is an **error** rather than something quietly dropped — the same rule
+`governance.policies` follows, for the same reason: a config that is silently ignored reads, to
+whoever wrote it, exactly like one that was obeyed.
 
 **`writes` is off by default, and that is a decision.** Until the action runtime became a tool set,
 `loom serve` could not change anything, and deployments were pointed at real lakes on that basis.
@@ -566,6 +586,39 @@ generates against — though M5 may end up subsuming it.
 **`actor` is what a served run is recorded as** in `_loom_meta.edits`. Unset, runs record `unknown`.
 See §4.1's "the actor is supplied by the caller, never invented" for why this is a config key rather
 than an inference or a tool parameter.
+
+**The transport has an address now, and the address is the posture.** `stdio` has none: a client
+spawns the process and owns it. `http` is reachable by whoever can reach the port, and that single
+difference decides everything else in this block.
+
+*All of it is config, including the port.* The argument that put `writes` here — a flag lets one
+invocation contradict the file an operator reviews — is weakest for a port number, which is not a
+posture at all. It goes here anyway, because a file that describes half an address does not describe
+the server, and reviewing the deployment would mean reading the unit file too. The host is the
+strongest case rather than the weakest: it *is* the posture, and it is precisely the question this
+file should answer.
+
+*`host` defaults to `127.0.0.1`*, for the reason `loom apply` refuses to run unattended: do not put
+somebody's lake on a network because nobody said to. `loom serve` speaks cleartext — there is no TLS
+key, and terminating TLS belongs to whatever sits in front — which is a second reason the default
+bind is local.
+
+*`writes: true` is refused on a non-loopback bind*, at startup, the way `cmd_serve` already refuses
+rather than advertising tools that will fail. **Writes over a socket are not the same decision as
+writes over a pipe**, and the difference is reachability rather than transport. It is worth being
+exact about why, because the obvious reason is wrong: `actor` lives in *this file*, so it always
+named a deployment rather than a session — three stdio clients reading one `loom.yaml` already
+record one string for three callers. Many callers under one name is not what a socket introduces.
+What a non-loopback bind changes is who is permitted to *be* one of those callers: over stdio,
+whoever can run the binary and read this file; over `0.0.0.0`, whoever can reach the port. That is
+where `actor:` stops being a statement anybody checked. The check is honest about its own limit —
+it constrains what Loom **binds**, not what **reaches** it, and a proxy in front of a loopback bind
+is outside anything this file can see.
+
+*`allowed_hosts`* is the `Host` allow-list behind DNS-rebinding protection, which is always on. It
+is optional exactly where it can be derived: a loopback bind knows the three names it answers to. A
+non-loopback bind does not know the name the world reaches it by, so it is required there rather
+than guessed.
 
 ---
 
@@ -620,6 +673,21 @@ attempts, `editId`, and typed `failures[]`. Never a protocol-level error: the tr
 answers *did this call become a run*, not *did the run succeed*, so a refused precondition, a
 conflict and a write failure all arrive as content an agent branches on. That is also the only
 encoding that can describe `applied` with a `log_failed` beside it, which a boolean gets backwards.
+
+**Nothing in this table differs by transport, and that is stated rather than implied.** The surface
+is a function of the spec; `mcp.transport` is not one of its inputs. Both transports are handed the
+same assembled server, so there is no seam here for one of them to widen — a tool that exists over
+HTTP exists over stdio, with the same name, the same input schema and the same description.
+
+The corollary matters more than the claim, because **a transport with real status codes invites
+re-litigating `isError`**. It does not get to. An HTTP status answers *did this exchange happen*;
+`isError` answers *did this call become a run*. They are questions at different layers and never two
+votes on one thing, so **an HTTP status never disagrees with `isError`**: every tool outcome —
+`applied`, `previewed`, `refused`, `failed`, an unknown link, an unknown tool — is a `200` carrying
+content. A non-`200` is only ever about the exchange (a rejected `Host`, a rejected `Origin`, a
+malformed body, an unknown session), and no tool result can produce one. The alternative maps a
+refusal onto a 4xx, where an agent's transport raises before its own branch on `status` ever runs,
+and a validation rule doing its job arrives looking like a broken client.
 
 Two invariants the compiler guarantees: **the LLM never receives raw SQL** (only these
 verbs), and **governance policies filter both the direct API and the MCP tools identically**
@@ -897,12 +965,31 @@ Named deliberately so they're conscious deferrals, not gaps:
   a read, records property *names* without values, or is expired on a retention window is the same
   question §6 faces and belongs to the same milestone. Nothing is deferred about the record's shape:
   the columns are fixed now (§9.2) because the table is only ever created.
-- **A per-caller identity over MCP** — §7's `run_<action>` records `mcp.actor`, which names a
-  *deployment* rather than a caller, because stdio has no authentication, no principal and nothing
-  in the protocol to carry one. Over an authenticated transport the actor becomes a per-call fact,
-  and nothing has to move to accommodate it: `ActionRuntime.run` already takes the argument per call
-  and the serve boundary already fills it in. Until then a served log answers everything except
-  *who*, and says `unknown` rather than guessing.
+- **A per-caller identity over MCP** — still open, and the HTTP transport narrowed it rather than
+  closing it. `run_<action>` records `mcp.actor`, which names a *deployment*; neither transport Loom
+  speaks authenticates anybody, so there is no caller to name instead.
+
+  What was learned in narrowing it is that there are **three** kinds of answer here and only one is
+  worth having, which the earlier wording did not distinguish. An actor may be *declared* by an
+  operator (`mcp.actor` — true about a deployment, silent about a caller); *inferred* by Loom
+  (`default_actor()`'s OS user — rejected, because it looks like a principal and is not one); or
+  **attested** by a transport that checked it — not declared and not inferred, and the only one of
+  the three worth more than `unknown`. MCP's authorization is an OAuth 2.1 resource-server profile,
+  so attested means a bearer token validated on issuer, audience, expiry and signature against an
+  authorization server. Anything short of that — reading a header, trusting a claim — is the
+  client-supplied actor rejected above, wearing a hat.
+
+  What is still missing is therefore specific: the validation, and the config to describe an
+  authorization server. Nothing else has to move. `ActionRuntime.run` already takes the argument per
+  call, the serve boundary already fills it in, and §6 already refuses the case where the gap would
+  do damage — writes on a bind reachable by strangers. A loopback HTTP server may write today
+  because its callers are the same set stdio's were; a public one may not, until this closes.
+
+  Governance (§6 `policies`) is the other half and lands in the same place. Policies filter by
+  principal in the resolver, below MCP, so that a direct call and an agent call filter identically —
+  which means the identity has to reach the resolver, not only the edit log. It does not today, and
+  deliberately: a per-call principal with no source and no reader would be threading a value further
+  than anything uses it.
 - **Refusing to act when the log is unavailable** — a run whose record cannot be written still
   happens, and reports `log_failed`. "No log, no write" is a coherent audit posture and a *policy*,
   so it belongs with the other policies rather than wired in where no deployment could turn it off.

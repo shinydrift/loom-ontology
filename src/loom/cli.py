@@ -287,7 +287,7 @@ def cmd_serve(args) -> int:
         return 1
 
     from .catalog import CatalogError
-    from .mcp.server import build_server, serve_stdio
+    from .mcp.server import build_server, serve_http, serve_stdio
 
     try:
         server, _ = build_server(ontology, config)
@@ -296,7 +296,12 @@ def cmd_serve(args) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    # stdout is the transport, so every human-facing line goes to stderr.
+    # Every human-facing line goes to stderr. That used to be because stdout was the transport,
+    # which stops being true the moment a second transport has an address instead of a pipe. The
+    # rule stays and the reason is replaced: the banner is *diagnostics*, and diagnostics go to
+    # stderr whatever the transport. Splitting it — stdout unless stdio — would give one command two
+    # output shapes to keep in step, and would have to be revisited by every transport after this
+    # one. Whatever collects these lines should not need to know how the tools are being served.
     print(
         f"loom serve — {ontology.summary()} → {len(server.tools)} tool(s) over {config.mcp.transport}",
         file=sys.stderr,
@@ -305,11 +310,14 @@ def cmd_serve(args) -> int:
         print(f"  {name}", file=sys.stderr)
     # Said every time, in both modes. "How many tools" does not answer "can this thing write to my
     # lake", and that is the question somebody pointing a client at a production catalog is
-    # actually asking. The counts above are what was *built*, so the line below is what explains
-    # the gap between them and what the spec declares.
-    for line in _write_mode(config, ontology):
+    # actually asking. The counts above are what was *built*, so the lines below are what explain
+    # the gap between them and what the spec declares — and, over HTTP, who can reach them.
+    for line in _write_mode(config, ontology) + _transport_mode(config):
         print(f"  {line}", file=sys.stderr)
-    asyncio.run(serve_stdio(server))
+    if config.mcp.transport == "http":
+        asyncio.run(serve_http(server, config.mcp))
+    else:
+        asyncio.run(serve_stdio(server))
     return 0
 
 
@@ -329,6 +337,28 @@ def _write_mode(config, ontology) -> list[str]:
         else "recorded as actor 'unknown' — set mcp.actor to say who this deployment writes as"
     )
     return [f"writes enabled · {actions} action(s) exposed, every run {who}"]
+
+
+def _transport_mode(config) -> list[str]:
+    """What a socket changes, said where somebody starting the server will read it.
+
+    Nothing for stdio, which has no address and one client. For HTTP, the two facts a person cannot
+    infer from "10 tools": where it is, and that it answers one call at a time. The second is a
+    scaling claim, and a server that makes it silently is a support ticket."""
+    mcp = config.mcp
+    if mcp.transport != "http":
+        return []
+    lines = [f"listening on {mcp.address()} · cleartext HTTP, no TLS — terminate it in front"]
+    lines.append(
+        "one call at a time · tool calls are serialized, so a slow query blocks the server rather "
+        "than queueing beside another"
+    )
+    if not mcp.is_loopback:
+        lines.append(
+            f"bound to {mcp.host} · reachable by whoever can reach the port, not only by whoever "
+            "can run this binary"
+        )
+    return lines
 
 
 def cmd_plan(args) -> int:

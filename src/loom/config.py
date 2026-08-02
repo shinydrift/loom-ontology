@@ -11,7 +11,8 @@ reports spec and config problems in a single pass.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import ipaddress
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,13 +29,37 @@ SPEC_VERSION = 0
 # no services to stand up; it sits behind the same Catalog port as `iceberg-rest`.
 CATALOG_TYPES = frozenset({"iceberg-rest", "iceberg-sql"})
 ENGINE_TYPES = frozenset({"duckdb"})
-TRANSPORTS = frozenset({"stdio"})
+TRANSPORTS = frozenset({"stdio", "http"})
+
+DEFAULT_HTTP_PORT = 8000
+DEFAULT_HTTP_PATH = "/mcp"
+DEFAULT_HTTP_HOST = "127.0.0.1"
 
 _TOP_KEYS = {"version", "catalogs", "engine", "mcp", "governance"}
 _CATALOG_KEYS = {"type", "uri", "warehouse", "auth", "properties"}
 _ENGINE_KEYS = {"type", "options"}
-_MCP_KEYS = {"name", "transport", "writes", "actor"}
+_MCP_KEYS = {"name", "transport", "writes", "actor", "host", "port", "path", "allowed_hosts"}
+_ADDRESS_KEYS = ("host", "port", "path", "allowed_hosts")
+"""The keys that only mean something once the transport has an address. stdio has none, and a
+config that sets them under `transport: stdio` is refused rather than ignored — the rule
+`_check_governance` states, applied to a second set of keys that would otherwise be silently
+dropped."""
 _GOVERNANCE_KEYS = {"policies"}
+
+
+def is_loopback(host: str) -> bool:
+    """Does binding to `host` keep the server reachable only from this machine?
+
+    Fails **closed**: a name Loom cannot resolve to a loopback address — including every DNS name
+    other than `localhost` — is treated as not loopback. Two refusals in `_parse_mcp` hang off this
+    answer, and both are the kind that should err towards refusing to start."""
+    h = host.strip().strip("[]")
+    if h.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -57,7 +82,7 @@ class EngineConfig:
 
 @dataclass(frozen=True)
 class McpConfig:
-    """What `loom serve` exposes, and as whom.
+    """What `loom serve` exposes, where, and as whom.
 
     `writes` is **off by default**, and that is a decision rather than caution. Until the action
     runtime became a tool set, `loom serve` could not change anything, and people pointed it at real
@@ -76,17 +101,77 @@ class McpConfig:
     `actor` is what the edit log records for a run that arrives through a tool. It is **declared,
     never inferred**, which is the whole difference between it and `default_actor()`: that function
     falls back to the OS user, so on this path it would name whoever started the process while
-    looking like a principal, and stamp every caller in the deployment with one string. An operator
-    writing `actor: agent:support-bot` is instead making a true statement about a deployment — and
-    over stdio it is exactly true, because one client spawns one process and the session has one
-    principal. Unset, runs record `unknown`; see `action.log.UNKNOWN_ACTOR` for why that beats a
-    confident wrong answer.
+    looking like a principal. An operator writing `actor: agent:support-bot` is instead making a
+    statement about a deployment. Unset, runs record `unknown`; see `action.log.UNKNOWN_ACTOR` for
+    why that beats a confident wrong answer.
+
+    M4's first slice justified that with "over stdio it is exactly true, because one client spawns
+    one process and the session has one principal", and the HTTP transport is where that sentence
+    has to be corrected rather than extended — **it was already doing less work than it looked
+    like.** This key lives in `loom.yaml`, which is per *deployment*, so three stdio clients reading
+    one config file already record one string for three callers. Many callers under one name is not
+    what a socket introduces. What survives untouched is the distinction that was actually load
+    bearing: declared versus inferred.
+
+    What HTTP *does* change is **reachability** — who is permitted to be one of those callers. Over
+    stdio the set is "whoever can run the binary and read this file"; over a loopback bind it is very
+    nearly the same set; over `0.0.0.0` it is not remotely the same set, and there `actor:` names a
+    deployment nobody bounded. So the limit is drawn on the bind address rather than on the
+    transport, and `_parse_mcp` refuses `writes: true` on a non-loopback bind. What that check can
+    honestly claim is narrow and worth saying: it constrains what Loom *binds*, not what *reaches*
+    it. A proxy in front of a loopback bind is outside anything this file can see.
+
+    ---
+
+    **The address, and why all of it is here rather than on the command line.** `host`, `port`,
+    `path`. M4's first slice put `writes` in config on the argument that a flag lets one invocation
+    contradict the file an operator reviews, and a port number is the weakest case that argument has
+    to survive — a port is not a posture. It goes here anyway, because a file that describes half an
+    address does not describe the server, and reviewing it would mean reading the unit file too. The
+    host is the strongest case: it *is* the posture, and it is exactly the question the reviewed file
+    has to answer.
+
+    `host` defaults to `127.0.0.1` for the same reason `loom apply` refuses to run unattended — do
+    not put somebody's lake on a network because nobody said to. `0.0.0.0` is a deliberate act, and
+    it costs the write surface until an authenticated transport lands.
+
+    `allowed_hosts` is the `Host` header allow-list backing DNS-rebinding protection, which stays on.
+    It is optional exactly where it can be derived: a loopback bind knows its own names
+    (`host_allow_list`). A non-loopback bind does not know what hostname the world reaches it by, so
+    it is required there rather than guessed — the same shape as the `writes` refusal above.
+
+    There is no TLS key. `loom serve` speaks cleartext HTTP and terminating TLS is a job for whatever
+    sits in front, which is the third reason the default bind is loopback.
     """
 
     name: str = "loom"
     transport: str = "stdio"
     writes: bool = False
     actor: str | None = None
+    host: str = DEFAULT_HTTP_HOST
+    port: int = DEFAULT_HTTP_PORT
+    path: str = DEFAULT_HTTP_PATH
+    allowed_hosts: tuple[str, ...] = ()
+
+    @property
+    def is_loopback(self) -> bool:
+        return is_loopback(self.host)
+
+    def address(self) -> str:
+        """The URL the banner prints. Cleartext by construction — see the class docstring."""
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"http://{host}:{self.port}{self.path}"
+
+    def host_allow_list(self) -> tuple[str, ...]:
+        """The `Host` header values the transport accepts.
+
+        Declared wins. Otherwise the bind is loopback — `_parse_mcp` refuses any other bind that
+        leaves this unset — so the three spellings a local client can reach it by are the complete
+        set, and a browser rebinding `evil.example` onto 127.0.0.1 sends a `Host` that is not among
+        them."""
+        if self.allowed_hosts:
+            return self.allowed_hosts
+        return tuple(f"{name}:{self.port}" for name in ("127.0.0.1", "localhost", "[::1]"))
 
 
 @dataclass(frozen=True)
@@ -249,9 +334,9 @@ def _parse_mcp(raw: object, loc: SourceLoc, diag: Diagnostics) -> McpConfig:
     check_keys(raw, _MCP_KEYS, loc, diag, "mcp")
 
     transport = raw.get("transport", "stdio")
-    if transport not in TRANSPORTS:
-        hint = "http transport is not implemented yet (M4)" if transport == "http" else suggest(str(transport), TRANSPORTS)
-        diag.error(f"unsupported mcp transport '{transport}'", loc, hint)
+    declared = transport in TRANSPORTS
+    if not declared:
+        diag.error(f"unsupported mcp transport '{transport}'", loc, suggest(str(transport), TRANSPORTS))
         transport = "stdio"
 
     writes = raw.get("writes", False)
@@ -266,12 +351,99 @@ def _parse_mcp(raw: object, loc: SourceLoc, diag: Diagnostics) -> McpConfig:
         diag.error(f"'mcp.actor' must be a non-empty string, got {actor!r}", loc)
         actor = None
 
-    return McpConfig(
+    host, port, path, allowed_hosts = _parse_address(raw, loc, diag)
+    config = McpConfig(
         name=str(raw.get("name") or "loom"),
         transport=str(transport),
         writes=writes,
         actor=actor.strip() if isinstance(actor, str) else None,
+        host=host,
+        port=port,
+        path=path,
+        allowed_hosts=allowed_hosts,
     )
+    if declared:
+        _check_transport_posture(config, raw, loc, diag)
+    return config
+
+
+def _parse_address(raw: dict, loc: SourceLoc, diag: Diagnostics) -> tuple[str, int, str, tuple[str, ...]]:
+    """`host` / `port` / `path` / `allowed_hosts`, each falling back to its default on a bad value.
+
+    Nothing here knows about the transport; `_check_transport_posture` owns every question that
+    needs to see more than one key at once."""
+    host = raw.get("host", DEFAULT_HTTP_HOST)
+    if not isinstance(host, str) or not host.strip():
+        diag.error(f"'mcp.host' must be a non-empty string, got {host!r}", loc)
+        host = DEFAULT_HTTP_HOST
+    host = host.strip()
+
+    port = raw.get("port", DEFAULT_HTTP_PORT)
+    # `isinstance(True, int)` is True, and `port: yes` is a plausible YAML typo for a port number.
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        diag.error(f"'mcp.port' must be an integer from 1 to 65535, got {port!r}", loc)
+        port = DEFAULT_HTTP_PORT
+
+    path = raw.get("path", DEFAULT_HTTP_PATH)
+    if not isinstance(path, str) or not path.startswith("/"):
+        diag.error(f"'mcp.path' must be a string beginning with '/', got {path!r}", loc)
+        path = DEFAULT_HTTP_PATH
+    # `/mcp/` and `/mcp` mount the same endpoint; normalising here keeps the banner, the allow-list
+    # and the route from disagreeing about which one this deployment is.
+    path = "/" + path.strip("/")
+
+    raw_hosts = raw.get("allowed_hosts")
+    allowed_hosts: tuple[str, ...] = ()
+    if raw_hosts is not None:
+        if not isinstance(raw_hosts, Sequence) or isinstance(raw_hosts, (str, bytes)):
+            diag.error(f"'mcp.allowed_hosts' must be a list of host[:port] strings, got {raw_hosts!r}", loc)
+        elif not all(isinstance(h, str) and h.strip() for h in raw_hosts):
+            diag.error(f"'mcp.allowed_hosts' entries must be non-empty strings, got {list(raw_hosts)!r}", loc)
+        else:
+            allowed_hosts = tuple(h.strip() for h in raw_hosts)
+    return host, port, path, allowed_hosts
+
+
+def _check_transport_posture(config: McpConfig, raw: dict, loc: SourceLoc, diag: Diagnostics) -> None:
+    """The three questions that need more than one key to answer.
+
+    All of them are *errors*, so `loom validate` reports them and `loom serve` never starts — which
+    is the posture `cmd_serve` already takes when a catalog will not open. A warning on the way past
+    is worth nothing here: nobody reads the third line of a banner on a server that came up."""
+    address_keys = [k for k in _ADDRESS_KEYS if k in raw]
+    if config.transport == "stdio":
+        if address_keys:
+            # `_check_governance`'s rule, applied to a second set of keys: silently ignoring
+            # something a config declared is a worse failure than refusing to boot. And a stdio
+            # server that quietly ignored `host: 0.0.0.0` would read, to the person who wrote it,
+            # exactly like one that honoured it.
+            diag.error(
+                f"mcp.{', mcp.'.join(address_keys)} set but transport is 'stdio', which has no address",
+                loc,
+                "set 'transport: http' to serve over a socket, or drop the address keys",
+            )
+        return
+
+    if config.is_loopback:
+        return
+
+    # From here the bind is reachable from off this machine, and two things stop being derivable.
+    if not config.allowed_hosts:
+        diag.error(
+            f"'mcp.host' is {config.host!r}, which is not loopback, and 'mcp.allowed_hosts' is unset",
+            loc,
+            "a non-loopback bind cannot derive the Host headers to accept — declare them, e.g. "
+            f"allowed_hosts: [loom.internal:{config.port}]",
+        )
+    if config.writes:
+        diag.error(
+            f"'mcp.writes' is true on a non-loopback bind ({config.host!r}) — refusing to serve a "
+            "write surface to whoever can reach the port",
+            loc,
+            "bind 127.0.0.1 and put authentication in front, or set 'writes: false'. `mcp.actor` "
+            "names a deployment, not a caller, so every write here would be recorded under one "
+            "name nobody checked",
+        )
 
 
 def _check_governance(raw: object, loc: SourceLoc, diag: Diagnostics) -> None:

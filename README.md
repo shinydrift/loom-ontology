@@ -100,9 +100,18 @@ copy of them. That completed M3 — and the runtime is now **reachable by the th
 for**: `run_<action>` tools, one per declared action, with input schemas from the declared parameter
 types and typed results an agent branches on rather than protocol errors it can only retry. Writes
 are off unless `loom.yaml` says otherwise, and a served run is recorded as the actor a deployment
-declared, or as `unknown` — stdio authenticates nobody, and a log that says so beats one that names
-the wrong principal. What's left in M4 is a second transport and capability negotiation; after that,
-governance.
+declared, or as `unknown` — Loom authenticates nobody, and a log that says so beats one that names
+the wrong principal.
+
+And `loom serve` now speaks **HTTP** as well as stdio, which is the first time a Loom process
+outlives the client that started it. The tool set does not change — the surface is a function of the
+spec, not of the transport — but two things about a shared process do. It answers **one tool call at
+a time**, deliberately and out loud, because the DuckDB connection and the resolver underneath it are
+built once per process and making them per-caller is the same change governance needs. And the write
+surface is bounded by the **bind**: `mcp.writes: true` refuses to start on anything but a loopback
+address, because `mcp.actor` names a deployment rather than a caller, and that is only an honest
+thing to record while the set of callers is the same one that could already run the binary. What's
+left in M4 is capability negotiation; after that, governance.
 
 | Component | State |
 |-----------|-------|
@@ -126,7 +135,8 @@ governance.
 | Optimistic concurrency — snapshot check | ✅ asserted inside the commit |
 | Edit-log (audit) table | ✅ `_loom_meta.edits` |
 | MCP `run_<action>` tools | ✅ `mcp.writes: true` |
-| HTTP transport + capability negotiation | ⏳ |
+| HTTP transport | ✅ `mcp.transport: http` |
+| Capability negotiation | ⏳ |
 | Governance (row/column policies) | ⏳ |
 
 `docs/spec-v0.md` is the full grammar — the framework's public contract.
@@ -138,7 +148,7 @@ governance.
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 436 tests
+pytest                              # 460 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 3 action(s)
 ```
 
@@ -199,6 +209,49 @@ loom serve — 2 object type(s), 1 link type(s), 3 action(s) → 10 tool(s) over
 
 The banner counts what is actually exposed rather than what the spec declares, and says which mode
 it is in either way — "how many tools" does not answer "can this change my lake".
+
+Change one more line and the same tools are served over a socket instead of a pipe:
+
+```
+$ loom serve examples/retail/ontology     # mcp: { transport: http }
+loom serve — 2 object type(s), 1 link type(s), 3 action(s) → 7 tool(s) over http
+  get_customer  get_order  list_customer  list_order  search_customer  search_order  traverse
+  read-only · mcp.writes is false, so 3 declared action(s) are not exposed
+    (`loom run` still reaches them — the runtime is not what is switched off, the surface is)
+  listening on http://127.0.0.1:8000/mcp · cleartext HTTP, no TLS — terminate it in front
+  one call at a time · tool calls are serialized, so a slow query blocks the server rather than queueing beside another
+```
+
+The same seven tools, because **a transport is not an input to the surface** — a spec compiles to
+one tool set and both transports are handed it. What differs is what a *process* is. `host`, `port`
+and `path` live in `loom.yaml` rather than on the command line, for the reason `writes` does: a flag
+lets one invocation contradict the file an operator reviews, and "who can reach this" is exactly the
+question that file should answer. It binds to `127.0.0.1` unless told otherwise.
+
+Two lines of that banner are the honest disclosures. It answers one call at a time, which is a
+scaling claim and is therefore stated rather than left to be discovered — the DuckDB connection and
+the resolver under it are built once for the process, and making them per-caller is the same change
+governance needs, so it is one deliberate change later rather than half of one now. And it speaks
+cleartext: TLS belongs to whatever sits in front, which is part of why the default bind is local.
+
+The other half of that posture is a refusal. `mcp.writes: true` will not start on a non-loopback
+bind:
+
+```
+$ loom serve examples/retail/ontology     # mcp: { transport: http, host: 0.0.0.0, writes: true }
+1 problem in ontology spec:
+  - loom.yaml: 'mcp.writes' is true on a non-loopback bind ('0.0.0.0') — refusing to serve a write
+    surface to whoever can reach the port
+    hint: bind 127.0.0.1 and put authentication in front, or set 'writes: false'. `mcp.actor` names
+    a deployment, not a caller, so every write here would be recorded under one name nobody checked
+```
+
+Writes over a socket are not the same decision as writes over a pipe, and the difference is
+reachability rather than transport. `mcp.actor` always named a deployment — it lives in `loom.yaml`,
+so three stdio clients reading one file already record one string. What a public bind changes is who
+is permitted to *be* one of those callers: over stdio, whoever can run the binary; over `0.0.0.0`,
+whoever can reach the port. A per-caller identity needs a transport that actually checked one, which
+means validating a bearer token rather than reading a header — until then, the bind is the bound.
 
 ```jsonc
 // traverse({"objectType": "Customer", "key": "c2", "link": "orders", "limit": 2})
@@ -564,8 +617,12 @@ Over MCP the actor comes from `mcp.actor` in `loom.yaml` — declared by an oper
 Loom, which is the difference that keeps `$LOOM_ACTOR`-or-OS-user off this path: that would name
 whoever started `loom serve` while looking like a principal. Unset, a served run records `unknown`,
 and the edit log then answers what was done, to which row, when, with which parameters and whether it
-refused — everything except *who*. Over stdio there is no *who* to answer with; that gap closes with
-an authenticated transport, and `ActionRuntime.run` already takes the argument per call for it.
+refused — everything except *who*. Neither transport has a *who* to answer with: HTTP is a socket,
+not an authentication, and `mcp.actor` names a deployment either way. The gap closes with a transport
+that actually checked an identity — a validated bearer token, not a header read and believed, which
+would be a caller filling in its own name on its own audit record. `ActionRuntime.run` already takes
+the argument per call for it, and until then the bind is what bounds the claim: a write surface is
+refused on anything but a loopback address.
 
 The validator accumulates every problem and reports them in one pass with source locations:
 

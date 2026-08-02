@@ -12,7 +12,9 @@ what lets one assertion here be about the *process* rather than the tool: that c
 proves a serving process can change rows and no schema at all.
 """
 
+import asyncio
 import datetime as dt
+import inspect
 import json
 from decimal import Decimal
 from pathlib import Path
@@ -24,7 +26,7 @@ from loom.action import APPLIED, CONFLICT, PREVIEWED, REFUSED, UNKNOWN_ACTOR, Ac
 from loom.catalog.base import CatalogError, writer_for
 from loom.config import LoomConfig, McpConfig
 from loom.mcp.registry import DRY_RUN_ARG, PARAMETERS_ARG, RESERVED_RUN_ARGS, build_tools, json_safe, snake_case
-from loom.mcp.server import LoomMCPServer, build_server
+from loom.mcp.server import LoomMCPServer, build_mcp_server, build_server
 from loom.query.engine import Capabilities, CompiledQuery
 from loom.resolver import MAX_PAGE_SIZE, Resolver
 
@@ -510,3 +512,54 @@ def test_build_server_builds_no_runtime_unless_mcp_writes_is_on(ontology):
         "run_forget_customer",
         "run_upgrade_tier",
     ]
+
+
+# ---- what a second transport must not change ------------------------------------
+
+
+def test_nothing_the_server_dispatches_can_yield_the_event_loop(ontology):
+    """**Why an HTTP `loom serve` answers one call at a time**, as an assertion rather than a hope.
+
+    The MCP SDK dispatches `on_call_tool` concurrently — two clients on one HTTP server genuinely
+    interleave, which was measured before this was decided, so nothing above Loom is holding this
+    line. What serializes a served process is one rung down and entirely structural: dispatch is a
+    plain function and so is every handler, so a call runs to completion without a suspension point
+    in it and the event loop has nowhere to switch. A synchronous callable *cannot* be interleaved;
+    this is a proof, not a convention.
+
+    It is asserted because it is load-bearing and invisible. `DuckDBEngine` holds one connection for
+    the process and registers every scan under `t0` / `t1` / `m0` — constants in `resolver.py`,
+    identical for every object type in every ontology — so two concurrent reads clobber each other's
+    relation and the loser answers with the winner's rows. `build_server` builds one `Resolver` and
+    one `ActionRuntime` for the process. None of that is the transport's to fix, and all of it is
+    fine for exactly as long as this test passes.
+
+    So: make a handler `async` and this fails, which is the point. What it is telling you is not
+    "undo it" but "the three things above are now a correctness problem rather than a performance
+    one, and they belong to the layers that own them"."""
+    assert not inspect.iscoroutinefunction(LoomMCPServer.call)
+    for name, tool in _tools(ontology, runtime=_runtime(ontology)).items():
+        assert not inspect.iscoroutinefunction(tool.handler), name
+        assert not inspect.isasyncgenfunction(tool.handler), name
+
+
+def test_both_transports_are_handed_one_server(ontology):
+    """§7's surface is a function of the spec, and a transport is not one of its inputs.
+
+    `serve_stdio` and `serve_http` differ only in where they get a pair of streams; the tool set,
+    the descriptions and the instructions come from `build_mcp_server` either way. Asserting it here
+    — with no socket in sight — is what makes the claim about *both* transports rather than about
+    whichever one a test happened to drive."""
+    pytest.importorskip("mcp", reason="needs the [mcp] extra")
+
+    loom_server = _server(ontology, FakeRowCatalog())
+    sdk_server = build_mcp_server(loom_server)
+
+    on_list_tools = sdk_server.get_request_handler("tools/list").handler
+    listed = asyncio.run(on_list_tools(None, None))
+    assert {t.name for t in listed.tools} == set(loom_server.tools)
+    for advertised in listed.tools:
+        built = loom_server.tools[advertised.name]
+        assert advertised.description == built.description
+        assert advertised.input_schema == built.input_schema
+    assert "There is no SQL interface." in (sdk_server.instructions or "")
