@@ -8,11 +8,17 @@ The whole of an action is four steps, in this order and no other:
 2. **Read.** For `modify`/`delete`, the target row — *all* of it, physically. See `_read`.
 3. **Evaluate.** Every validation rule, against the bound parameters and the row just read. All of
    them, so a caller sees every precondition it failed rather than one per attempt.
-4. **Write.** One call to one `RowWriter` verb, which is one Iceberg transaction.
+4. **Write.** One call to one `RowWriter` verb, which is one Iceberg transaction — carrying the
+   snapshot step 2 read, so that the read and the write take effect as one decision or not at all.
 
 Everything that can refuse happens in 1-3, so **a run that refuses changes nothing** — the same
 promise `loom apply` makes, and for the same reason: a half-done write leaves a row that neither
-the caller nor the spec describes.
+the caller nor the spec describes. A run that conflicts refuses on that same definition: the write
+was declined before it committed, not undone afterwards.
+
+The four steps run up to `MAX_ATTEMPTS` times. `ActionRuntime.run` carries the argument for why a
+conflict is retried here rather than handed straight back; `_write` carries the argument for why
+all three operations are checked, and `_conflict` for what the failure tells a caller.
 
 Two boundaries this file is careful about:
 
@@ -30,12 +36,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..catalog.base import Catalog, CatalogError, RowWriter, row_writer_for
+from ..catalog.base import Catalog, CatalogError, ConcurrencyError, RowWriter, row_writer_for
 from ..model import Action, ObjectType, Ontology, coerce_value
 from .evaluate import EvalError, Scope, evaluate
 from .result import (
     AMBIGUOUS_KEY,
     APPLIED,
+    CONFLICT,
     EXPRESSION_ERROR,
     FAILED,
     MISSING_PARAMETER,
@@ -50,6 +57,15 @@ from .result import (
     ActionResult,
     Failure,
 )
+
+MAX_ATTEMPTS = 3
+"""How many times one `run` will read, evaluate and try to write before handing the conflict back.
+
+Three because a conflict is another commit landing inside a window measured in milliseconds, so
+losing it twice running means the table is genuinely hot rather than that we were unlucky — and at
+that point spinning is a livelock dressed up as a slow success. The bound is about liveness, not
+correctness: every attempt is as safe as the first, and the caller still gets a retryable failure
+and can decide with fresher information than the runtime has."""
 
 
 class ActionError(RuntimeError):
@@ -71,12 +87,43 @@ class ActionRuntime:
     def run(
         self, action_name: str, parameters: Mapping[str, Any], *, dry_run: bool = False
     ) -> ActionResult:
+        """One action, up to `MAX_ATTEMPTS` times, and the last word either way.
+
+        A conflict is retried **here** rather than handed straight back, because the check it comes
+        from is deliberately coarse: it asserts the whole table's snapshot, so every unrelated
+        append to a busy table refuses a run that would have been perfectly correct. Those two are
+        one decision, not two — a table-level check is only defensible if something absorbs the
+        conflicts it invents, and pushing that onto every caller means every caller writing the same
+        retry loop, badly, including the ones that are language models.
+
+        Each attempt is a **fresh** `_Run`: the row is read again, every rule is evaluated again
+        against the row that is actually about to be written over, and every effect expression is
+        evaluated again. Nothing is replayed. Replaying the first attempt's decision would write
+        values computed against a row that no longer exists and freeze a `now()` at the moment of a
+        read that lost — the same reason `loom run` re-runs its preview instead of recording it.
+
+        The consequence worth stating plainly: a retry can succeed against a row the caller never
+        saw. What makes that sound rather than sly is that the spec's `validation` rules *are* the
+        caller's statement of which states it is willing to act on, and they are re-checked against
+        the newer row — a stricter test than the caller's own stale read could apply. Where the
+        competing write genuinely invalidates the action, the retry does not paper over it: it comes
+        back as `validation_failed` or `object_not_found`, the real reason, rather than as a
+        conflict the caller is invited to retry forever. And the result says how many attempts it
+        took, because "applied" after three internal re-reads is a different fact from "applied"."""
         action = self.ontology.actions.get(action_name)
         if action is None:
             known = ", ".join(sorted(self.ontology.actions)) or "none"
             raise ActionError(f"unknown action '{action_name}' (known: {known})")
         target = self.ontology.object_types[action.target_object_type]
-        return _Run(self, action, target, dry_run).execute(parameters)
+
+        result = None
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            run = _Run(self, action, target, dry_run, attempt=attempt)
+            result = run.execute(parameters)
+            if not run.conflicted:
+                break
+        assert result is not None  # the loop runs at least once
+        return result
 
     def preview(self, action_name: str, parameters: Mapping[str, Any]) -> ActionResult:
         """Everything but the write. The write path's `loom plan`, and nearly free, because a
@@ -102,7 +149,9 @@ class _Run:
     action: Action
     target: ObjectType
     dry_run: bool
+    attempt: int = 1
     failures: list[Failure] = field(default_factory=list)
+    conflicted: bool = False
 
     # ---- the four steps --------------------------------------------------------
 
@@ -124,9 +173,10 @@ class _Run:
             return self._result(REFUSED)
 
         # The snapshot *before* the rows, not after: it makes the recorded id at-or-before the data
-        # the rules were evaluated against, so the concurrency slice's check can report a conflict
-        # that wasn't one but can never miss one that was. The other order silently blesses a lost
-        # update.
+        # the rules were evaluated against, so the check can report a conflict that wasn't one but
+        # can never miss one that was. The other order silently blesses a lost update. Those false
+        # conflicts are the price of that order, paid deliberately and absorbed by the retry in
+        # `ActionRuntime.run` — they are a consequence of the decision, not a defect in it.
         snapshot = catalog.current_snapshot_id(table) if catalog.table_exists(table) else None
         row = self._read(catalog, table, pk.column, key)
         before = self._project(row)
@@ -151,7 +201,13 @@ class _Run:
             return self._result(PREVIEWED, key=key, before=before, after=after, snapshot=snapshot)
 
         try:
-            self._write(catalog, table, pk.column, key, row, values)
+            self._write(catalog, table, pk.column, key, row, values, snapshot)
+        except ConcurrencyError as e:
+            # `REFUSED`, not `FAILED`. The write was declined before it committed, so this is a run
+            # that changed nothing — the same promise every other refusal makes, and the reason a
+            # caller can retry it without first working out what landed.
+            self._conflict(catalog, table, pk.column, key, before, e)
+            return self._result(REFUSED, key=key, before=before, snapshot=snapshot)
         except CatalogError as e:
             self._fail(WRITE_FAILED, str(e))
             return self._result(FAILED, key=key, before=before, snapshot=snapshot)
@@ -321,21 +377,56 @@ class _Run:
         key: Any,
         row: Mapping[str, Any] | None,
         values: Mapping[str, Any],
+        snapshot: int | None,
     ) -> None:
-        """One verb, one transaction. The writer is asked for here rather than held, so nothing in
-        this process keeps a row-writable handle between actions."""
+        """One verb, one transaction, and the snapshot the read saw carried into it.
+
+        The writer is asked for here rather than held, so nothing in this process keeps a
+        row-writable handle between actions.
+
+        **All three verbs are checked, and each earns it separately.**
+
+        `modify` is the obvious one, and its reason is the carry-across two methods up: the write
+        puts back every column the ontology never mapped, using values read before the competing
+        commit. Committing anyway would not merely lose a race — it would take somebody else's newer
+        value and quietly restore the old one, using a column Loom deliberately refuses to look at.
+        Which settles the question that rule raises: a change to an unmapped column *is* a conflict,
+        and the reason sits beside the never-inspect rule rather than qualifying it. Loom does not
+        read that column and does not overwrite it blind; the snapshot check is how it manages the
+        second without doing the first, since it compares no columns at all.
+
+        `create` earns it because it has a read too — the primary-key existence check — and two
+        concurrent creates on one key both pass it. Both would then append, manufacturing exactly
+        the duplicate row `_read` refuses as `ambiguous_key` every time it meets one afterwards, and
+        which Loom can never repair. Checked, they cannot: both read the same snapshot, so only one
+        commit can land on it. That check is what finally makes the existence check mean something
+        — for writers coming through Loom. It still guarantees nothing about a writer that isn't,
+        which is why `ambiguous_key` stays.
+
+        `delete` is where the argument is supposed to cut the other way — the row is gone either
+        way, so refusing because it changed first refuses something that has already effectively
+        happened. That holds only if the competing write was also a delete. If it was a `modify`,
+        the row is *not* gone: it changed, and deleting it destroys a state the caller never saw, in
+        the one operation nothing can put back. A conflicting modify can be re-applied and a
+        conflicting create refuses cleanly; a delete that lost a race is simply gone. So it is
+        checked on the strongest reason of the three — and the objection gets the outcome it wanted
+        anyway, because when the competing write really was a delete, the retry re-reads, finds
+        nothing, and returns `object_not_found`. That is "it has already happened", said accurately,
+        rather than a delete reporting that it did work it did not do."""
         writer: RowWriter = row_writer_for(catalog)
         op = self.action.effect.op
         if op == "deleteObject":
-            writer.delete_row(table, key_column, key)
+            writer.delete_row(table, key_column, key, expect_snapshot_id=snapshot)
             return
         if op == "createObject":
-            writer.insert_row(table, self._columns({}, values))
+            writer.insert_row(table, self._columns({}, values), expect_snapshot_id=snapshot)
             return
         assert row is not None  # OBJECT_NOT_FOUND refused the run otherwise
         # `row` first, then the effect's columns over the top: every column the ontology does not
         # map survives the rewrite exactly as it was read.
-        writer.replace_row(table, key_column, key, self._columns(row, values))
+        writer.replace_row(
+            table, key_column, key, self._columns(row, values), expect_snapshot_id=snapshot
+        )
 
     def _columns(self, row: Mapping[str, Any], values: Mapping[str, Any]) -> dict[str, Any]:
         """Property-named values back onto physical columns, over the row that was read.
@@ -347,6 +438,115 @@ class _Run:
         for name, value in values.items():
             out[self.target.properties[name].column] = value
         return out
+
+    # ---- conflict --------------------------------------------------------------
+
+    def _conflict(
+        self,
+        catalog: Catalog,
+        table: str,
+        key_column: str,
+        key: Any,
+        before: Mapping[str, Any] | None,
+        exc: ConcurrencyError,
+    ) -> None:
+        """The one retryable failure, carrying enough to decide whether retrying is the point.
+
+        "Conflict, retry" on its own is the failure mode: an agent told only that will retry until
+        it runs out of patience against a table that is merely busy, and will give up just as
+        readily on the one case where its intent has genuinely been overtaken. So the detail answers
+        the question behind the retry — *did the thing I was about change?* — rather than only
+        reporting that something did:
+
+        - `expectedSnapshotId` / `foundSnapshotId` — the table version the rules were evaluated
+          against, and the one it is at now. `found` is advisory: it is read after the refusal, so
+          on a hot table it may already be past the commit that actually won.
+        - `attempts` — how many times this run read and tried before giving the conflict back.
+        - `changed` — the **declared properties** whose value moved under this run, `null` when the
+          row could not be re-read to tell (or when there was no prior row at all, as for a
+          `create`). Diffed through the same projection `before` and `after` use, so the columns no
+          property maps are not compared any more than they are reported. An empty list is a real
+          answer, and the most common one: the table moved and this row did not.
+        - `contended` — whether any of `changed` is a property this action reads in a rule or writes
+          in an effect. That is the difference between a race worth re-examining and a queue.
+
+        It is also the shape the edit log will want — expected, found, and what moved — which is why
+        it is settled here rather than migrated into later."""
+        changed = self._changed(catalog, table, key_column, key, before)
+        in_play = self._properties_in_play()
+        contested = sorted(set(changed) & in_play) if changed else []
+        self._fail(
+            CONFLICT,
+            self._conflict_message(key, changed, contested),
+            {
+                "table": table,
+                "expectedSnapshotId": exc.expected,
+                "foundSnapshotId": exc.found,
+                "attempts": self.attempt,
+                "changed": changed,
+                "contended": bool(contested),
+            },
+        )
+        self.conflicted = True
+
+    def _conflict_message(self, key: Any, changed: list[str] | None, contested: list[str]) -> str:
+        head = (
+            f"{self.target.api_name} {key!r} could not be written: the table moved between the read "
+            f"and the write, after {self.attempt} attempt{'s' if self.attempt != 1 else ''}"
+        )
+        if contested:
+            return f"{head} — {', '.join(contested)} changed under it"
+        if changed:
+            return (
+                f"{head} — {', '.join(changed)} changed, but nothing this action reads or writes did"
+            )
+        if changed == []:
+            return f"{head} — no declared property of this row changed; the table is simply busy"
+        return f"{head} — the row could not be re-read to say what changed"
+
+    def _changed(
+        self,
+        catalog: Catalog,
+        table: str,
+        key_column: str,
+        key: Any,
+        before: Mapping[str, Any] | None,
+    ) -> list[str] | None:
+        """Declared properties that differ between what this attempt read and what is there now.
+
+        Deliberately not a row comparison: it runs *after* the refusal, as a diagnosis, and never as
+        the check. A comparison could not be the check — Iceberg's commit protocol can assert a
+        ref's snapshot and nothing finer, so a row-level test is unavoidably a compare-then-write
+        with a window between the two, which is the guarantee this slice exists to close. What is
+        too weak to decide with is still useful to explain with."""
+        if before is None:
+            return None
+        try:
+            rows = catalog.scan(table, predicates=[(key_column, key)]).to_pylist()
+        except CatalogError:  # pragma: no cover - the table was readable moments ago
+            return None
+        rows = [r for r in rows if r.get(key_column) == key]
+        if len(rows) != 1:
+            return None  # gone, or doubled — neither is a property-level answer
+        now = self._project(rows[0]) or {}
+        return sorted(name for name, was in before.items() if was != now.get(name))
+
+    def _properties_in_play(self) -> set[str]:
+        """The declared properties this action reads in a rule or writes in an effect.
+
+        `object.<prop>` in a validation rule or in an effect value is the action saying that
+        property is part of its reasoning; a `set` key is it saying the property is part of its
+        outcome. Anything else on the row is a neighbour."""
+        names = set(self.action.effect.set_values)
+        exprs = [rule.expr for rule in self.action.validation]
+        exprs += list(self.action.effect.set_values.values())
+        if self.action.effect.key is not None:
+            exprs.append(self.action.effect.key)
+        for expr in exprs:
+            names.update(
+                ref.path[1] for ref in expr.refs() if len(ref.path) == 2 and ref.path[0] == "object"
+            )
+        return names & set(self.target.properties)
 
     # ---- result ----------------------------------------------------------------
 
@@ -370,6 +570,7 @@ class _Run:
             before=before,
             after=after,
             read_snapshot_id=snapshot,
+            attempts=self.attempt,
             failures=tuple(self.failures),
         )
 

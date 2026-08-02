@@ -20,7 +20,15 @@ from pathlib import Path
 import pytest
 
 from loom import build
-from loom.action import APPLIED, PREVIEWED, REFUSED, VALIDATION_FAILED, ActionRuntime
+from loom.action import (
+    APPLIED,
+    CONFLICT,
+    MAX_ATTEMPTS,
+    PREVIEWED,
+    REFUSED,
+    VALIDATION_FAILED,
+    ActionRuntime,
+)
 from loom.config import find_config, load_config
 from loom.errors import Diagnostics
 
@@ -102,9 +110,9 @@ def test_the_row_count_does_not_change_because_the_delete_and_the_append_are_one
 
 
 def test_the_write_advances_the_snapshot_the_read_recorded(seeded, runtime):
-    """The seam the concurrency slice needs: the id is real, it belongs to the table the row was
-    read from, and it is *not* the id the table sits at afterwards. Nothing checks that yet, and
-    the result says so."""
+    """The id is real, it belongs to the table the row was read from, and it is *not* the id the
+    table sits at afterwards — the write itself moved it, which is what makes an uncontested run's
+    own commit the next run's baseline."""
     from loom.catalog import open_catalogs
 
     _, _, config = seeded
@@ -113,7 +121,8 @@ def test_the_write_advances_the_snapshot_the_read_recorded(seeded, runtime):
     assert result.read_snapshot_id is not None
     now = open_catalogs(config)["local"].current_snapshot_id("crm.customers")
     assert now != result.read_snapshot_id
-    assert result.as_json()["concurrency"] == "recorded, not enforced"
+    assert result.as_json()["concurrency"] == "enforced — the write asserts the snapshot the read saw"
+    assert result.attempts == 1
 
 
 def test_a_failed_rule_leaves_the_lake_exactly_as_it_was(seeded, runtime):
@@ -193,3 +202,175 @@ def test_the_schema_is_untouched_by_every_action(seeded, runtime):
         c.name: (c.iceberg_type, c.field_id) for c in before.values()
     }
     assert UNMAPPED <= set(after)
+
+
+# ---- optimistic concurrency, against a catalog that really commits ---------------
+
+
+class Interloper:
+    """The real-Iceberg twin of `test_action.Interloper`: a `Catalog` that commits somebody else's
+    write in the window between a run's read and its write.
+
+    The competing write goes through a **second, independently opened catalog handle** — its own
+    `SqlCatalog`, its own metadata cache, reaching the same metastore. That is a genuine concurrent
+    writer, not a simulation of one: it produces a real Iceberg commit that really advances the
+    table's `main` branch, and the run that follows it really loses.
+
+    Deterministic without a thread, because the seam is the port. The runtime's own call sequence
+    drives the interleaving — record a snapshot, read the row, write — so arming on
+    `current_snapshot_id` and firing on the next `scan` places the competing commit exactly once per
+    attempt, in exactly the gap, every run. Two threads and hope would test the same code path a
+    fraction of the time and pass either way.
+    """
+
+    def __init__(self, inner, config, strike_on=(1,)):
+        self.name = inner.name
+        self.inner = inner
+        self.config = config
+        self.strike_on = set(strike_on)
+        self.attempts = 0
+        self._armed = False
+
+    def current_snapshot_id(self, table):
+        self._armed = True
+        return self.inner.current_snapshot_id(table)
+
+    def scan(self, table, columns=None, predicates=(), limit=None):
+        rows = self.inner.scan(table, columns, predicates, limit)
+        if self._armed:
+            self._armed = False
+            self.attempts += 1
+            if self.attempts in self.strike_on:
+                self._compete(table)
+        return rows
+
+    def _compete(self, table):
+        """Somebody else's `loom run`, in effect — a different process upgrading `c1`."""
+        from loom.catalog import open_catalogs
+
+        other = open_catalogs(self.config)["local"]
+        row = next(r for r in other.scan(table).to_pylist() if r["id"] == "c1")
+        other.replace_row(
+            table, "id", "c1",
+            {**row, "region": f"apac-{self.attempts}"},
+            expect_snapshot_id=other.current_snapshot_id(table),
+        )
+
+    def table_exists(self, table):
+        return self.inner.table_exists(table)
+
+    def describe(self, table):  # pragma: no cover - the runtime never asks
+        return self.inner.describe(table)
+
+    def insert_row(self, table, row, *, expect_snapshot_id):
+        self.inner.insert_row(table, row, expect_snapshot_id=expect_snapshot_id)
+
+    def replace_row(self, table, key_column, key_value, row, *, expect_snapshot_id):
+        self.inner.replace_row(table, key_column, key_value, row, expect_snapshot_id=expect_snapshot_id)
+
+    def delete_row(self, table, key_column, key_value, *, expect_snapshot_id):
+        self.inner.delete_row(table, key_column, key_value, expect_snapshot_id=expect_snapshot_id)
+
+
+def _contended(seeded, strike_on):
+    from loom.catalog import open_catalogs
+
+    _, ontology, config = seeded
+    catalog = Interloper(open_catalogs(config)["local"], config, strike_on=strike_on)
+    return ActionRuntime(ontology=ontology, catalogs={"local": catalog})
+
+
+def test_a_real_commit_in_the_gap_refuses_the_write_and_the_row_is_unchanged(seeded):
+    """M3's definition of done for this slice, against real Iceberg.
+
+    Every attempt loses to a real commit, so the run refuses — and the row it was about is byte for
+    byte what it was. Not rolled back: never written. The assertion rides inside the transaction, so
+    the catalog declined the commit rather than the runtime undoing one."""
+    before = physical(seeded, "crm.customers")
+    runtime = _contended(seeded, strike_on=range(1, MAX_ATTEMPTS + 1))
+
+    result = runtime.run("upgradeTier", {"customer": "c3", "newTier": "gold"})
+
+    assert result.status == REFUSED and result.retryable
+    assert [f.code for f in result.failures] == [CONFLICT]
+    assert result.attempts == MAX_ATTEMPTS
+
+    after = physical(seeded, "crm.customers")
+    c3_before = next(r for r in before if r["id"] == "c3")
+    c3_after = next(r for r in after if r["id"] == "c3")
+    assert c3_after == c3_before, "the contested row was written despite the refusal"
+    assert c3_after["tier"] == "bronze"
+    assert len(after) == len(before)
+    # The interloper's commits are all there. Loom lost the race and left the winner alone.
+    assert next(r for r in after if r["id"] == "c1")["region"] == f"apac-{MAX_ATTEMPTS}"
+
+
+def test_the_conflict_detail_names_real_snapshots_and_says_the_table_was_merely_busy(seeded):
+    """The failure an agent has to act on, filled in by a real catalog. `c1` moved and `c3` did not,
+    so nothing this run reads or writes changed — the honest answer is that the table is busy, which
+    is a different decision from "your intent was overtaken"."""
+    runtime = _contended(seeded, strike_on=range(1, MAX_ATTEMPTS + 1))
+
+    result = runtime.run("upgradeTier", {"customer": "c3", "newTier": "gold"})
+
+    detail = result.failures[0].detail
+    assert detail["table"] == "crm.customers"
+    assert isinstance(detail["expectedSnapshotId"], int)
+    assert isinstance(detail["foundSnapshotId"], int)
+    assert detail["expectedSnapshotId"] != detail["foundSnapshotId"]
+    assert detail["changed"] == [] and detail["contended"] is False
+    assert "the table is simply busy" in result.failures[0].message
+
+
+def test_one_commit_in_the_gap_is_retried_and_the_run_applies(seeded):
+    """The common case, and why the conflict is retried here rather than handed back. A
+    table-snapshot check refuses on *any* concurrent commit, so an unrelated write to `c1` refuses a
+    run about `c3` — correct and useless on its own. The retry re-reads, re-evaluates every rule
+    against the row actually about to be written over, and applies."""
+    runtime = _contended(seeded, strike_on=(1,))
+
+    result = runtime.run("upgradeTier", {"customer": "c3", "newTier": "gold"})
+
+    assert result.status == APPLIED, result.failures
+    assert result.attempts == 2
+
+    after = physical(seeded, "crm.customers")
+    assert next(r for r in after if r["id"] == "c3")["tier"] == "gold"
+    # Both writes survived: ours, and the one that beat us to the first attempt.
+    assert next(r for r in after if r["id"] == "c1")["region"] == "apac-1"
+    assert next(r for r in after if r["id"] == "c3")["region"] == "apac"  # unmapped, carried
+
+
+def test_the_snapshot_assertion_is_really_on_the_transaction(seeded):
+    """The guarantee rests on pyiceberg keeping the requirement we stage rather than the one its
+    snapshot producer stages for itself, which is a deduplication rule in a library we do not own.
+    If a release ever changes it, this write must fail loudly — a silent downgrade from a closed
+    race to a narrower one is the single worst outcome available here, because everything above
+    would go on claiming "enforced".
+
+    So: drive the adapter directly with a stale expectation and require a refusal. If the assertion
+    stopped being carried, this commit would simply succeed."""
+    from loom.catalog import open_catalogs
+    from loom.catalog.base import ConcurrencyError
+
+    _, _, config = seeded
+    catalog = open_catalogs(config)["local"]
+    stale = catalog.current_snapshot_id("crm.customers")
+    row = next(r for r in catalog.scan("crm.customers").to_pylist() if r["id"] == "c2")
+
+    # Somebody else commits, so `stale` is now genuinely stale.
+    catalog.replace_row(
+        "crm.customers", "id", "c1",
+        {**next(r for r in catalog.scan("crm.customers").to_pylist() if r["id"] == "c1"), "region": "amer"},
+        expect_snapshot_id=stale,
+    )
+
+    with pytest.raises(ConcurrencyError) as e:
+        catalog.replace_row(
+            "crm.customers", "id", "c2", {**row, "tier": "gold"}, expect_snapshot_id=stale
+        )
+
+    assert e.value.expected == stale
+    assert e.value.found != stale
+    assert e.value.table == "crm.customers"
+    assert next(r for r in physical(seeded, "crm.customers") if r["id"] == "c2")["tier"] == "silver"

@@ -89,8 +89,9 @@ MCP client as typed tools. The **migration path** is complete — `loom plan` cl
 change would do to the physical tables, `loom apply` executes it (bootstrapping an empty warehouse
 from nothing but a spec), and `loom rollback` puts an earlier spec back. And the **action runtime**
 now writes: `loom run` binds an action's parameters, evaluates the validation rules the spec
-declares, and mutates one row as one Iceberg commit. Optimistic concurrency and the edit log are
-the two pieces still to come.
+declares, and mutates one row as one Iceberg commit — with the snapshot its read saw asserted
+inside that commit, so a competing write refuses the run rather than silently losing to it. The
+edit log is the piece still to come.
 
 | Component | State |
 |-----------|-------|
@@ -111,7 +112,7 @@ the two pieces still to come.
 | `renamedFrom` — column renames as field-id remaps | ✅ |
 | Migration rollback | ✅ `loom rollback` |
 | Action runtime — single-object writeback (`action/`) | ✅ `loom run` |
-| Optimistic concurrency — snapshot check | ⏳ recorded, not yet enforced |
+| Optimistic concurrency — snapshot check | ✅ asserted inside the commit |
 | Edit-log (audit) table | ⏳ |
 | MCP `run_<action>` tools + HTTP transport | ⏳ |
 | Governance (row/column policies) | ⏳ |
@@ -125,7 +126,7 @@ the two pieces still to come.
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 355 tests
+pytest                              # 371 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 3 action(s)
 ```
 
@@ -377,8 +378,9 @@ Loom run — upgradeTier on examples/retail/ontology
   modify Customer "c3"
       ~ tier  "bronze" -> "gold"
 
-  read at snapshot 3071900788344075695 — recorded, not yet enforced:
-  the write is one Iceberg transaction; the read before it is not.
+  previewed at snapshot 3071900788344075695 — nothing is held:
+  the run reads again and asserts that read, so a row that moves while you
+  decide is a conflict you are told about, never a silent overwrite.
 
 Run these changes? [y/N] y
 ```
@@ -389,12 +391,13 @@ Run these changes? [y/N] y
   "before": { "customerId": "c3", "name": "Alan Turing", "tier": "bronze", "ltv": null },
   "after":  { "customerId": "c3", "name": "Alan Turing", "tier": "gold",   "ltv": null },
   "readSnapshotId": 3071900788344075695,
-  "concurrency": "recorded, not enforced",
+  "concurrency": "enforced — the write asserts the snapshot the read saw",
+  "attempts": 1,
   "failures": []
 }
 ```
 
-Four rules shape it.
+Five rules shape it.
 
 **A modify carries across the columns nobody declared.** A row-level modify is an equality-delete
 plus an append committed as one transaction, which means it rewrites the *whole* row — so every
@@ -438,11 +441,41 @@ property mentions is left alone rather than dropped. A declared `delete` action 
 silence — someone wrote the word and named the key. The scopes differ too: never-drop governs
 schema, and Loom still never drops a column or a table, in any command.
 
-One thing this slice deliberately does *not* do: close the gap between the read and the write. The
-write is one Iceberg transaction; the read before it is a separate one, and between them the row
-can move. So the snapshot each read saw is **recorded and not checked**, the result says exactly
-that, and `conflict` exists as the one retryable failure code with nothing yet raising it. A
-snapshot id printed without that sentence would read as a guarantee.
+**The gap between the read and the write is closed, and "closed" is meant literally.** The snapshot
+the read saw is carried into the write and asserted *inside the commit* — an Iceberg
+`assert-ref-snapshot-id` requirement the catalog validates against live metadata as the table's
+metadata pointer swaps. Not a re-read and a comparison in the runtime: that leaves a window between
+deciding and committing, which narrows the race rather than closing it, and would have meant writing
+"narrowing" here.
+
+What is asserted is the **table's** snapshot, because Iceberg's commit protocol can assert a ref and
+nothing finer. So a run conflicts with any concurrent commit, including one to a row it never touched
+— coarse, and chosen: the only narrower test is comparing the row, and a row comparison can't be
+carried into a commit. Two things follow. A competing write to a column the ontology never mapped
+*is* a conflict, not because Loom looked at it but because a modify writes it back from a stale read
+— Loom won't inspect that column and won't overwrite it blind. And the runtime absorbs the false
+conflicts itself, retrying up to three times, re-reading and re-evaluating every rule against the row
+actually about to be written over. `attempts` is on the result, because "applied" after three
+internal re-reads is a different fact from "applied":
+
+```jsonc
+{ "status": "refused", "attempts": 3, "failures": [{
+    "code": "conflict",
+    "message": "Customer 'c3' could not be written: the table moved between the read and the write, after 3 attempts — tier changed under it",
+    "detail": { "table": "crm.customers", "expectedSnapshotId": 3071900788344075695,
+                "foundSnapshotId": 8442119003518827741, "attempts": 3,
+                "changed": ["tier"], "contended": true },
+    "retryable": true }] }
+```
+
+`contended` is the field that matters: an agent told only "conflict, retry" will hammer a table that
+is merely busy and give up just as readily when its intent has genuinely been overtaken. And where a
+competing write really does invalidate the action, the retry doesn't paper over it — the run comes
+back `validation_failed` or `object_not_found`, the real reason.
+
+Note what the prompt above does *not* say. It doesn't hold the row while you decide: the run does its
+own read and asserts that one, so what you approve is the shape of the change. That's the only answer
+that can also be true of `run_<action>`, which has no prompt at all.
 
 The validator accumulates every problem and reports them in one pass with source locations:
 

@@ -12,13 +12,18 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .base import CatalogError, Column, SchemaEdit, TableSchema
+from .base import CatalogError, Column, ConcurrencyError, SchemaEdit, TableSchema
 
 _DECIMAL = re.compile(r"^decimal\((\d+),\s*(\d+)\)$")
+
+_MAIN = "main"
+"""The branch every Loom write targets. Loom has no branch or tag vocabulary — `scan` reads the
+table, so the ref a write must be asserted against is the one a read would have seen."""
 
 
 def canonical_iceberg_type(t: object) -> str:
@@ -269,41 +274,121 @@ class PyIcebergCatalog:
 
     # --- RowWriter -----------------------------------------------------------------------
     # One row, addressed by key. No batch verb and no predicate: the spec's single-object boundary
-    # is enforced here by the absence of a way to express anything wider.
+    # is enforced here by the absence of a way to express anything wider. Every verb goes through
+    # `_guarded`, so there is no path through this class that writes a row without asserting the
+    # snapshot its caller read.
 
-    def insert_row(self, table: str, row: Mapping[str, Any]) -> None:
-        tbl = self._load(table)
-        try:
-            tbl.append(self._batch(tbl, [row]))
-        except Exception as e:
-            raise CatalogError(f"could not insert into '{table}' in catalog '{self.name}': {e}") from e
+    def insert_row(self, table: str, row: Mapping[str, Any], *, expect_snapshot_id: int | None) -> None:
+        with self._guarded(table, expect_snapshot_id, "insert into") as (tbl, txn):
+            txn.append(self._batch(tbl, [row]))
 
     def replace_row(
-        self, table: str, key_column: str, key_value: Any, row: Mapping[str, Any]
+        self,
+        table: str,
+        key_column: str,
+        key_value: Any,
+        row: Mapping[str, Any],
+        *,
+        expect_snapshot_id: int | None,
     ) -> None:
-        tbl = self._load(table)
-        try:
-            batch = self._batch(tbl, [row])
+        with self._guarded(table, expect_snapshot_id, "replace a row in") as (tbl, txn):
             # `overwrite` inside a transaction *is* the equality-delete plus append: pyiceberg
             # drops or rewrites the files matching the filter and adds the new row, and the whole
             # thing lands as one Iceberg commit. A reader sees the old row or the new one — never
             # neither, and never both.
-            with tbl.transaction() as txn:
-                txn.overwrite(batch, overwrite_filter=self._key_filter(key_column, key_value))
-        except Exception as e:
-            raise CatalogError(
-                f"could not replace a row in '{table}' in catalog '{self.name}': {e}"
-            ) from e
+            txn.overwrite(
+                self._batch(tbl, [row]), overwrite_filter=self._key_filter(key_column, key_value)
+            )
 
-    def delete_row(self, table: str, key_column: str, key_value: Any) -> None:
+    def delete_row(
+        self, table: str, key_column: str, key_value: Any, *, expect_snapshot_id: int | None
+    ) -> None:
+        with self._guarded(table, expect_snapshot_id, "delete a row from") as (_tbl, txn):
+            txn.delete(delete_filter=self._key_filter(key_column, key_value))
+
+    @contextmanager
+    def _guarded(self, table: str, expect_snapshot_id: int | None, doing: str):
+        """One row write, as one Iceberg commit that asserts the snapshot its caller read.
+
+        The assertion is a `TableRequirement` on the transaction, not a comparison in this process,
+        and that distinction is the whole of the port's promise. pyiceberg hands the requirements to
+        the catalog with the updates; the catalog validates them against metadata it re-reads
+        itself and then swaps the metadata pointer conditionally on the location it validated
+        against. A commit that lands in between loses. There is no window here to narrow.
+
+        Two orderings are load-bearing:
+
+        - The requirement is staged **before** the caller's write op. pyiceberg keeps at most one
+          requirement per type, first one in winning, and every snapshot-producing update stages an
+          `AssertRefSnapshotId` of its own carrying the snapshot the *transaction* opened at. Going
+          first is what replaces that with the snapshot the *read* saw — the difference between
+          asserting against a table we loaded a microsecond ago and asserting against the row we
+          actually evaluated the rules on.
+        - The staged requirement is re-checked before the commit. That guarantee rests on a
+          library's deduplication rule, so if a pyiceberg release ever changes it the write must
+          fail loudly rather than quietly commit under the weaker assertion.
+        """
+        from pyiceberg.exceptions import CommitFailedException
+        from pyiceberg.table.update import AssertRefSnapshotId
+
         tbl = self._load(table)
-        try:
-            with tbl.transaction() as txn:
-                txn.delete(delete_filter=self._key_filter(key_column, key_value))
-        except Exception as e:
+        # `tbl.transaction()` bare rather than `with tbl.transaction()`: the context manager commits
+        # on the way out, including on the way out of a failure, and the one thing every refusal here
+        # has to promise is that nothing was written.
+        txn = tbl.transaction()
+        if not hasattr(txn, "_stage"):  # pragma: no cover - guards a pyiceberg API change
             raise CatalogError(
-                f"could not delete a row from '{table}' in catalog '{self.name}': {e}"
-            ) from e
+                f"refusing to write '{table}' in catalog '{self.name}': this pyiceberg cannot be "
+                f"asked to assert a snapshot on a transaction, so the write would commit without a "
+                f"concurrency check"
+            )
+        try:
+            txn._stage((), (AssertRefSnapshotId(ref=_MAIN, snapshot_id=expect_snapshot_id),))
+            yield tbl, txn
+            self._still_asserted(txn, table, expect_snapshot_id)
+            txn.commit_transaction()
+        except CommitFailedException as e:
+            # Every requirement on this transaction is about the table having moved — ours, and the
+            # table-uuid one `commit_transaction` adds, which fails when the table was replaced
+            # wholesale. The metastore's own "updated by another process" arrives here too.
+            raise self._conflict(table, expect_snapshot_id, e) from e
+        except CatalogError:
+            raise
+        except Exception as e:
+            raise CatalogError(f"could not {doing} '{table}' in catalog '{self.name}': {e}") from e
+
+    @staticmethod
+    def _still_asserted(txn: Any, table: str, expected: int | None) -> None:
+        from pyiceberg.table.update import AssertRefSnapshotId
+
+        staged = [r for r in txn._requirements if isinstance(r, AssertRefSnapshotId)]
+        if len(staged) == 1 and staged[0].ref == _MAIN and staged[0].snapshot_id == expected:
+            return
+        raise CatalogError(  # pragma: no cover - guards a pyiceberg API change
+            f"refusing to write '{table}': the snapshot assertion for {expected!r} did not survive "
+            f"onto the transaction (found {[(r.ref, r.snapshot_id) for r in staged]!r}). "
+            f"pyiceberg's requirement handling has changed and this write would have committed "
+            f"under a weaker check, or none"
+        )
+
+    def _conflict(self, table: str, expected: int | None, cause: Exception) -> ConcurrencyError:
+        """The refusal, with the snapshot the table is at *now* attached as a diagnosis.
+
+        Best-effort and deliberately not authoritative: it is read after the refusal, so on a busy
+        table it may already be newer than the commit that actually won. It is there to tell an
+        agent 'the table moved' apart from 'the table is moving constantly', not to be branched on.
+        """
+        try:
+            found = self.current_snapshot_id(table)
+        except CatalogError:  # pragma: no cover - the table was there a moment ago
+            found = None
+        return ConcurrencyError(
+            f"'{table}' in catalog '{self.name}' moved between the read and the write "
+            f"(expected snapshot {expected}, found {found}): {cause}",
+            table=table,
+            expected=expected,
+            found=found,
+        )
 
     @staticmethod
     def _key_filter(key_column: str, key_value: Any):

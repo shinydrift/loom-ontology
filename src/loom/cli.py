@@ -196,6 +196,18 @@ def cmd_run(args) -> int:
     print(json.dumps(json_safe(result.as_json()), indent=2, default=str))
     for failure in result.failures:
         print(f"error: {failure.code}: {failure.message}", file=sys.stderr)
+    if result.read_snapshot_id != preview.read_snapshot_id:
+        # The one thing the preview promised to tell them. The CLI is the only caller with a
+        # before-and-after to compare, so it is the only one that can say the thinking time
+        # mattered — and staying quiet would let the previewed diff pass for what was applied.
+        print(
+            f"note: the table moved while you decided (previewed at {preview.read_snapshot_id}, "
+            f"ran at {result.read_snapshot_id}) — the result above is what happened, not the "
+            f"preview above it.",
+            file=sys.stderr,
+        )
+    if result.attempts > 1:
+        print(f"note: {result.attempts} attempts — the row was contended.", file=sys.stderr)
     print(f"{result.status} · {result.object_type} {result.key!r}", file=sys.stderr)
     return 0 if result.ok else 1
 
@@ -227,9 +239,15 @@ def _render_run(result, title: str) -> str:
             if result.after is not None and before.get(name) != after.get(name):
                 lines.append(f"      ~ {name}  {show(before.get(name))} -> {show(after.get(name))}")
     if result.read_snapshot_id is not None:
-        # Said out loud, because a snapshot id printed on its own would read as something checked.
-        lines.append(f"\n  read at snapshot {result.read_snapshot_id} — recorded, not yet enforced:")
-        lines.append("  the write is one Iceberg transaction; the read before it is not.")
+        # Said out loud, because a snapshot id printed above a y/N prompt would otherwise read as a
+        # hold on the table — as if answering slowly were safe because this version was reserved.
+        # It is not reserved: this is a preview, and the run that follows does its own read and
+        # asserts *that*. So what the prompt asks a person to approve is the shape of the change,
+        # which is the only thing it can honestly ask about, and the only thing `run_<action>` —
+        # which has no prompt at all — could ever be said to approve either.
+        lines.append(f"\n  previewed at snapshot {result.read_snapshot_id} — nothing is held:")
+        lines.append("  the run reads again and asserts that read, so a row that moves while you")
+        lines.append("  decide is a conflict you are told about, never a silent overwrite.")
     for failure in result.failures:
         lines.append(f"\n  ! {failure.code}: {failure.message}")
     if result.failures:

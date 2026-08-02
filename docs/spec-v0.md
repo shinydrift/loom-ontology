@@ -289,8 +289,9 @@ effects:
 6. `validation[].rule` and every `<expr>` reference **only** declared parameters and
    properties of the target object (see §5) — no free variables. `object.<prop>` is in scope for
    `modify`/`delete` only: a `create` has no prior object.
-7. **Concurrency is implicit:** `modify`/`delete` are read-modify-write under optimistic
-   concurrency (version/snapshot check). No YAML expresses it; the runtime always does it.
+7. **Concurrency is implicit:** every operation is read-then-write under optimistic concurrency —
+   the write asserts the snapshot the read saw, inside the same commit. No YAML expresses it; the
+   runtime always does it, for `create` as well as `modify`/`delete` (§4.1 says why all three).
 
 ### 4.1 What running an action actually does
 
@@ -334,12 +335,69 @@ cause is an exception. A run comes back with a status (`applied` · `previewed` 
 `message`, verbatim. Every rule is evaluated rather than stopping at the first failure, for the
 same reason `loom validate` reports every problem at once.
 
-**Concurrency, honestly.** The *write* is one Iceberg transaction. The read and the write together
-are two, and rule 7 above is not yet true: the runtime **records** the snapshot each read saw and
-does not check it. It says so — a result carries `concurrency: "recorded, not enforced"`, and
-`conflict` is the one retryable code, defined and raised by nothing until the check lands. The
-snapshot is read *before* the rows, so the recorded id is at-or-before the data: a check against it
-can report a conflict that wasn't one, but can never miss one that was.
+**Concurrency, and what it is a guarantee about.** Rule 7 is now true. The runtime records the
+snapshot each read saw and hands it to the write, which asserts it **inside the commit** — for
+Iceberg, an `assert-ref-snapshot-id` requirement the catalog validates against live metadata as the
+table's metadata pointer swaps. A run that loses is declined before it commits, so it changes
+nothing, exactly as every other refusal does; it comes back `conflict`, the one retryable code.
+
+The distinction that word is doing work for: this is not a re-read and a comparison. A runtime that
+compares and then writes has a window between deciding and committing — it *narrows* the race rather
+than closing it, and "optimistic concurrency" is a phrase that promises closed. The check is carried,
+not performed.
+
+**What counts as the row moving: the whole table.** The check asserts the table's snapshot, so a
+commit anywhere in the table conflicts with a run that had nothing to do with it. That coarseness is
+chosen. Iceberg's commit protocol can assert a ref's snapshot and nothing finer, so the only narrower
+test is comparing the row itself — and a row comparison cannot be carried into a commit, which would
+trade the guarantee for the precision. Coarse-and-closed beats narrow-and-open.
+
+Two consequences follow, and both are deliberate. **A competing write to a column no property maps is
+a conflict**, which is the answer to the question the carry-across rule above leaves open — not
+because the runtime inspected the column (it inspects none), but because a `modify` writes that
+column back from a read taken before the competing commit, so committing anyway would restore a stale
+value over somebody else's newer one. Loom will not read that column and will not overwrite it blind.
+And **false conflicts exist by construction**: the snapshot is read *before* the rows, so the recorded
+id is at-or-before the data, and the check reports conflicts that weren't ones but can never miss one
+that was. The other order silently blesses a lost update.
+
+**A conflict is retried inside the run, up to three times, and the result says how many.** That is
+what makes the coarse check usable: something has to absorb the conflicts it invents, and pushing
+that onto every caller means every caller writing the same retry loop. Each attempt re-reads and
+re-evaluates every rule and every effect expression against the row actually about to be written
+over — never a replay, which would write values computed against a row that no longer exists. A retry
+can therefore succeed against a row the caller never saw; what makes that sound is that
+`validation` rules *are* the caller's statement of which states it will act on, and they are checked
+against the newer row. Where a competing write genuinely invalidates the action, the retry reports
+the real reason — `validation_failed`, `object_not_found` — rather than a conflict inviting an agent
+to retry something that cannot succeed. `attempts` is on the result because "applied" after three
+internal re-reads is a different fact from "applied".
+
+**All three operations are checked, each for its own reason.** `modify`, for the carry-across above.
+`create`, because its read is the primary-key existence check and two concurrent creates both pass
+it, then both append — manufacturing exactly the duplicate row the runtime refuses as `ambiguous_key`
+ever after and can never repair; checked, only one can commit against the snapshot both read. (This
+guarantees nothing about a writer that isn't Loom, which is why `ambiguous_key` stays.) `delete`,
+because it is the only irreversible one: a conflicting modify can be re-applied and a conflicting
+create refuses cleanly, but a delete that lost a race is gone, and the competing write may have been
+a `modify` rather than another delete — in which case the row is not "already gone", it changed. When
+the competing write really was a delete, the retry re-reads, finds nothing, and returns
+`object_not_found`, which is that outcome stated accurately.
+
+**What `conflict` carries.** Not just "retry": an agent told only that will hammer a table that is
+merely busy and give up just as readily when its intent has genuinely been overtaken. `detail` holds
+the table, `expectedSnapshotId` and `foundSnapshotId` (the latter advisory — read after the refusal,
+so on a hot table it may already be past the commit that won), `attempts`, `changed` — the **declared
+properties** that moved, diffed through the same projection `before`/`after` use, so unmapped columns
+are compared no more than they are reported — and `contended`, whether any of those are properties
+this action reads in a rule or writes in an effect. A busy table and a contested row are different
+situations, and the message says which.
+
+**The confirmation prompt is outside the window.** `loom run` previews, asks, then runs — and the
+run does its own read, which is the one it asserts. A human's thinking time is therefore not inside
+the transaction, and what the prompt asks a person to approve is the *shape* of the change. That is
+also the only answer that can be true of both callers: `run_<action>` has no prompt at all, so a
+design in which the checked snapshot came from a preview is one the MCP caller could never join.
 
 ---
 
@@ -627,7 +685,10 @@ Named deliberately so they're conscious deferrals, not gaps:
 - **Complex types** — `array`/`struct`/`map` (see §1).
 - **Computed / derived properties** — properties backed by an expression rather than a column.
 - **Multi-object actions** — the explicit post-v1 feature the §4 boundary reserves room for.
-- **Optimistic concurrency** — §4.1 records the snapshot each read saw and does not yet check it.
+- **Row-level conflict detection** — §4.1's check is the *table's* snapshot, because Iceberg's
+  commit protocol can assert a ref and nothing finer, so a run conflicts with unrelated writes to the
+  same table. Narrowing it needs a row-level precondition the format does not have; comparing rows in
+  the runtime instead would reopen the race the check exists to close, so it is not the answer.
 - **Governance and the carry-across** — a `modify` carries every column the ontology does not map
   (§4.1), which is a superset of what §6's `governance.policies` will let a caller read. Whether a
   masked column is carried (it must be, or the write destroys it) or the write is refused is a
