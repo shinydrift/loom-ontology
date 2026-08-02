@@ -5,8 +5,10 @@ An engine does two things: turn a `Plan` into something executable (`compile`) a
 storage, which is how the SQL an adapter generates gets asserted directly in tests instead of
 only inferred from query results.
 
-`capabilities()` is what the serve-time negotiation in M4 reads, and what lets the write path
-later choose a native `MERGE` where one exists.
+`capabilities()` is read by `negotiate.py`, which refuses to wire an ontology to an engine that
+cannot serve the surface it generates — and it is *also* what lets the write path later choose a
+native `MERGE` where one exists. Those are two different kinds of fact and the dataclass says which
+is which.
 """
 
 from __future__ import annotations
@@ -24,11 +26,28 @@ class EngineError(RuntimeError):
 
 @dataclass(frozen=True)
 class Capabilities:
+    """What an adapter can do — and two kinds of fact live here, which is worth saying because it
+    looked for a while like one of them was in the wrong place.
+
+    A **requirement** is something a spec can demand and an engine can therefore fail: declare a
+    link and a traverse needs a join, declare a string property searchable and a filter needs a
+    case-insensitive LIKE. `negotiate.py` reads those, and a mismatch refuses to start.
+
+    A **routing hint** is something no spec can demand, because there is a path that works without
+    it. `native_merge` is the only one: writes go through the catalog's `RowWriter` — which every
+    catalog implements — so an engine that cannot `MERGE` is a slower way to serve an ontology and
+    never a reason to refuse one. It sits on this dataclass rather than somewhere on the write path
+    because it is a fact about the *engine*, and this is where an engine is asked what it is; that
+    the engine only reads today does not make the question a read-path question.
+
+    `negotiate.NEGOTIATED` / `NOT_NEGOTIATED` cover these fields exactly, under a test, so adding a
+    flag here forces the choice between the two kinds rather than quietly making a third."""
+
     name: str
     joins: bool = True
     offset: bool = True
     case_insensitive_like: bool = True
-    native_merge: bool = False  # write path (M3+): can the engine MERGE, or must writes go via the catalog?
+    native_merge: bool = False  # routing hint, never negotiated — see above
 
 
 @dataclass(frozen=True)

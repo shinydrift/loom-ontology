@@ -110,8 +110,17 @@ a time**, deliberately and out loud, because the DuckDB connection and the resol
 built once per process and making them per-caller is the same change governance needs. And the write
 surface is bounded by the **bind**: `mcp.writes: true` refuses to start on anything but a loopback
 address, because `mcp.actor` names a deployment rather than a caller, and that is only an honest
-thing to record while the set of callers is the same one that could already run the binary. What's
-left in M4 is capability negotiation; after that, governance.
+thing to record while the set of callers is the same one that could already run the binary.
+
+That leaves M4 complete, because a spec and an engine are now **negotiated** before they are wired
+together. An ontology implies things an engine has to be able to do — a declared link means a
+traverse joins two tables, a searchable string property means a filter is a case-insensitive LIKE,
+and the page arguments on every read tool mean a second page is an `OFFSET` — and an engine that
+cannot do one of them is refused rather than served narrowly. Refused, because the alternatives are
+to make the generated surface a function of the engine instead of the spec, or, worse, to quietly
+match exactly where the spec promised substring: that one returns rows, so nothing fails and the
+agent believes an answer that is wrong. The check sits where the two are paired rather than at
+serve, so `loom query` refuses exactly what `loom serve` refuses. Next is governance.
 
 | Component | State |
 |-----------|-------|
@@ -136,7 +145,7 @@ left in M4 is capability negotiation; after that, governance.
 | Edit-log (audit) table | ✅ `_loom_meta.edits` |
 | MCP `run_<action>` tools | ✅ `mcp.writes: true` |
 | HTTP transport | ✅ `mcp.transport: http` |
-| Capability negotiation | ⏳ |
+| Capability negotiation | ✅ refused at wiring, not narrowed |
 | Governance (row/column policies) | ⏳ |
 
 `docs/spec-v0.md` is the full grammar — the framework's public contract.

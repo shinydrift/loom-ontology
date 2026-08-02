@@ -103,6 +103,7 @@ def cmd_query(args) -> int:
 
     from .catalog import CatalogError
     from .mcp.registry import json_safe
+    from .negotiate import CapabilityError
     from .resolver import ResolverError, build_resolver
 
     # Argument shape first, before anything opens a catalog — a typo'd flag shouldn't need a
@@ -127,7 +128,10 @@ def cmd_query(args) -> int:
             rows = [row] if row else []
         else:
             rows = resolver.search(args.object_type, filters, limit=args.limit)
-    except (ResolverError, CatalogError) as e:
+    except (ResolverError, CatalogError, CapabilityError) as e:
+        # A `CapabilityError` reaches here for the same reason `loom query` mirrors the generated
+        # tools at all: if the dev command can read out of an engine the served surface refuses to
+        # stand on, the ontology has a back door.
         print(f"error: {e}", file=sys.stderr)
         return 1
 
@@ -288,11 +292,15 @@ def cmd_serve(args) -> int:
 
     from .catalog import CatalogError
     from .mcp.server import build_server, serve_http, serve_stdio
+    from .negotiate import CapabilityError
 
     try:
         server, _ = build_server(ontology, config)
-    except CatalogError as e:
-        # Better to refuse to start than to advertise tools that will fail on every call.
+    except (CatalogError, CapabilityError) as e:
+        # Better to refuse to start than to advertise tools that will fail on every call. A
+        # capability mismatch is the second half of that sentence: an engine without OFFSET fails
+        # not on every call but on the second page, which is the worse shape — it works until it
+        # doesn't, and by then a client has the tool list.
         print(f"error: {e}", file=sys.stderr)
         return 1
 

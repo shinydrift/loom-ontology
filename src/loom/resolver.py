@@ -258,9 +258,25 @@ class Resolver:
 
 
 def build_resolver(ontology: Ontology, config, catalogs: Mapping[str, Any] | None = None) -> Resolver:
-    """Wire an ontology to the engine and catalogs named in a project config."""
+    """Wire an ontology to the engine and catalogs named in a project config.
+
+    **This is where an engine is negotiated with, and "at serve" was the wrong place for it.** M4's
+    box says capability negotiation happens at serve, which is where it is *observed* rather than
+    where it belongs: this function is the one place a spec and an engine are paired, so checking
+    here means `loom query` refuses exactly what `loom serve` refuses. Putting it in `cmd_serve`
+    would leave a dev command reading successfully out of an engine the served surface will not
+    stand on — the same shape as the back door `loom query` was deliberately built not to be, and
+    the same principle M5 states for governance: enforce below MCP so a direct call and an agent
+    call get the same answer.
+
+    It is not an invariant of `Resolver` itself, which stays constructible from any engine. That is
+    what lets a test drive the resolver with a fake, and an adapter be exercised before anybody has
+    decided which ontology it will serve; the pairing is what has to be checked, not the pair."""
     from .catalog import open_catalogs
+    from .negotiate import check_capabilities
     from .query.engines import open_engine
 
     open_cats = catalogs if catalogs is not None else open_catalogs(config)
-    return Resolver(ontology=ontology, engine=open_engine(config.engine, open_cats))
+    engine = open_engine(config.engine, open_cats)
+    check_capabilities(ontology, engine.capabilities())
+    return Resolver(ontology=ontology, engine=engine)

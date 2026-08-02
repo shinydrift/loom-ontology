@@ -378,6 +378,39 @@ def test_a_malformed_param_is_caught_before_any_catalog_is_opened(tmp_path, caps
     assert "--param expects NAME=VALUE" in capsys.readouterr().err
 
 
+def test_serve_refuses_an_engine_that_cannot_serve_the_surface(tmp_path, capsys, monkeypatch):
+    """A capability mismatch stops the server rather than starting a degraded one.
+
+    It reaches `cmd_serve` as an error and not a traceback for the same reason an unopenable
+    catalog does — better to refuse to start than to advertise tools that fail. The shape is worse
+    here, though, and the test names it: an engine missing OFFSET would serve page 1 of every
+    query and fail page 2, so it works until it doesn't, by which time a client holds the tool
+    list.
+
+    Nothing is spawned. The refusal happens inside `build_server`, before `cmd_serve` reaches a
+    transport to block on."""
+    pytest.importorskip("pyiceberg", reason="needs the [iceberg] extra")
+    from loom.query.engine import Capabilities
+
+    class Pageless:
+        def capabilities(self):
+            return Capabilities(name="pageless", offset=False)
+
+        def compile(self, plan):  # pragma: no cover - never reached
+            raise AssertionError("refused before anything compiled")
+
+        def execute(self, compiled):  # pragma: no cover - never reached
+            raise AssertionError("refused before anything executed")
+
+    monkeypatch.setattr("loom.query.engines.open_engine", lambda cfg, cats: Pageless())
+    ontology = _project(tmp_path)
+    assert main(["serve", str(ontology)]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ")
+    assert "engine 'pageless' cannot serve this ontology" in err
+    assert "offset" in err
+
+
 def test_the_serve_banner_says_whether_this_server_can_write(tmp_path):
     """"How many tools" does not answer "can this change my lake", so the banner answers it
     separately, in both modes.
