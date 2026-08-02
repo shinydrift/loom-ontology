@@ -10,8 +10,17 @@ Ten rules shape the package. Each had an obvious-looking alternative:
   `CatalogWriter` changes a table's shape, `RowWriter` changes its rows, `EditLogWriter` appends to
   `_loom_meta.edits` — and none of them extends another. `loom apply` cannot delete a row and an
   action cannot alter a schema, not by policy but because the port each holds has no verb for it.
-  The runtime asks for its writers per run, for the one catalog the target object binds, so nothing
-  in a serving process holds a row-writable handle between calls.
+  The runtime asks for its writers per run, for the one catalog the target object binds, so it holds
+  no row-writable *typed* reference between calls and `row_writer_for()` stays the one place the
+  write plane is named at a call site.
+
+  That sentence used to end "so nothing in a serving process holds a row-writable handle between
+  calls", and `run_<action>` is why it does not. A serving process holds `Catalog`s, and a catalog
+  that implements every port — every real one does — is one function call from being a row writer
+  whatever the runtime does with it, so the handle rule stops being load-bearing the moment a
+  long-lived process can write at all. What survives it is stronger, and a fake can prove it: the
+  runtime holds a `RowWriter` and an `EditLogWriter` and never a `CatalogWriter`, so **a serving
+  process can change the rows the spec's actions declare and no schema at all.**
 
   The fourth port was the edit log's first question and the count is the honest thing to change:
   writing the log through `insert_row` would have needed a snapshot expectation the append does not
@@ -104,6 +113,14 @@ Ten rules shape the package. Each had an obvious-looking alternative:
   started `loom serve` and stamps every caller with the same string. So the actor is an argument, the
   CLI passes it in at the one call site where it is true, and when nobody supplies one the log
   records `unknown` — which is worth more than a confident wrong answer.
+
+  The MCP caller now exists and supplies `mcp.actor` — a value an *operator declared*, never one
+  Loom inferred, which is the whole distinction the rule was about. Unset, a served run records
+  `unknown`, and that is the honest answer rather than a gap: stdio has no authentication, no
+  principal and no identity in the protocol, so the edit log over stdio answers what was done, to
+  which row, when, with which parameters and whether it refused — and does not answer *who*, because
+  the transport has nobody to name. A client-supplied actor was the other option and is worse than
+  `unknown`: an audit record whose subject fills in its own name is self-attestation.
 
 - **`operation: delete` does not contradict "Loom never drops".** Never-drop is about *inference* —
   Loom refusing to conclude a destruction from **silence** in a spec, because a column no property

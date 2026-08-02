@@ -16,3 +16,13 @@ engine:
 mcp:
   name: loom-retail
   transport: stdio
+  # Uncomment to expose the three declared actions as `run_` tools. Off by default: declaring an
+  # action and serving it to every client that connects are different decisions, and `loom serve`
+  # was a read-only command for long enough that deployments were pointed at real lakes on that
+  # basis. `loom run` reaches the same runtime either way.
+  #
+  # `actor` is what a served run is recorded as in `_loom_meta.edits`. Declared by you, never
+  # inferred by Loom — over stdio there is no authenticated caller to name, and a log that says
+  # `unknown` beats one that confidently names whoever started the process.
+  # writes: true
+  # actor: agent:support-bot

@@ -5,15 +5,32 @@ from `PropType.json_schema()`, and the descriptions from the spec's own `descrip
 is the whole point of the spec being the single source of truth — the agent-facing contract is
 *derived*, so it cannot drift from the model the resolver enforces.
 
-The generated surface is fixed (spec §7) and read-only in M1:
+The generated surface is fixed (spec §7):
 
     get_<object>      one object by primary key
     search_<object>   filter by declared `searchable` properties
     list_<object>     a page of objects
     traverse          one hop along a declared link
+    run_<action>      one declared action, against one row
 
-`run_<action>` joins them when the action runtime lands (M3/M4). There is deliberately no tool
-that accepts a predicate, a column, a table, or a query string.
+There is deliberately no tool that accepts a predicate, a column, a table, or a query string.
+
+**Two argument namespaces, and they never mix.** Names that come from the spec's vocabulary live
+inside a nested object; names Loom chose live at the top level. `search_<object>` was already built
+this way — declared property filters under `filter`, `limit`/`offset` beside it — and
+`run_<action>` follows it: declared parameters under `parameters`, `dryRun` beside it. Stating the
+rule rather than repeating the shape is what makes the collision impossible: an action may declare
+a parameter called `dryRun`, or `limit`, or `filter`, and none of them can shadow an argument Loom
+means something by. `get_<object>` and `traverse` are the same rule seen from the other side — their
+top-level names (`key`, `objectType`, `link`) are Loom's words, and only the *types* behind them come
+from the spec.
+
+**Where the read tools and the write tools differ, and where they don't.** A `run_` tool takes a
+runtime instead of a resolver, because a modify must see the whole physical row and the resolver
+projects one down to declared properties. Everything else is the same bargain: the name comes from
+the api name, the schema from the declared parameter types, the description from the spec's own
+`description`, and the result is `ActionResult.as_json()` serialized — a shape the runtime defined,
+not one this layer composes.
 """
 
 from __future__ import annotations
@@ -23,12 +40,22 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from ..model import ObjectType
+from ..model import Action, ObjectType
 from ..resolver import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Resolver
 
+if TYPE_CHECKING:
+    from ..action import ActionRuntime
+
 TRAVERSE_TOOL = "traverse"
+
+PARAMETERS_ARG = "parameters"
+DRY_RUN_ARG = "dryRun"
+RESERVED_RUN_ARGS = (PARAMETERS_ARG, DRY_RUN_ARG)
+"""The complete top level of a `run_` tool. Nothing derived from a spec ever appears here — see the
+module docstring — so this tuple is also the assertion that a declared parameter cannot widen the
+surface with a name Loom reserves."""
 
 _PAGE_SCHEMA = {
     "limit": {
@@ -79,8 +106,16 @@ def json_safe(value: Any) -> Any:
     return value
 
 
-def build_tools(resolver: Resolver) -> list[ToolSpec]:
-    """Introspect the resolver's ontology into the full read tool set."""
+def build_tools(
+    resolver: Resolver,
+    runtime: ActionRuntime | None = None,
+    actor: str | None = None,
+) -> list[ToolSpec]:
+    """Introspect the ontology into the tool set this deployment exposes.
+
+    The read tools always. The `run_` tools only when a runtime is supplied, which is `loom serve`'s
+    way of saying `mcp.writes` is on — the surface is what the deployment permits, not what the spec
+    declares, and the banner counts what was built rather than what could have been."""
     tools: list[ToolSpec] = []
     for obj in resolver.ontology.object_types.values():
         tools.append(_get_tool(resolver, obj))
@@ -88,7 +123,33 @@ def build_tools(resolver: Resolver) -> list[ToolSpec]:
         tools.append(_list_tool(resolver, obj))
     if resolver.ontology.link_types:
         tools.append(_traverse_tool(resolver))
+    if runtime is not None:
+        for action in resolver.ontology.actions.values():
+            tools.append(_run_tool(runtime, action, actor))
     return tools
+
+
+# ---- status ---------------------------------------------------------------------
+
+_STATUS_LABEL = {"deprecated": "DEPRECATED", "experimental": "EXPERIMENTAL"}
+
+
+def _described(status: str, text: str) -> str:
+    """A tool description, carrying the spec's `status` when it is not `active`.
+
+    `status` is on every objectType, linkType and action, and until now nothing read it. It is read
+    here, and the choice is to **label rather than hide** — for a reason that is about Loom's shape
+    rather than about taste. Hiding a deprecated action would leave `loom run` able to run something
+    the tool surface denies, which is the exact back door `loom run` exists to not be; the only way
+    to hide it honestly would be to make the runtime refuse it, turning a surface label into a
+    kill switch and making `status: deprecated` mean "broken". It is also the form that works on the
+    caller this surface is for: an agent reads descriptions afresh every session and has no memory of
+    a deprecation notice, so the notice has to be in the thing it reads.
+
+    Narrowing a surface for a real deployment is a different question with its own answers —
+    `mcp.writes` for the write half, §6's governance policies for the rest."""
+    label = _STATUS_LABEL.get(status)
+    return f"{label} — {text}" if label else text
 
 
 # ---- per-object tools ----------------------------------------------------------
@@ -119,7 +180,7 @@ def _get_tool(resolver: Resolver, obj: ObjectType) -> ToolSpec:
 
     return ToolSpec(
         name=f"get_{snake_case(obj.api_name)}",
-        description=f"Fetch one {_subject(obj)} by its {pk.name}.",
+        description=_described(obj.status, f"Fetch one {_subject(obj)} by its {pk.name}."),
         input_schema=schema,
         handler=handler,
     )
@@ -158,7 +219,7 @@ def _search_tool(resolver: Resolver, obj: ObjectType) -> ToolSpec:
     searchable = ", ".join(filterable) or "no properties are declared searchable"
     return ToolSpec(
         name=f"search_{snake_case(obj.api_name)}",
-        description=f"Search {_subject(obj)} by {searchable}.",
+        description=_described(obj.status, f"Search {_subject(obj)} by {searchable}."),
         input_schema=schema,
         handler=handler,
     )
@@ -173,7 +234,7 @@ def _list_tool(resolver: Resolver, obj: ObjectType) -> ToolSpec:
 
     return ToolSpec(
         name=f"list_{snake_case(obj.api_name)}",
-        description=f"List {_subject(obj)}, ordered by {obj.primary_key}.",
+        description=_described(obj.status, f"List {_subject(obj)}, ordered by {obj.primary_key}."),
         input_schema=schema,
         handler=handler,
     )
@@ -197,14 +258,38 @@ def _page(obj: ObjectType, rows: list[dict], args: dict) -> dict:
 
 
 def _traverse_tool(resolver: Resolver) -> ToolSpec:
-    """One generic tool rather than one per link: the link name is data, and enumerating
-    object-type x link as separate tools would grow the surface an agent has to read for no gain."""
+    """One generic tool rather than one per link — and the rule that says so is narrower than it
+    first looked.
+
+    It used to read: *the link name is data, and enumerating object-type x link as separate tools
+    would grow the surface an agent has to read for no gain.* That is true of an action name too, so
+    as written it decides `run_<action>` the wrong way. The rule it was reaching for is about the
+    **schema**, not the name:
+
+        A generic tool is right exactly when the varying element does not change the input schema.
+
+    For `traverse` it does not — `(objectType, key, link, page)` is the same tuple for every link in
+    every ontology, and `link` is a string drawn from an enumerated set. For an action it *is* the
+    schema: `upgradeTier` takes an objectRef and an enum of two values, `recordOrder` takes a string,
+    an objectRef and a `decimal(12,2)`. Collapsing those into one `run(action, params)` means typing
+    `params` as a free-form object, which would be the only place in the generated surface where an
+    agent is handed an untyped bag and "declared types are honored on the way in" stops being
+    structural. So the surface is per action, and the cost is real and paid deliberately: a spec with
+    forty actions generates forty tools. What does not fix that is detyping them; what does is
+    exposing fewer (`mcp.writes`, and eventually §6's policies).
+
+    The status of a link goes in the route catalogue rather than in a prefix, for the same reason
+    the tool is generic: one tool spans many links, and a non-active link is one route among them,
+    not a property of the verb."""
     routes: dict[str, list[str]] = {}
     for name in resolver.ontology.object_types:
         directions = resolver.links_of(name)
         if directions:
             routes[name] = [
-                f"{d.name} -> {d.target_object_type} ({d.link.cardinality})" for d in directions
+                f"{d.name} -> {d.target_object_type} ({d.link.cardinality}"
+                + (f", {d.link.status}" if d.link.status != "active" else "")
+                + ")"
+                for d in directions
             ]
     catalogue = "; ".join(f"from {ot}: {', '.join(links)}" for ot, links in routes.items())
 
@@ -260,4 +345,122 @@ def _traverse_tool(resolver: Resolver) -> ToolSpec:
         ),
         input_schema=schema,
         handler=handler,
+    )
+
+
+# ---- run ------------------------------------------------------------------------
+
+
+def _run_tool(runtime: ActionRuntime, action: Action, actor: str | None) -> ToolSpec:
+    """One declared action as one tool.
+
+    Three things about it are decisions rather than defaults.
+
+    **`parameters` is nested and `dryRun` sits beside it.** The module docstring carries the rule;
+    the consequence worth naming here is that it is what makes `dryRun` safe to add at all. A flat
+    `run_upgrade_tier(customer, newTier, dryRun)` reserves the name `dryRun` out of the spec's own
+    vocabulary, so an ontology that declares a parameter by that name either loses it or fails to
+    serve — a spec that validates and cannot be exposed is the worst seam available. Nested, the
+    question cannot come up.
+
+    **`dryRun` is an inspection verb, not an approval step.** It runs the first three of the four
+    steps and stops before the write, which is exactly what `loom run` prints above its `y/N`. What
+    it deliberately is *not* is a confirmation: nothing links a preview to a later run, no state is
+    carried between them, and a previewed result holds no row and confers no permission — the next
+    run does its own read and asserts *that* one (§4.1, "the prompt is outside the window"). That is
+    also why an MCP caller can have this at all. §4.1 settled the concurrency design on the fact that
+    `run_<action>` has no prompt; a preview that promised anything about the run after it would be
+    the design that decision rejected. What approval there is happens where the human is — in the
+    client's own tool-approval UI — and Loom's part is to make the shape of the change knowable
+    before the write, which is what this is. Without it, `previewed` would be a status no MCP caller
+    could ever see and an agent's only way to learn what an action does would be to do it.
+
+    **The `actor` is bound here, once, from `mcp.actor`.** The runtime takes it per call and never
+    invents one; this closure is the "what its transport authenticated" the runtime's docstring
+    points at, and over stdio the honest value is usually `None` — see `McpConfig.actor`.
+    """
+    target = runtime.ontology.object_types[action.target_object_type]
+    pk = target.pk_property
+
+    props: dict[str, Any] = {}
+    required: list[str] = []
+    for name, param in action.parameters.items():
+        fragment = dict(param.type.json_schema())
+        if param.description:
+            # The spec author's sentence wins over the type's generated one — `objectRef` and
+            # `decimal` both generate a description, and neither knows what the parameter is for.
+            fragment["description"] = param.description
+        if param.default is not None:
+            fragment["default"] = json_safe(param.default)
+        props[name] = fragment
+        if param.required:
+            required.append(name)
+
+    parameters_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": props,
+        "additionalProperties": False,
+        "description": f"the declared parameters of {action.api_name}",
+    }
+    if required:
+        parameters_schema["required"] = required
+
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            PARAMETERS_ARG: parameters_schema,
+            DRY_RUN_ARG: {
+                "type": "boolean",
+                "description": (
+                    "bind, read and validate, then stop before the write and report what would "
+                    "have happened (status 'previewed'). Nothing is held: a run after a preview "
+                    "reads again"
+                ),
+            },
+        },
+        "additionalProperties": False,
+    }
+    if required:
+        # Required only when something inside it is. An action whose parameters all have defaults
+        # can be called with no arguments at all, and saying otherwise would be the schema
+        # contradicting the spec it was generated from.
+        schema["required"] = [PARAMETERS_ARG]
+
+    def handler(args: dict) -> Any:
+        result = runtime.run(
+            action.api_name,
+            args.get(PARAMETERS_ARG) or {},
+            actor=actor,
+            dry_run=bool(args.get(DRY_RUN_ARG, False)),
+        )
+        # Serialized, not composed. `ActionResult` is the shape the runtime settled on for exactly
+        # this caller; `json_safe` is the only thing this layer adds, because it is the layer that
+        # knows a Decimal must not go out through a float.
+        return json_safe(result.as_json())
+
+    return ToolSpec(
+        name=f"run_{snake_case(action.api_name)}",
+        description=_described(action.status, _run_description(action, target, pk.name)),
+        input_schema=schema,
+        handler=handler,
+    )
+
+
+def _run_description(action: Action, target: ObjectType, key_name: str) -> str:
+    """What the action does, and what to do with what comes back.
+
+    The second half is here because the input schema cannot carry it. A `run_` result is a typed
+    `ActionResult`, and the protocol's `isError` is deliberately false for every run that reached
+    the runtime (see `LoomMCPServer.call`) — so the agent has to be told, in the one place it reads,
+    that the outcome is in the payload and which field carries it."""
+    verb = {"create": "Creates", "modify": "Modifies", "delete": "Deletes"}[action.operation]
+    subject = (action.description or f"The declared action {action.api_name}").rstrip(". ")
+    return (
+        f"{subject}. {verb} exactly one "
+        f"{target.display_name or target.api_name}, addressed by {key_name}. "
+        "Returns a typed result rather than a protocol error — branch on `status` "
+        "('applied' the write committed · 'previewed' dryRun, nothing written · 'refused' a "
+        "precondition said no and nothing was changed · 'failed' the write itself failed and it is "
+        "unknown whether the row changed), then on `failures[].code`. Retry only where "
+        "`failures[].retryable` is true, which is only ever 'conflict'."
     )

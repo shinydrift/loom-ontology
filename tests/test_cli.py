@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from loom import build
 from loom.cli import main
 
 VALID = Path(__file__).parent / "fixtures" / "valid"
@@ -375,3 +376,28 @@ def test_a_malformed_param_is_caught_before_any_catalog_is_opened(tmp_path, caps
     ontology = _project(tmp_path, config=UNREACHABLE_CONFIG)
     assert main(["run", "upgradeTier", str(ontology), "--param", "customer"]) == 1
     assert "--param expects NAME=VALUE" in capsys.readouterr().err
+
+
+def test_the_serve_banner_says_whether_this_server_can_write(tmp_path):
+    """"How many tools" does not answer "can this change my lake", so the banner answers it
+    separately, in both modes.
+
+    Asserted against the line builder rather than by spawning a server, because `cmd_serve` blocks
+    on a transport immediately afterwards — `tests/test_mcp_stdio.py` is where the served surface
+    itself is checked."""
+    from loom.cli import _write_mode
+    from loom.config import LoomConfig, McpConfig
+
+    ontology, _ = build(VALID)  # three declared actions
+
+    off = "\n".join(_write_mode(LoomConfig(), ontology))
+    assert "read-only" in off and "3 declared action(s) are not exposed" in off
+    # And the thing that is *not* switched off, said out loud so nobody reads this as the runtime
+    # being unavailable.
+    assert "`loom run` still reaches them" in off
+
+    named = "\n".join(_write_mode(LoomConfig(mcp=McpConfig(writes=True, actor="ci")), ontology))
+    assert "writes enabled · 3 action(s) exposed" in named and "actor 'ci'" in named
+
+    anonymous = "\n".join(_write_mode(LoomConfig(mcp=McpConfig(writes=True)), ontology))
+    assert "actor 'unknown'" in anonymous and "set mcp.actor" in anonymous

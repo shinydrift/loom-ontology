@@ -303,8 +303,32 @@ def cmd_serve(args) -> int:
     )
     for name in sorted(server.tools):
         print(f"  {name}", file=sys.stderr)
+    # Said every time, in both modes. "How many tools" does not answer "can this thing write to my
+    # lake", and that is the question somebody pointing a client at a production catalog is
+    # actually asking. The counts above are what was *built*, so the line below is what explains
+    # the gap between them and what the spec declares.
+    for line in _write_mode(config, ontology):
+        print(f"  {line}", file=sys.stderr)
     asyncio.run(serve_stdio(server))
     return 0
+
+
+def _write_mode(config, ontology) -> list[str]:
+    """The two sentences the banner needs about writes, and the actor they will be recorded under."""
+    actions = len(ontology.actions)
+    if not config.mcp.writes:
+        if not actions:
+            return ["read-only · the spec declares no action"]
+        return [
+            f"read-only · mcp.writes is false, so {actions} declared action(s) are not exposed",
+            "  (`loom run` still reaches them — the runtime is not what is switched off, the surface is)",
+        ]
+    who = (
+        f"recorded as actor '{config.mcp.actor}'"
+        if config.mcp.actor
+        else "recorded as actor 'unknown' — set mcp.actor to say who this deployment writes as"
+    )
+    return [f"writes enabled · {actions} action(s) exposed, every run {who}"]
 
 
 def cmd_plan(args) -> int:
