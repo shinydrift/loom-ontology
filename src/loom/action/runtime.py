@@ -36,8 +36,12 @@ Three boundaries this file is careful about:
 
 - **It does not go through the resolver.** The resolver projects a row down to declared properties,
   which is exactly the set a modify must *not* be limited to — see `_read`. The resolver stays the
-  semantic read (projected, paged, and where governance will live); this is a physical read of one
-  row by key.
+  semantic read (projected, paged, and governed); this is a physical read of one row by key. Which
+  is why governance had to arrive here as well as there: a policy enforced on the resolver alone
+  would be one `dryRun` away from being read out of `before`, so `_project` withholds exactly what
+  `Resolver._projection` does. What a policy *cannot* reach is refused at bind time instead — an
+  action that reads or writes a masked property makes the deployment refuse to start, so nothing in
+  the four steps below has to branch on a policy.
 - **It holds a `RowWriter`, never a `CatalogWriter`.** It cannot alter a schema, because the port
   it asks for has no verb for it. The `EditLogWriter` it also holds does not weaken that: it takes
   no table name, so the only thing it can reach is `_loom_meta.edits`. This is the boundary that
@@ -66,7 +70,8 @@ from ..catalog.base import (
     edit_log_writer_for,
     row_writer_for,
 )
-from ..model import Action, ObjectType, Ontology, coerce_value
+from ..governance import PolicySet
+from ..model import Action, ObjectType, Ontology, coerce_value, properties_in_play
 from .evaluate import EvalError, Scope, evaluate
 from .log import (
     UNKNOWN_ACTOR,
@@ -124,6 +129,9 @@ class ActionRuntime:
 
     ontology: Ontology
     catalogs: Mapping[str, Catalog]
+    policies: PolicySet = field(default_factory=PolicySet)
+    """What this deployment withholds. Empty by default, so a runtime built without one governs
+    nothing rather than failing to mention that it does not."""
 
     def run(
         self,
@@ -443,14 +451,27 @@ class _Run:
         return rows[0] if rows else None
 
     def _project(self, row: Mapping[str, Any] | None) -> dict[str, Any] | None:
-        """The physical row as the ontology sees it: declared properties, by property name.
+        """The physical row as the ontology sees it, minus what this deployment withholds.
 
         The unmapped columns stay behind. They are carried across the write (that is what `row`
         itself is for) but they are not the ontology's to show, and reporting them would leak
-        somebody else's data past a governance layer that does not exist yet."""
+        somebody else's data past the governance layer below.
+
+        A masked property leaves by the same door, and it has to leave *here* rather than on the way
+        out of the tool: `before` and `after` are built from this, `dryRun` returns them without
+        changing anything, and `_changed` diffs them — so a mask applied any later would be one
+        preview away from being read, and would make the conflict detail name a property the caller
+        cannot see. The carry-across is untouched, which is the answer spec-v0's open edge was
+        holding: a masked column is *carried*, never dropped, or the write would destroy exactly the
+        data the policy was protecting. Withheld from the account of the write, not from the write."""
         if row is None:
             return None
-        return {name: row.get(prop.column) for name, prop in self.target.properties.items()}
+        masked = self.rt.policies.masked(self.target.api_name)
+        return {
+            name: row.get(prop.column)
+            for name, prop in self.target.properties.items()
+            if name not in masked
+        }
 
     # ---- 3. evaluate -----------------------------------------------------------
 
@@ -506,7 +527,10 @@ class _Run:
     def _after(self, before: Mapping[str, Any] | None, values: Mapping[str, Any], key: Any) -> dict | None:
         if self.action.effect.op == "deleteObject":
             return None
-        base = dict(before) if before is not None else {n: None for n in self.target.properties}
+        # A create has no `before`, so the empty shape comes from the same projection rather than
+        # from `target.properties` directly — otherwise `after` would name a masked property (as
+        # null) on the one operation that has nothing to diff it against.
+        base = dict(before) if before is not None else (self._project({}) or {})
         base.update(values)
         base[self.target.primary_key] = key
         return base
@@ -699,19 +723,10 @@ class _Run:
     def _properties_in_play(self) -> set[str]:
         """The declared properties this action reads in a rule or writes in an effect.
 
-        `object.<prop>` in a validation rule or in an effect value is the action saying that
-        property is part of its reasoning; a `set` key is it saying the property is part of its
-        outcome. Anything else on the row is a neighbour."""
-        names = set(self.action.effect.set_values)
-        exprs = [rule.expr for rule in self.action.validation]
-        exprs += list(self.action.effect.set_values.values())
-        if self.action.effect.key is not None:
-            exprs.append(self.action.effect.key)
-        for expr in exprs:
-            names.update(
-                ref.path[1] for ref in expr.refs() if len(ref.path) == 2 and ref.path[0] == "object"
-            )
-        return names & set(self.target.properties)
+        The definition moved to `model.properties_in_play` when governance grew a second reader for
+        it: a policy that masks a property an action reads or writes is refused where the spec and
+        the deployment are paired, which is the same question asked of a spec that is not running."""
+        return properties_in_play(self.action, self.target)
 
     # ---- result ----------------------------------------------------------------
 
@@ -754,9 +769,22 @@ _ABSENT = _Absent()
 def build_runtime(ontology: Ontology, config, catalogs: Mapping[str, Any] | None = None) -> ActionRuntime:
     """Wire an ontology to the catalogs named in a project config. Mirrors `build_resolver`, and
     notably takes no engine: writes bypass the compute engine entirely, which is what keeps the
-    write path identical across DuckDB, Trino and Spark."""
+    write path identical across DuckDB, Trino and Spark.
+
+    **It binds governance for the same reason `build_resolver` does**, and that is what made this
+    function load-bearing rather than merely available: it was exported and called by nothing, while
+    `loom run` and `build_server` each constructed an `ActionRuntime` of their own. Two constructions
+    are two chances for one of them to be the ungoverned one — and `loom run` is precisely the direct
+    caller M5's claim is about, so an unbound runtime there would be the back door `loom run` exists
+    not to be. Both call this now.
+
+    The pairing is checked even though nothing on this path reads a policy at bind time: a mask that
+    an action contradicts is a refusal, and the write plane is where that contradiction lives."""
     from ..catalog import open_catalogs
+    from ..governance import bind_policies
 
     return ActionRuntime(
-        ontology=ontology, catalogs=catalogs if catalogs is not None else open_catalogs(config)
+        ontology=ontology,
+        catalogs=catalogs if catalogs is not None else open_catalogs(config),
+        policies=bind_policies(ontology, config.policies),
     )

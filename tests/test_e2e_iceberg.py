@@ -249,3 +249,80 @@ def test_an_agent_sending_a_key_as_the_wrong_json_type_still_gets_its_row(projec
     text, is_error = server.call("search_order", {"filter": {"orderId": "o1"}})
     assert is_error is False
     assert json.loads(text)["count"] == 1
+
+
+# ---- governance, with nothing stubbed -------------------------------------------
+
+
+def test_a_policy_withholds_from_both_callers_alike(project, catalogs):
+    """M5's claim at the only altitude that settles it: real Iceberg, real Arrow, real DuckDB SQL,
+    real tool dispatch, and the same property missing from both answers.
+
+    The `loom query` half is the resolver — the object *is* the same object, because the
+    withholding happens below both callers rather than being applied twice — and the SQL is the
+    reason it cannot be otherwise: `lifetime_value` is not in the SELECT, so there is no result set
+    for a surface to filter, forget to filter, or be talked out of filtering."""
+    from dataclasses import replace
+
+    from loom.governance import Policy
+    from loom.mcp.server import build_server
+    from loom.resolver import build_resolver
+
+    ontology, config = project
+    governed = replace(config, policies=(Policy(name="hide-ltv", object_type="Customer", mask=("ltv",)),))
+
+    resolver = build_resolver(ontology, governed, catalogs)
+    direct = resolver.get("Customer", "c1")
+    assert direct == {"customerId": "c1", "name": "Ada Lovelace", "tier": "gold"}
+
+    server, _ = build_server(ontology, governed, catalogs)
+    text, is_error = server.call("get_customer", {"key": "c1"})
+    assert is_error is False
+    payload = json.loads(text)
+    assert payload["object"] == direct
+    assert payload["masked"] == ["ltv"]
+    assert "lifetime_value" not in text
+
+    # And the ungoverned build of the same project still reads it, so the absence above is the
+    # policy rather than a property that was never there.
+    assert build_resolver(ontology, config, catalogs).get("Customer", "c1")["ltv"] == 48210.5
+
+
+class _Spy:
+    """The real engine, with a note of what it was asked to compile. Wrapping rather than faking:
+    the SQL asserted below is the SQL DuckDB actually ran."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.compiled = []
+
+    def capabilities(self):
+        return self.inner.capabilities()
+
+    def compile(self, plan):
+        compiled = self.inner.compile(plan)
+        self.compiled.append(compiled)
+        return compiled
+
+    def execute(self, compiled):
+        return self.inner.execute(compiled)
+
+
+def test_a_governed_read_never_asks_the_warehouse_for_the_column(project, catalogs):
+    """The projection is the enforcement, and this is what that buys: the column is not in the SQL,
+    so it is not in the Arrow batch pulled out of Iceberg, so it never leaves the catalog. A mask
+    applied to rows on the way out would be a mask that has already read the data it withholds."""
+    from dataclasses import replace
+
+    from loom.governance import Policy
+    from loom.resolver import build_resolver
+
+    ontology, config = project
+    governed = replace(config, policies=(Policy(name="hide-ltv", object_type="Customer", mask=("ltv",)),))
+    resolver = build_resolver(ontology, governed, catalogs)
+    resolver.engine = _Spy(resolver.engine)
+
+    assert [c["customerId"] for c in resolver.list("Customer")] == ["c1", "c2", "c3"]
+    (compiled,) = resolver.engine.compiled
+    assert "lifetime_value" not in compiled.sql
+    assert all("lifetime_value" not in scan.columns for scan in compiled.scans)

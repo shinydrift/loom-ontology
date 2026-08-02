@@ -20,7 +20,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ..action import ActionError, ActionRuntime
+from ..action import ActionError, ActionRuntime, build_runtime
 from ..config import LoomConfig, McpConfig
 from ..model import Ontology
 from ..resolver import Resolver, ResolverError
@@ -113,23 +113,31 @@ def build_server(ontology: Ontology, config: LoomConfig, catalogs: Mapping[str, 
     would each open their own otherwise, which is two connections and two chances to disagree about
     what the lake currently looks like.
 
-    **Where the principal stops, now that a transport could have one.** It stops exactly where it
-    did: `mcp.actor` reaches the edit log through the `actor` argument the runtime already takes,
-    and nothing else. The resolver is handed no identity, because this slice authenticates nobody
-    and there is no identity to hand it — an invented per-call principal would be a value with no
-    source and no reader, which is the mistake `expect_snapshot_id` was kept out of `RowWriter` to
-    avoid. M5 enforces governance in the resolver so a direct call and an agent call filter
-    identically, and when it does, the seam it needs is visible from here: this function builds
-    **one** resolver for the process, so a per-caller principal means a per-caller resolver or a
-    principal argument on every resolver verb. That is the same change that would make concurrent
-    calls safe (see `build_mcp_server`), which is a reason to make it once, deliberately, in the
-    milestone that knows what a policy takes — rather than half of it in a transport slice."""
+    **Where the principal stops.** Exactly where it did: `mcp.actor` reaches the edit log through the
+    `actor` argument the runtime already takes, and nothing else. The resolver is handed no identity,
+    because nothing here authenticates anybody and an invented per-call principal would be a value
+    with no source and no reader — the mistake `expect_snapshot_id` was kept out of `RowWriter` to
+    avoid.
+
+    M4 predicted that M5 would move this, and it did not, so the prediction is corrected here rather
+    than left standing. Governance does enforce in the resolver, and a direct call and an agent call
+    do filter identically — but a policy names no principal (`governance.py` has the argument, and
+    it turns on `loom query` having no transport to attest anything to), so what this function builds
+    **one** of is exactly what one deployment needs one of. Per-caller resolvers buy nothing until an
+    attested principal exists, and would not fix concurrency even then: the shared state that
+    serializes this process is one `DuckDBEngine` connection registering every scan under the global
+    aliases `t0`/`t1`/`m0`, which is the query layer's to fix and not this one's. Both changes still
+    belong to the milestone that lands attestation, and neither is M5's."""
     from ..catalog import open_catalogs
     from ..resolver import build_resolver
 
     open_cats = catalogs if catalogs is not None else open_catalogs(config)
     resolver = build_resolver(ontology, config, open_cats)
-    runtime = ActionRuntime(ontology=ontology, catalogs=open_cats) if config.mcp.writes else None
+    # Through `build_runtime` rather than constructing one here, so this process governs its write
+    # half through the same function `loom run` does. Both halves bind the same policies from the
+    # same config against the same ontology, which is what stops a served surface and a dev command
+    # from withholding different things.
+    runtime = build_runtime(ontology, config, open_cats) if config.mcp.writes else None
     server = LoomMCPServer.from_resolver(
         resolver, server_name=config.mcp.name, runtime=runtime, actor=config.mcp.actor
     )
@@ -157,8 +165,11 @@ def build_mcp_server(loom_server: LoomMCPServer):
       concurrent reads do not merely race on the same table, they race on the same three names, and
       the loser answers with the winner's rows. That is the query layer's to fix.
     - `build_server` builds one `Resolver` and one `ActionRuntime` for the lifetime of the process.
-      Making those per-caller is the same change M5 needs in order to filter by principal, which is
-      an argument for doing it once, there, rather than half of it here.
+      That was written as "the same change M5 needs in order to filter by principal", and M5 turned
+      out not to need it: a governance policy is deployment-scoped and names no caller, so one of
+      each is the right count for one deployment. The change belongs to the milestone that attests a
+      principal per call, which is where the second half of it — this alias problem — has to be
+      solved anyway.
     - The runtime's retry loop reasons about competing commits, not about competing callers in one
       process.
 

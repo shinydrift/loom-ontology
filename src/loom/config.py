@@ -20,6 +20,7 @@ import yaml
 
 from ._shape import check_keys, require, suggest
 from .errors import Diagnostics, SourceLoc
+from .governance import Policy, parse_policies
 
 CONFIG_FILENAME = "loom.yaml"
 SPEC_VERSION = 0
@@ -179,6 +180,10 @@ class LoomConfig:
     catalogs: Mapping[str, CatalogConfig] = field(default_factory=dict)
     engine: EngineConfig = field(default_factory=EngineConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
+    # `governance:` has exactly one key in v0, so the policies arrive flat rather than behind a
+    # config object with one field. Unresolved on purpose: these are policies as *written*, and
+    # nothing here has an ontology to check them against — `build_resolver` binds them.
+    policies: tuple[Policy, ...] = ()
     version: int = SPEC_VERSION
     source: str | None = None  # path it was loaded from, for error messages
 
@@ -225,12 +230,13 @@ def load_config(path: str | Path, diag: Diagnostics) -> LoomConfig | None:
     catalogs = _parse_catalogs(doc.get("catalogs"), loc, diag, base)
     engine = _parse_engine(doc.get("engine"), loc, diag)
     mcp = _parse_mcp(doc.get("mcp"), loc, diag)
-    _check_governance(doc.get("governance"), loc, diag)
+    policies = _parse_governance(doc.get("governance"), loc, diag)
 
     return LoomConfig(
         catalogs=catalogs,
         engine=engine,
         mcp=mcp,
+        policies=policies,
         version=SPEC_VERSION,
         source=str(path),
     )
@@ -446,21 +452,21 @@ def _check_transport_posture(config: McpConfig, raw: dict, loc: SourceLoc, diag:
         )
 
 
-def _check_governance(raw: object, loc: SourceLoc, diag: Diagnostics) -> None:
-    """Governance is deliberately not in v0. Accept the key so specs can carry it forward, but
-    refuse to start with non-empty policies — silently ignoring a declared access policy is a
-    far worse failure than not booting."""
+def _parse_governance(raw: object, loc: SourceLoc, diag: Diagnostics):
+    """`governance.policies`, shape-checked here and resolved against an ontology later.
+
+    This used to refuse every declared policy outright, on the grounds that silently ignoring an
+    access policy is far worse than not booting. That rule did not go away when enforcement landed —
+    it moved down a level, and `governance.RESERVED_KEYS` is where it lives now: a policy is refused
+    key by key for exactly what Loom cannot yet enforce of it, instead of wholesale.
+
+    The two-phase split is `negotiate`'s, seen from the other side. What can be checked without an
+    ontology is checked here, where a config is read and diagnostics accumulate; what needs the spec
+    is checked in `build_resolver`, which is the one place the two are paired."""
     if raw is None:
-        return
+        return ()
     if not isinstance(raw, dict):
         diag.error("'governance' must be a mapping", loc)
-        return
+        return ()
     check_keys(raw, _GOVERNANCE_KEYS, loc, diag, "governance")
-    policies = raw.get("policies") or []
-    if policies:
-        diag.error(
-            f"{len(policies)} governance policy/policies declared but policy enforcement is not "
-            "implemented yet — refusing to start rather than silently ignoring them",
-            loc,
-            "remove them until M5 lands, or pin an older spec",
-        )
+    return parse_policies(raw.get("policies"), loc, diag)

@@ -21,7 +21,11 @@ def suggest(bad: str, options: Iterable[str]) -> str | None:
 def check_keys(raw: dict, allowed: set[str], loc: SourceLoc, diag: Diagnostics, ctx: str) -> None:
     for k in raw:
         if k not in allowed:
-            diag.error(f"unexpected key '{k}' in {ctx}", loc, suggest(k, allowed))
+            # A YAML key is not necessarily a string: under YAML 1.1 the bare keys `on`, `off`,
+            # `yes` and `no` resolve to booleans, so a hand-written grammar can be handed one — and
+            # `suggest` would raise on it rather than report it. The same trap is why a governance
+            # policy names its subject `objectType:` and not the obvious `on:`.
+            diag.error(f"unexpected key '{k}' in {ctx}", loc, suggest(k, allowed) if isinstance(k, str) else None)
 
 
 def require(raw: dict, key: str, loc: SourceLoc, diag: Diagnostics, ctx: str):

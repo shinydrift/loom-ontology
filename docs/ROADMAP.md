@@ -225,7 +225,9 @@ that same ontology as MCP tools, driven end to end over stdio.
   no name for is carried the same way, untouched and unexamined: the conversion is driven by the
   table's own schema, so `array<T>` being deferred in §1 costs the write path nothing. `before`
   and `after` still report only declared properties — the unmapped columns travel, but reporting
-  them would leak someone else's data past a governance layer that doesn't exist yet.
+  them would leak someone else's data past a governance layer that doesn't exist yet. *(M5's first
+  slice extended that rule to the layer once it did exist: `before`/`after` also drop what a policy
+  masks, and the unmapped columns are still carried — see below.)*
 
 - **The snapshot is captured now and checked later, and the difference is said out loud.** Every
   read-then-write records the Iceberg snapshot it read (`Catalog.current_snapshot_id`, a *read*
@@ -570,6 +572,8 @@ what looked like the read path's port. The third slice below is that question an
   It belongs to *this* slice rather than the capability-negotiation box below: that box is about what
   the engine can do, and this is about what the deployment permits. It is deliberately not a
   governance policy either — it names no principal and filters no row — though M5 may subsume it.
+  *(M5's first slice answered that: it does not. Policies subtract and never add, so a policy can
+  only ever deny further than this switch already does — see below.)*
 
   One thing this slice could not test the way it wanted to: a **conflict produced by a real race over
   the wire**. It needs a competing commit inside the window between the served read and the served
@@ -741,9 +745,30 @@ waiting on, and the question it was carrying):
 
 *Goal: row/column policies enforced identically for API and MCP callers.*
 
-- [ ] Design the `governance.policies` grammar (deliberately deferred in v0).
-- [ ] Enforce in the **resolver** (below MCP) so direct + agent calls filter the same way.
-- [ ] Column masking + row predicates; policy tests over both paths.
+The milestone's first question was not on the list: **does attested identity come before or after
+the grammar?** If policies are designed to filter against `mcp.actor`, they get shaped around a
+value about to be replaced by a real per-call principal — and MCP's authorization is an OAuth 2.1
+resource-server profile, which M4 called a milestone rather than a slice.
+
+**After**, and the argument is structural rather than a matter of sequencing: `loom query` and
+`loom run` have no transport, so nothing can ever attest an identity to them, and a spawned stdio
+server carries no bearer either. A grammar expressible only against an authenticated caller would
+make the *direct* half of this milestone's own claim — a direct call and an agent call filter
+identically — ungovernable by construction, and would leave governance existing only over HTTP,
+which is the transport-dependent surface M4's second slice spent a slice proving Loom does not have.
+So M5 enforces **deployment-scoped** policy: one `loom.yaml` filters one way, for every caller of
+it, and two audiences are served by two deployments. `mcp.actor` gains no second reader. The clause
+attestation unblocks is reserved in the grammar and refused, so nothing written against v0 has to
+change when it lands.
+
+- [x] Design the `governance.policies` grammar (deliberately deferred in v0). *Named subject,
+      named effect, and every key Loom cannot enforce refused rather than ignored.*
+- [x] Enforce in the **resolver** (below MCP) so direct + agent calls filter the same way. *In the
+      projection, and in the action runtime's own projection, which is the half a read-only reading
+      of that sentence would have missed.*
+- [ ] Column masking + row predicates; policy tests over both paths. *Masking landed with the
+      grammar; row predicates are the next slice — and the two questions they turn on are written
+      into the grammar's refusal rather than discovered later.*
 - [ ] What the **edit log** holds under a policy. M3 deliberately left three questions here rather
       than answering them where nobody could turn the answer off: whether `_loom_meta.edits` masks
       under the same policies as a read (it records declared properties and the bound parameters —
@@ -751,6 +776,93 @@ waiting on, and the question it was carrying):
       describes); whether a retention window expires it; and whether "no log, no write" is
       expressible, since today an unloggable run still happens and reports `log_failed`. The record's
       *shape* is not deferred — the columns are fixed, because the table is only ever created.
+      *The first is answered by the slice below; the other two are the third slice.*
+
+**Eight decisions taken in the first slice** (the grammar, and column masking end to end):
+
+- **A mask announces itself; a row predicate will not — and one principle decides both.** *The
+  schema is public; the data is not.* The property names are already in the spec, in the tool
+  description and in the JSON Schema, so `masked: ["ltv"]` on every read result tells a caller
+  nothing the surface did not already say. The rows *are* the data, so "you may not see this one"
+  is an existence oracle over it and the next slice will make a filtered row simply absent. The same
+  principle settles a question that looked unrelated: **filtering on a masked property is refused,
+  not answered emptily.** An empty result is an oracle — a substring filter on a withheld column
+  binary-searches its value in a handful of calls, an exact one confirms a guess — and a refusal
+  gives away only what the mask already said. The masked property also leaves the `filter` schema,
+  because `cmd_serve` already refuses to advertise tools that fail on every call and an argument
+  that fails on every call is the same thing one size down. The refusal is in the *resolver*, so
+  `loom query` meets it too; the schema is only the surface not advertising it.
+
+- **Policies subtract, never add — which is what settles `mcp.writes` rather than subsuming it.**
+  M4 left "M5 may subsume it" hanging, and the answer is no. A policy can withhold; none can grant,
+  and none can widen what the config already permits, so folding the write switch into the policy
+  list would turn "is this server writable" from a line an operator reads into a set they have to
+  evaluate. Composition is then total and order-free (masks union), and monotonicity is asserted
+  rather than asserted-in-prose.
+
+- **Withheld by never being *selected*.** The mask is applied to `Resolver._projection`, so a
+  masked column is not in the plan, not in the compiled SQL, not in the Arrow batch pulled out of
+  Iceberg, and therefore not in a result set that any layer above could return by forgetting to
+  drop it. The alternatives — nulling the value, or a `"***"` sentinel — were rejected for reasons
+  Loom has already paid for once: a null lies to the agent exactly the way a narrowed `Contains`
+  would, and a sentinel puts a string in a `decimal` property, which spends "declared types are
+  honored on the way in and out". Dropping the key is the only one of the three that withholds
+  without lying, and it is the only one that never reads the data it is withholding.
+
+- **A masked property is one *no* surface returns, so the write path was in this slice.** A mask on
+  the read path alone would have shipped a mask that does not mask: `run_<action>` reports `before`
+  and `after` as declared properties and `dryRun` returns them without changing anything, so a
+  withheld `ltv` would have been one preview away from any caller with an action on that type.
+  `_Run._project` withholds exactly what `Resolver._projection` does, and `_loom_meta.edits`
+  inherits it because the record is built from the same projection — which answers the first of M3's
+  three edit-log questions. What the runtime did **not** grow is a branch on a policy.
+
+- **The two ways an action could still touch what it cannot see are refused at bind, not evaluated
+  at run.** A validation rule that reads a masked property is an oracle the caller drives
+  (`upgradeTier` refuses when `newTier == object.tier`, so three calls learn a withheld tier), and
+  an effect that writes one destroys data the deployment says this caller may not read. Both are
+  static facts about a spec — `model.properties_in_play` already had to name that exact set for the
+  conflict detail, so it moved out of the runtime and became one definition with two readers — so
+  the deployment refuses to start and nothing in the four steps has to know. This is also what keeps
+  the carry-across honest: spec-v0's open edge asked whether a masked column is carried or the write
+  refused, and the answer is **carried**, exactly as an unmapped column is, because the alternative
+  destroys the data the policy exists to protect. Withheld from the account of the write, never from
+  the write — and M3's *what the record does not name, the run did not change* survives word for
+  word, because nothing can write what nobody can read.
+
+- **Two more things a mask cannot withhold, and neither is an implementation limit.** A **primary
+  key**: every surface addresses a row by it, so masking one withholds the object rather than a
+  property, and not declaring the object type is the honest spelling of that intention (it is also
+  what guarantees a projection is never empty). A property a **link** joins on: the value is the
+  link's whole meaning. With the action rule above, that is four refusals, all collected and
+  reported at once — `check_capabilities`' bargain, because somebody reconciling a policy file with
+  a spec should learn the whole of what disagrees in one reading.
+
+- **Checked where the spec and the deployment are paired, which M4 already argued for.** The
+  capability slice said it was borrowing M5's principle a milestone early; this is the milestone
+  paying it back through the same function. `build_resolver` binds policies beside
+  `check_capabilities`, and `build_runtime` — which existed, was exported, and was called by nothing
+  while `loom run` and `build_server` each constructed their own runtime — became the write plane's
+  equivalent and is now called by both. Two constructions are two chances for one of them to be the
+  ungoverned one, and `loom run` is precisely the direct caller this milestone's claim is about. Not
+  in `loom validate`: a spec that is valid stays valid whatever a deployment withholds of it, and
+  that command does not require a `loom.yaml` to exist at all.
+
+- **A key Loom cannot enforce is refused key by key, where the whole block used to be refused
+  wholesale.** `_check_governance` used to reject any non-empty `policies:` on the grounds that
+  silently ignoring an access policy is far worse than not booting. That rule did not go away when
+  enforcement landed; it moved down a level. `ENFORCED_KEYS` and `RESERVED_KEYS` must cover the
+  grammar exactly under a test — `negotiate.NEGOTIATED`'s device, applied to a grammar — so a fifth
+  key has to be declared as one kind or the other rather than arriving as the third kind Loom has
+  already been bitten by: accepted, unenforced, and silent about it. `rows:` and `audit:` are
+  refused as *not yet*; `when:` is refused as *this deployment cannot tell callers apart*, with the
+  posture that works today in the hint.
+
+  One trap worth recording, because the obvious grammar walks into it: the subject key is
+  `objectType:` and not `on:`, because **YAML 1.1 resolves the bare key `on` to the boolean `True`**
+  — a policy written the obvious way arrives with a key no grammar can name. `objectType` is also
+  Loom's own vocabulary for the same thing (§7's `traverse` takes one). `_shape.check_keys` was
+  hardened in passing: it used to hand a non-string key to `difflib` and raise instead of reporting.
 
 ---
 

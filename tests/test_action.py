@@ -330,7 +330,8 @@ def test_a_modify_carries_across_the_columns_nobody_declared(runtime, catalog):
 def test_the_result_reports_the_ontology_not_the_table(runtime):
     """`before`/`after` are property-named and carry only declared properties. The unmapped columns
     travel across the write but are not the ontology's to show — reporting them would leak somebody
-    else's data past a governance layer that does not exist yet."""
+    else's data past the governance layer below. (What that layer withholds on top of this is
+    `test_governance.py`'s: this runtime binds no policy, so every declared property is here.)"""
     result = runtime.run("upgradeTier", {"customer": "c1", "newTier": "silver"})
 
     assert set(result.before) == {"customerId", "name", "tier", "ltv"}
