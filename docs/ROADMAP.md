@@ -70,7 +70,7 @@ that same ontology as MCP tools, driven end to end over stdio.
 
 ---
 
-## ⏳ M2 — Migration engine (`plan` / `apply`) — *in progress: only rollback is left*
+## ✅ Done — M2: Migration engine (`plan` / `apply` / `rollback`)
 
 *Goal: edit the YAML, run `loom plan`, see a classified diff; `loom apply` evolves Iceberg.*
 
@@ -83,8 +83,47 @@ that same ontology as MCP tools, driven end to end over stdio.
 - [x] `renamedFrom:` handling — treat as a field-id remap, not drop+add. Property-level and on
       `through` columns; a `rename` change kind classified safe; the old column no longer reported
       as unmanaged.
-- [ ] Rollback path — restore prior spec + point physical schema at an earlier snapshot.
-      (`_loom_meta` already stores the spec source verbatim, which is what this restores.)
+- [x] `loom rollback` — restore the spec `_loom_meta` recorded and re-plan it against the live
+      catalog. DDL only: it reverses schema changes, never data. Renames come back as renames;
+      adds are left live and named.
+
+**Five decisions taken in the `rollback` slice:**
+- **Rollback is the ordinary loop over an older spec, with exactly one addition.** It emits no
+  change kind and no write op that `apply` doesn't, and it executes through `apply_plan` under the
+  same whole-plan refusal. The one thing it proposes that a plain apply of the restored spec would
+  not is the reverse rename — everything else is the plan the restored spec would have produced
+  anyway, because the live catalog is already the baseline.
+- **Only renames reverse; everything else is said rather than faked.** An `add` reverses to a drop
+  and Loom never drops, so the column stays live and the restored spec no longer maps it: it is
+  unmanaged, and the report *names* it rather than leaving it to be discovered. A `promote`
+  reverses to a narrowing and a `relax` to a tightening, and both are breaking, so the whole
+  rollback is refused. That is not a gap — once the column is a `long`, the spec that says `int`
+  no longer describes this lake, and the way out is forward.
+- **`renamedFrom` points forward, so the reverse rename comes out of the history.** The restored
+  spec cannot name the column it has to be renamed back from; a naive re-plan would add the old
+  name beside the full new column and strand it, which is the exact failure `renamedFrom` exists to
+  prevent. So `apply` now records its renames as *data* alongside the prose in `summary`, and
+  rollback composes them across versions (`a→b` then `b→c` means `a` is `c` now), inverts the
+  chain, and overlays it on the restored spec's desired columns. Parsing the display string was the
+  alternative and was rejected: a mis-parse renames the wrong column.
+- **A version selects a spec, not a per-catalog target.** This is what makes the multi-catalog case
+  tractable: a version whose text differs makes every bound catalog stale, so a catalog with no row
+  at version 5 is one whose text didn't change at 5 and is already at that spec. Nothing is skipped
+  and nothing is rolled back to "its own earliest" — the version names one text, catalogs holding
+  it must agree on its hash, and a catalog with no history that far back is named in the report.
+- **A rollback is an append that says `applied`.** Not a deleted row and not a new status:
+  `status` is what the *next* run's "has this spec already been applied here?" check reads, and
+  after a rollback the lake genuinely is at the restored spec. The marker goes in `summary` as
+  `rollback_of`, because `_loom_meta` is only ever created and never altered — a new column would
+  never reach a history table that already exists.
+
+  One boundary worth stating outright, because the line this replaced ("point physical schema at
+  an earlier snapshot") invited the opposite reading: **`apply` only ever ran DDL, so `rollback`
+  only ever reverses DDL.** No snapshot rollback, no expiry, no deletes. Rows written since are
+  nobody's to throw away. The same logic decides the working tree in the other direction: spec
+  files absent from the restored snapshot *are* deleted — named before the prompt — because the old
+  spec plus whatever came after is not the spec that was recorded. Files are written last, after
+  the DDL, so a refused or declined rollback leaves the tree untouched.
 
 **Four decisions taken in the `renamedFrom` slice:**
 - **The spec says what it wants; the live catalog decides what that currently means.** One

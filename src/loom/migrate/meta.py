@@ -80,15 +80,24 @@ class SpecSnapshot:
         return _canonical(self.files)
 
 
-def snapshot_spec(path: str | Path) -> SpecSnapshot:
+def spec_files(path: str | Path) -> dict[str, Path]:
+    """The spec's source files, keyed by their path relative to `path`.
+
+    One definition of "a spec file", shared deliberately: `snapshot_spec` hashes what this returns
+    and `rollback` restores into it. A rollback that swept a wider set than the snapshot captured
+    would delete files Loom never claimed."""
     root = Path(path)
-    files = {
-        p.relative_to(root).as_posix(): p.read_text()
+    return {
+        p.relative_to(root).as_posix(): p
         for p in sorted(root.rglob("*"))
         # `find_config` will accept a loom.yaml *inside* the ontology directory, so excluding it
         # has to be by name rather than by where it sits.
         if p.is_file() and p.suffix in _SPEC_SUFFIXES and p.name != CONFIG_FILENAME
     }
+
+
+def snapshot_spec(path: str | Path) -> SpecSnapshot:
+    files = {name: p.read_text() for name, p in spec_files(path).items()}
     payload = _canonical(files)
     return SpecSnapshot(files=files, content_hash=hashlib.sha256(payload.encode()).hexdigest())
 

@@ -12,13 +12,11 @@ from nothing but a spec is the thing `apply` is for.
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 
 import pytest
 
 from loom import build
-from loom.config import find_config, load_config
 from loom.errors import Diagnostics
 from loom.migrate import (
     APPLIED,
@@ -32,23 +30,6 @@ from loom.migrate import (
 from loom.migrate.meta import META_TABLE
 
 pytest.importorskip("pyiceberg", reason="needs the [iceberg] extra")
-
-EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "retail"
-
-
-@pytest.fixture
-def project(tmp_path):
-    """The shipped example's spec and config, pointed at an *empty* warehouse — no seed step."""
-    target = tmp_path / "retail"
-    shutil.copytree(EXAMPLE, target, ignore=shutil.ignore_patterns(".warehouse"))
-    (target / ".warehouse").mkdir()
-
-    diag = Diagnostics()
-    config = load_config(find_config(target / "ontology"), diag)
-    ontology, _ = build(target / "ontology")
-    diag.raise_if_errors()
-    return target, ontology, config
-
 
 def _catalogs(config):
     from loom.catalog import open_catalogs
@@ -322,7 +303,16 @@ def test_the_spec_keeps_renamed_from_after_the_rename_has_landed(project):
     # what answers "is it safe to drop `renamedFrom` yet?" for a given lake.
     entry = MetaStore(_local(config)).latest()
     people = [e for e in entry.summary_data() if e["table"] == "local.hr.people"]
-    assert people == [{"table": "local.hr.people", "action": "alter", "columns": ["staff_count: renamed from headcount"]}]
+    # In prose for a reader, *and* as data — `rollback` has to invert this, and a rollback that
+    # parsed the display string would be one typo away from renaming the wrong column.
+    assert people == [
+        {
+            "table": "local.hr.people",
+            "action": "alter",
+            "columns": ["staff_count: renamed from headcount"],
+            "renames": {"staff_count": "headcount"},
+        }
+    ]
 
 
 def test_a_rename_onto_a_column_that_already_exists_is_refused(project):

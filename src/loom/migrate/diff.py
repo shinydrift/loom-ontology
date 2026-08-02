@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 from ..errors import Diagnostics
 from ..model import Ontology
 from ..types import promotable
-from .schema import DesiredColumn, DesiredTable, desired_tables
+from .schema import DesiredColumn, DesiredTable, TableKey, apply_renames, desired_tables
 
 if TYPE_CHECKING:  # type-only, as in the validator: planning a spec needs no catalog imported
     from ..catalog.base import Catalog, Column, TableSchema
@@ -125,18 +125,30 @@ class MigrationPlan:
 
 
 def diff_ontology(
-    ontology: Ontology, catalogs: Mapping[str, Catalog], diag: Diagnostics
+    ontology: Ontology,
+    catalogs: Mapping[str, Catalog],
+    diag: Diagnostics,
+    *,
+    renames: Mapping[TableKey, Mapping[str, str]] = {},
 ) -> MigrationPlan:
     """Classify every difference between what `ontology` wants and what `catalogs` hold.
 
     Follows the same accumulate-everything contract as validation: an undeclared catalog or an
     un-introspectable table is recorded and the remaining tables are still planned, so one broken
     binding doesn't hide the rest of the diff. A plan is only trustworthy once `diag` is clean.
+
+    `renames` overlays `renamedFrom` onto the desired columns and is the *only* way a rollback's
+    plan differs from a plain apply of the spec it restored — see `schema.apply_renames`. It stops
+    here: the overlay changes which shape `_alteration` sees, and every classification below is
+    then the ordinary one.
     """
     changes: list[TableChange] = []
     unmanaged: list[Unmanaged] = []
     targets: list[tuple[str, str]] = []
-    for desired in desired_tables(ontology, diag).values():
+    desired_by_key = desired_tables(ontology, diag)
+    if renames:
+        desired_by_key = apply_renames(desired_by_key, renames, diag)
+    for desired in desired_by_key.values():
         targets.append(desired.key)
         catalog = catalogs.get(desired.catalog)
         if catalog is None:

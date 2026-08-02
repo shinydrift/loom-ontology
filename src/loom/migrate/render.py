@@ -12,8 +12,12 @@ rewrite.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from .diff import LABELS, ColumnChange, MigrationPlan, Severity, TableChange
 from .executor import APPLIED, REFUSED, UP_TO_DATE, ApplyResult, TableOutcome
+from .meta import STATUS_APPLIED
+from .rollback import FileChanges, LeftBehind, RollbackTarget
 
 _COLUMN_SYMBOL = {"add": "+", "rename": "~", "promote": "~", "loosen": "~", "retype": "!", "tighten": "!"}
 _BREAKING_SYMBOL = "!"
@@ -24,14 +28,20 @@ DRY_RUN_NOTE = "This is a dry run — nothing was changed. Run `loom apply` to e
 BREAKING_NOTE = "`loom apply` will refuse this plan: a breaking change cannot be executed safely."
 
 
-def render_plan(plan: MigrationPlan, title: str | None = None, *, executing: bool = False) -> str:
+def render_plan(
+    plan: MigrationPlan, title: str | None = None, *, executing: bool = False, unmanaged: bool = True
+) -> str:
     """The full plan as one printable block, with no trailing newline.
 
     `executing` drops the closing note: `apply` prints the plan too — the same plan, so the reader
     can check what ran against what was proposed — and telling them there that nothing was changed
-    would be a lie a second before it changes something."""
+    would be a lie a second before it changes something.
+
+    `unmanaged` drops the footer, for `render_rollback`, which has more to say about those columns
+    than this does and says all of it in one place."""
+    footer = _render_unmanaged(plan) if unmanaged else []
     if plan.is_empty:
-        return "\n".join([NO_CHANGES, *_render_unmanaged(plan)])
+        return "\n".join([NO_CHANGES, *footer])
 
     name_width, detail_width = _widths(plan)
     lines: list[str] = []
@@ -43,8 +53,87 @@ def render_plan(plan: MigrationPlan, title: str | None = None, *, executing: boo
     lines.append(_summary(plan))
     if not executing:
         lines.append(BREAKING_NOTE if plan.severity is Severity.BREAKING else DRY_RUN_NOTE)
-    lines += _render_unmanaged(plan)
+    lines += footer
     return "\n".join(lines)
+
+
+def render_rollback(
+    target: RollbackTarget,
+    plan: MigrationPlan,
+    left: Sequence[LeftBehind],
+    changes: FileChanges,
+    title: str | None = None,
+) -> str:
+    """A rollback, before it runs: which version is being restored, what that does to the physical
+    schema, what it will *not* take back, and which files it will write.
+
+    The middle of it is `render_plan` unchanged, because the middle of a rollback is an ordinary
+    plan. The two blocks around it are the parts a plan has no way to say."""
+    lines = []
+    if title:
+        lines.append(f"Loom rollback — {title}")
+    lines.append(
+        f"Restoring the spec recorded at version {target.version} "
+        f"(from {', '.join(target.held_by)})."
+    )
+    if target.status != STATUS_APPLIED:
+        lines.append(
+            f"  note: version {target.version} is recorded as '{target.status}' — that apply did "
+            f"not fully land."
+        )
+    for name in target.absent_from:
+        # Not an error and not a skip: a version selects a spec, and that spec either binds this
+        # catalog or does not. Either way it is planned like every other one — this says only that
+        # its own history has nothing from that far back to compare against.
+        lines.append(
+            f"  note: '{name}' has no `_loom_meta` history at or before version {target.version}."
+        )
+    # The roadmap line this closes said "point the physical schema at an earlier snapshot", which
+    # reads like it could discard rows. It cannot, and the place to say so is here.
+    lines.append("Rows are untouched — `apply` only ever ran DDL, so this only reverses DDL.")
+    lines += ["", render_plan(plan, executing=True, unmanaged=False)]
+    lines += _render_left_behind(plan, left, target.version)
+    lines += _render_files(changes)
+    return "\n".join(lines)
+
+
+def _render_left_behind(
+    plan: MigrationPlan, left: Sequence[LeftBehind], version: int
+) -> list[str]:
+    """Everything the rollback is leaving live, in one block and split by how it got there.
+
+    Merged with the plan's ordinary unmanaged columns because from the lake's point of view they
+    are now the same thing — and split, because "Loom added this on a version you are undoing" and
+    "this was never yours to begin with" call for different decisions."""
+    stranded = {(e.catalog, e.table): set(e.columns) for e in left if not e.whole_table}
+    lines: list[str] = []
+    for entry in plan.unmanaged:
+        mine = stranded.get((entry.catalog, entry.table), set())
+        for columns, why in (
+            (tuple(c for c in entry.columns if c in mine), f"added after version {version}"),
+            (tuple(c for c in entry.columns if c not in mine), "never mapped by this ontology"),
+        ):
+            if columns:
+                lines.append(f"  · {entry.catalog}.{entry.table}: {', '.join(columns)} — {why}")
+    for entry in left:
+        if entry.whole_table:
+            lines.append(
+                f"  · {entry.catalog}.{entry.table} — the whole table, created after version {version}"
+            )
+    if not lines:
+        return []
+    return ["", "Left in place — a rollback never drops, so these stay live and unmanaged:", *lines]
+
+
+def _render_files(changes: FileChanges) -> list[str]:
+    """Named before the prompt, deletions included: nobody should be asked to approve a write to a
+    file they have open without being shown which files."""
+    if not changes.any:
+        return ["", "Spec files: already exactly what that version recorded."]
+    lines = ["", "Spec files:"]
+    lines += [f"  ~ {name} — restored" for name in changes.written]
+    lines += [f"  - {name} — deleted; it did not exist at that version" for name in changes.deleted]
+    return lines
 
 
 def render_apply(result: ApplyResult) -> str:

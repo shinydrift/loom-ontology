@@ -432,10 +432,27 @@ _loom_meta.applied
   applied_at    timestamptz  required
   content_hash  string                  # sha256 of the spec source, canonicalized
   spec          string                  # {relative path: file text} as JSON — what a rollback restores
-  summary       string                  # JSON: the tables this apply created/altered in this catalog
+  summary       string                  # JSON: the tables this run created/altered in this catalog
   status        string                  # applied | partial
   loom_version  string
   actor         string                  # $LOOM_ACTOR, else the OS user
+```
+
+`summary` is a JSON list, one entry per table this catalog holds:
+
+```json
+[{"table": "local.crm.customers", "action": "alter",
+  "columns": ["ltv_usd: renamed from lifetime_value"],
+  "renames": {"ltv_usd": "lifetime_value"}}]
+```
+
+`columns` is the plan's own prose, for a person reading the history. `renames` is present only when
+the run renamed something, and says the same thing as data — because `rollback` has to *invert* it
+(§9.1), and a rollback that parsed a display string would be one typo away from renaming the wrong
+column. A **rollback** records the same list wrapped in an object naming the version it restored:
+
+```json
+{"rollback_of": 4, "tables": [ … ]}
 ```
 
 **Append-only.** The current state is the row with the highest `version`; everything before it is
@@ -461,6 +478,58 @@ Each managed table additionally carries three Iceberg table properties, set in t
 transaction as its schema change: `loom.managed`, `loom.spec_hash`, `loom.applied_version`. They
 duplicate what this table records on purpose — a table should be self-describing without the
 reader knowing `_loom_meta` exists.
+
+### 9.1 `rollback` — what this table is *for*
+
+`loom rollback --to 4` restores the spec recorded at version 4 and re-plans it against the live
+catalog. It is deliberately the ordinary loop over an older spec: no new change kind, no new write
+op, the same classification and the same whole-plan refusal.
+
+**It reverses DDL, and only DDL.** `apply` never wrote a row, so `rollback` never deletes one. It
+touches no snapshot and expires nothing. Rows written since the version being restored are nobody's
+to throw away.
+
+**A version selects a spec, not a per-catalog target.** A version whose text differs from the one
+before it makes every bound catalog stale, so every one records a row for it — which means a
+catalog with *no* row at version 4 is a catalog whose text did not change at 4, and is therefore
+already at that spec. There is one thing to restore and every catalog is re-planned against it.
+Catalogs holding a row at that version must agree on its `content_hash`; if they don't, one was
+written outside Loom and there is no single spec to restore, so rollback refuses.
+
+**What comes back, and what doesn't.** Of the four ops the write port has, exactly one reverses
+within the port:
+
+| applied after version 4 | rolling back to 4 |
+|---|---|
+| `rename` | reversed — an Iceberg rename back, same field id, no file rewritten |
+| `add` | left live; the restored spec no longer maps it, so it is **unmanaged** from here on |
+| a created table | left in place, for the same reason one level up |
+| `promote` | refused — the reverse is a narrowing, which is breaking |
+| `relax` | refused — the reverse is a tightening, which is breaking |
+
+The last two are not a hole in rollback. Once a column is a `long`, the spec that says `int` no
+longer describes this lake, and the way out is forward rather than back. The middle two are the
+never-drop rule holding: a rolled-back add is a live column nothing maps, and `rollback` names it
+in its report rather than leaving it to be discovered.
+
+**Renames need this table, because `renamedFrom` points forward.** The spec at version 4 says
+`column: ltv_usd` and carries no key — a spec written before a rename cannot name the column that
+rename has to be undone from. So `rollback` reads `summary.renames` for every version after 4,
+composes the chain (`a→b` at 5 and `b→c` at 6 means the column called `a` at 4 is called `c` now),
+inverts it, and plans an ordinary rename. Nothing is written back into the YAML: the restored files
+are byte-identical to what was recorded.
+
+**A rollback is an append, not an unwind.** It writes a new row at the next version carrying the
+restored spec's text and hash. Its `status` is `applied` — after a rollback the lake genuinely *is*
+at that spec, so anything else would make the next run's "has this spec already been applied here?"
+check believe something false, and re-record a spec that is already live.
+
+**The spec files are the last thing it writes**, and only if the run was not refused: the plan is
+built against a copy, so a rollback that is declined or refused leaves the working tree exactly as
+it was. Files present now but absent from the snapshot are **deleted**, and named before the
+confirmation prompt — the old spec plus whatever came after it is not the spec that was recorded,
+so leaving them would not be a rollback. Scope is what `spec` captured and no wider: `*.yaml` and
+`*.yml` under the ontology directory, never `loom.yaml`, never a file of any other kind.
 
 ---
 

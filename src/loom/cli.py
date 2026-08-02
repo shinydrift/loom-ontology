@@ -2,7 +2,8 @@
 
 `validate` is structural and offline by default; `--physical` adds the catalog pass. `query` is a
 dev command for exercising the read path by hand, and `serve` exposes those same reads as MCP
-tools. `plan` dry-runs the migration engine and `apply` executes exactly what `plan` printed.
+tools. `plan` dry-runs the migration engine, `apply` executes exactly what `plan` printed, and
+`rollback` restores a spec out of `_loom_meta` and re-plans it — the same loop, an older spec.
 """
 
 from __future__ import annotations
@@ -10,6 +11,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
+from pathlib import Path
 
 from .config import CONFIG_FILENAME, find_config, load_config
 from .errors import Diagnostics, SourceLoc, SpecError, SpecErrors
@@ -243,7 +246,111 @@ def cmd_apply(args) -> int:
     return 0 if result.ok else 1
 
 
-def _confirmed(assume_yes: bool) -> bool:
+def cmd_rollback(args) -> int:
+    """Restore the spec `_loom_meta` recorded, and bring the physical schema back in line with it.
+
+    Note what it deliberately does *not* load: the spec on disk. Only `loom.yaml`, for the
+    catalogs. The spec you are rolling back *from* is quite often the one that no longer parses,
+    and needing it would make rollback unavailable exactly when it is wanted.
+
+    The working tree is written last, and only if the run was not refused. Everything before that
+    is planned against a copy of the recorded spec in a temporary directory, so a rollback you
+    decline — or one the executor refuses — leaves the lake and the files exactly as they were.
+    """
+    diag = Diagnostics()
+    config_path = find_config(args.path)
+    if config_path is None:
+        print(str(SpecErrors([_missing_config(args.path)])), file=sys.stderr)
+        return 1
+
+    from .catalog import CatalogError, open_catalogs
+    from .migrate import (
+        REFUSED,
+        MetaStore,
+        RollbackError,
+        Severity,
+        apply_plan,
+        desired_tables,
+        diff_ontology,
+        file_changes,
+        latest_version,
+        left_behind,
+        materialize,
+        render_apply,
+        render_rollback,
+        resolve_target,
+        restore_files,
+    )
+
+    try:
+        config = load_config(config_path, diag)
+        diag.raise_if_errors()
+        catalogs = open_catalogs(config)
+        history = {name: MetaStore(catalog).history() for name, catalog in catalogs.items()}
+        target = resolve_target(history, args.to)
+        # The spec the lake is at now, read from history rather than from disk for the same reason
+        # as everything else here: `left_behind` compares the two recorded specs, and the one on
+        # disk may be the reason someone is rolling back.
+        current = resolve_target(history, latest_version(history))
+    except SpecErrors as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    except (CatalogError, RollbackError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    with tempfile.TemporaryDirectory(prefix="loom-rollback-") as tmp:
+        try:
+            restored, _ = build(materialize(target.snapshot, Path(tmp) / "restored"))
+            recorded, _ = build(materialize(current.snapshot, Path(tmp) / "recorded"))
+        except SpecErrors as e:
+            print(f"error: a recorded spec cannot be loaded by this version of Loom\n{e}", file=sys.stderr)
+            return 1
+
+        try:
+            plan = diff_ontology(restored, catalogs, diag, renames=target.renames)
+            diag.raise_if_errors()
+        except SpecErrors as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        except CatalogError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+
+        # `diag` is clean by here, so a second pass over the same two specs adds no diagnostics —
+        # it is only being asked which columns each one maps.
+        left = left_behind(
+            plan, desired_tables(recorded, diag), desired_tables(restored, diag), catalogs
+        )
+        changes = file_changes(Path(args.path), target.snapshot)
+
+    for w in diag.warnings:
+        print(f"warning: {w.render()}", file=sys.stderr)
+    print(render_rollback(target, plan, left, changes, title=str(args.path)))
+
+    if plan.severity is not Severity.BREAKING and not _confirmed(args.yes, "roll back"):
+        print("aborted — nothing was rolled back", file=sys.stderr)
+        return 1
+
+    print()
+    try:
+        result = apply_plan(plan, catalogs, target.snapshot, rollback_of=target.version)
+    except CatalogError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(render_apply(result))
+    if result.status == REFUSED:
+        print("nothing was rolled back — no spec file was written either", file=sys.stderr)
+        return 1
+
+    restore_files(Path(args.path), target.snapshot, changes)
+    if changes.any:
+        deleted = f", deleted {len(changes.deleted)}" if changes.deleted else ""
+        print(f"Restored {len(changes.written)} spec file(s){deleted} in {args.path}.")
+    return 0 if result.ok else 1
+
+
+def _confirmed(assume_yes: bool, action: str = "apply") -> bool:
     """Ask before writing to someone's lake.
 
     Refusing when there's no terminal — rather than assuming yes — is the important half: `apply`
@@ -253,12 +360,12 @@ def _confirmed(assume_yes: bool) -> bool:
         return True
     if not sys.stdin.isatty():
         print(
-            "error: refusing to apply without confirmation — no terminal to ask at, pass --yes",
+            f"error: refusing to {action} without confirmation — no terminal to ask at, pass --yes",
             file=sys.stderr,
         )
         return False
     try:
-        answer = input("\nApply these changes? [y/N] ")
+        answer = input(f"\n{action[0].upper()}{action[1:]} these changes? [y/N] ")
     except EOFError:  # pragma: no cover - a tty that closes mid-question
         return False
     return answer.strip().lower() in ("y", "yes")
@@ -298,6 +405,18 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")
     a.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     a.set_defaults(func=cmd_apply)
+
+    r = sub.add_parser("rollback", help="restore a spec `_loom_meta` recorded and re-apply it")
+    r.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")
+    r.add_argument(
+        "--to",
+        type=int,
+        default=None,
+        metavar="VERSION",
+        help="the recorded version to restore (default: the one before the current)",
+    )
+    r.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    r.set_defaults(func=cmd_rollback)
 
     args = parser.parse_args(argv)
     return args.func(args)
