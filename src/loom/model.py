@@ -136,6 +136,28 @@ class Ontology:
         )
 
 
+def properties_in_play(action: Action, target: ObjectType) -> set[str]:
+    """The declared properties an action reads in a rule or writes in an effect.
+
+    `object.<prop>` in a validation rule or in an effect value is the action saying that property is
+    part of its reasoning; a `set` key is it saying the property is part of its outcome. Anything
+    else on the row is a neighbour.
+
+    A fact about a spec, so it lives with the spec's own types and takes no runtime: the conflict
+    detail asks it of a run in flight (which of the properties that moved does this action care
+    about) and `governance.bind_policies` asks it of a deployment that is not running yet (can this
+    action stand beside a policy that withholds one). Two readers, one definition — the alternative
+    is two that agree until somebody edits one."""
+    names = set(action.effect.set_values)
+    exprs = [rule.expr for rule in action.validation]
+    exprs += list(action.effect.set_values.values())
+    if action.effect.key is not None:
+        exprs.append(action.effect.key)
+    for expr in exprs:
+        names.update(ref.path[1] for ref in expr.refs() if len(ref.path) == 2 and ref.path[0] == "object")
+    return names & set(target.properties)
+
+
 def physical_type(prop_type: PropType, object_types: Mapping[str, ObjectType]) -> str | None:
     """The Iceberg type a property's values are actually stored as.
 

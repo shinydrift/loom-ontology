@@ -102,6 +102,7 @@ def cmd_query(args) -> int:
         return 1
 
     from .catalog import CatalogError
+    from .governance import PolicyError
     from .mcp.registry import json_safe
     from .negotiate import CapabilityError
     from .resolver import ResolverError, build_resolver
@@ -128,14 +129,22 @@ def cmd_query(args) -> int:
             rows = [row] if row else []
         else:
             rows = resolver.search(args.object_type, filters, limit=args.limit)
-    except (ResolverError, CatalogError, CapabilityError) as e:
+    except (ResolverError, CatalogError, CapabilityError, PolicyError) as e:
         # A `CapabilityError` reaches here for the same reason `loom query` mirrors the generated
         # tools at all: if the dev command can read out of an engine the served surface refuses to
-        # stand on, the ontology has a back door.
+        # stand on, the ontology has a back door. A `PolicyError` is the same sentence about a
+        # deployment instead of an engine.
         print(f"error: {e}", file=sys.stderr)
         return 1
 
     print(json.dumps(json_safe(rows), indent=2, default=str))
+    # The mask, on stderr beside the row count rather than in the JSON: this command prints rows
+    # rather than an envelope, and an agent is not reading it. What matters is that it is *said* —
+    # the withholding itself already happened one layer down, identically to the tool path.
+    read = args.object_type if not args.link else resolver.link_direction(args.object_type, args.link).target_object_type
+    masked = resolver.masked(read)
+    if masked:
+        print(f"({read}: {', '.join(masked)} withheld by governance policy)", file=sys.stderr)
     print(f"({len(rows)} row(s))", file=sys.stderr)
     return 0
 
@@ -160,8 +169,9 @@ def cmd_run(args) -> int:
         print(str(e), file=sys.stderr)
         return 1
 
-    from .action import LOG_FAILED, ActionError, ActionRuntime
+    from .action import LOG_FAILED, ActionError, build_runtime
     from .catalog import EDIT_LOG_TABLE, CatalogError, open_catalogs
+    from .governance import PolicyError
     from .mcp.registry import json_safe
     from .migrate.meta import default_actor
 
@@ -176,13 +186,17 @@ def cmd_run(args) -> int:
         parameters[name] = value
 
     try:
-        runtime = ActionRuntime(ontology=ontology, catalogs=open_catalogs(config))
+        # `build_runtime`, not a runtime built here: it is the one function that pairs this spec
+        # with this deployment on the write plane, so `loom run` withholds exactly what a served
+        # `run_<action>` withholds. Building one directly is how a dev command becomes the ungoverned
+        # path.
+        runtime = build_runtime(ontology, config, open_catalogs(config))
         # Always previewed first, even for a real run: it is the same four steps minus the write,
         # so what the prompt shows is what is about to happen rather than a second guess at it. It
         # is a preview and not a recording — an effect holding `now()` gets a fresh value on the
         # run, for the same reason `loom apply` re-plans instead of replaying a saved plan.
         preview = runtime.run(args.action, parameters, dry_run=True)
-    except ActionError as e:
+    except (ActionError, PolicyError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     except CatalogError as e:
@@ -291,12 +305,13 @@ def cmd_serve(args) -> int:
         return 1
 
     from .catalog import CatalogError
+    from .governance import PolicyError
     from .mcp.server import build_server, serve_http, serve_stdio
     from .negotiate import CapabilityError
 
     try:
-        server, _ = build_server(ontology, config)
-    except (CatalogError, CapabilityError) as e:
+        server, resolver = build_server(ontology, config)
+    except (CatalogError, CapabilityError, PolicyError) as e:
         # Better to refuse to start than to advertise tools that will fail on every call. A
         # capability mismatch is the second half of that sentence: an engine without OFFSET fails
         # not on every call but on the second page, which is the worse shape — it works until it
@@ -320,7 +335,7 @@ def cmd_serve(args) -> int:
     # lake", and that is the question somebody pointing a client at a production catalog is
     # actually asking. The counts above are what was *built*, so the lines below are what explain
     # the gap between them and what the spec declares — and, over HTTP, who can reach them.
-    for line in _write_mode(config, ontology) + _transport_mode(config):
+    for line in _write_mode(config, ontology) + _governance_mode(resolver) + _transport_mode(config):
         print(f"  {line}", file=sys.stderr)
     if config.mcp.transport == "http":
         asyncio.run(serve_http(server, config.mcp))
@@ -345,6 +360,31 @@ def _write_mode(config, ontology) -> list[str]:
         else "recorded as actor 'unknown' — set mcp.actor to say who this deployment writes as"
     )
     return [f"writes enabled · {actions} action(s) exposed, every run {who}"]
+
+
+def _governance_mode(resolver) -> list[str]:
+    """What this deployment withholds, said where somebody starting the server will read it.
+
+    Nothing when nothing is withheld — the banner already answers "can this write to my lake", and a
+    line saying no policy is in force would be one more thing to read on every start. When there is
+    one, it names the properties rather than the count: `2 policies` tells an operator that
+    *something* is governed, which is the half of the question they can already see in the config.
+
+    It says *deployment* out loud, because that is the part a reader is most likely to assume
+    otherwise. Every caller of this server gets these same masks; there is no per-caller filtering
+    here, and a server that let somebody believe there was would be the support ticket."""
+    withheld = [
+        f"{name}: {', '.join(resolver.masked(name))}"
+        for name in resolver.ontology.object_types
+        if resolver.masked(name)
+    ]
+    if not withheld:
+        return []
+    return [
+        f"governed · {len(resolver.policies.policies)} policy/policies withhold {'; '.join(withheld)}",
+        "  (deployment-wide — every caller of this server is filtered the same way, and `loom query` "
+        "against this config is filtered identically)",
+    ]
 
 
 def _transport_mode(config) -> list[str]:

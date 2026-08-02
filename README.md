@@ -61,8 +61,10 @@ types, and row/column governance enforced below the tool layer.
 
 *Today the reads, `traverse` and the `run_` tools are all live over MCP. Writes are off by default:
 `mcp.writes: true` in `loom.yaml` is what turns a declared action into a tool, because declaring one
-and serving it to every client that connects are different decisions. Governance is the next
-milestone. See [Status](#status).*
+and serving it to every client that connects are different decisions. Governance has begun: a
+`governance.policies` entry withholds a property from every caller — `loom query` included, because
+the mask is applied to the projection below both of them — and row predicates are next. See
+[Status](#status).*
 
 ## Architecture (5 layers)
 
@@ -107,7 +109,7 @@ And `loom serve` now speaks **HTTP** as well as stdio, which is the first time a
 outlives the client that started it. The tool set does not change — the surface is a function of the
 spec, not of the transport — but two things about a shared process do. It answers **one tool call at
 a time**, deliberately and out loud, because the DuckDB connection and the resolver underneath it are
-built once per process and making them per-caller is the same change governance needs. And the write
+built once per process, and the aliases every scan registers under are global. And the write
 surface is bounded by the **bind**: `mcp.writes: true` refuses to start on anything but a loopback
 address, because `mcp.actor` names a deployment rather than a caller, and that is only an honest
 thing to record while the set of callers is the same one that could already run the binary.
@@ -120,7 +122,30 @@ cannot do one of them is refused rather than served narrowly. Refused, because t
 to make the generated surface a function of the engine instead of the spec, or, worse, to quietly
 match exactly where the spec promised substring: that one returns rows, so nothing fails and the
 agent believes an answer that is wrong. The check sits where the two are paired rather than at
-serve, so `loom query` refuses exactly what `loom serve` refuses. Next is governance.
+serve, so `loom query` refuses exactly what `loom serve` refuses.
+
+**M5 is governance**, and its first question was one the boxes did not ask: whether an attested
+per-call identity has to come first. It does not, and the reason decides the shape of everything
+else — `loom query` and `loom run` have no transport, so nothing can ever attest an identity to
+them, and a governance grammar written against an authenticated caller would leave the *direct* half
+of "a direct call and an agent call filter identically" ungovernable. So a policy names no
+principal: it is a fact about a **deployment**, you serve two audiences by running two deployments,
+and the clause an attested caller would turn on is reserved in the grammar and refused rather than
+approximated against the deployment-wide `mcp.actor`. Column masking is live:
+
+```yaml
+governance:
+  policies:
+    - { name: hide-ltv, objectType: Customer, mask: [ltv] }
+```
+
+The property is withheld by never being *selected* — not in the SQL, not in the Arrow batch, not in
+a result set anything above could return by mistake — from `loom query`, from every read tool, and
+from an action's `before`/`after` and its edit-log record, since a `dryRun` would otherwise read out
+what a policy withheld. It is still carried across a write, untouched, because the alternative
+destroys the data the policy exists to protect. And masking a property some action reads or writes
+refuses the deployment at startup rather than resolving it per call: Loom would rather not start
+than serve a mask that an action can read around.
 
 | Component | State |
 |-----------|-------|
@@ -146,7 +171,8 @@ serve, so `loom query` refuses exactly what `loom serve` refuses. Next is govern
 | MCP `run_<action>` tools | ✅ `mcp.writes: true` |
 | HTTP transport | ✅ `mcp.transport: http` |
 | Capability negotiation | ✅ refused at wiring, not narrowed |
-| Governance (row/column policies) | ⏳ |
+| Governance — column masking | ✅ `governance.policies` |
+| Governance — row predicates | ⏳ |
 
 `docs/spec-v0.md` is the full grammar — the framework's public contract.
 `docs/ROADMAP.md` tracks what's next, milestone by milestone.
@@ -239,9 +265,12 @@ question that file should answer. It binds to `127.0.0.1` unless told otherwise.
 
 Two lines of that banner are the honest disclosures. It answers one call at a time, which is a
 scaling claim and is therefore stated rather than left to be discovered — the DuckDB connection and
-the resolver under it are built once for the process, and making them per-caller is the same change
-governance needs, so it is one deliberate change later rather than half of one now. And it speaks
-cleartext: TLS belongs to whatever sits in front, which is part of why the default bind is local.
+the resolver under it are built once for the process, and every scan registers under the same three
+global aliases, so two concurrent reads would not merely contend. (That was written as "the same
+change governance needs", and governance turned out not to need it: a policy names no caller, so one
+resolver is the right count for one deployment. It belongs to the milestone that attests a principal
+per call.) And it speaks cleartext: TLS belongs to whatever sits in front, which is part of why the
+default bind is local.
 
 The other half of that posture is a refusal. `mcp.writes: true` will not start on a non-loopback
 bind:

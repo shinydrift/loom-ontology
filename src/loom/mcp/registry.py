@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -115,7 +115,15 @@ def build_tools(
 
     The read tools always. The `run_` tools only when a runtime is supplied, which is `loom serve`'s
     way of saying `mcp.writes` is on — the surface is what the deployment permits, not what the spec
-    declares, and the banner counts what was built rather than what could have been."""
+    declares, and the banner counts what was built rather than what could have been.
+
+    **A policy is read here, once, and that is a claim with a lifetime.** Masks are resolved into
+    the schemas and descriptions at build time because they cannot change between two calls of a
+    process: policies are deployment-scoped, so there is exactly one answer for every caller of this
+    server (`governance.py` says why none of them names a principal). The day an attested principal
+    arrives per call, this is one of the two places that stops being true — the other being the one
+    `Resolver` and one `ActionRuntime` `build_server` holds — and the tool set becomes something
+    assembled per caller rather than per process."""
     tools: list[ToolSpec] = []
     for obj in resolver.ontology.object_types.values():
         tools.append(_get_tool(resolver, obj))
@@ -152,6 +160,19 @@ def _described(status: str, text: str) -> str:
     return f"{label} — {text}" if label else text
 
 
+def _withheld(masked: Sequence[str]) -> str:
+    """The sentence a mask adds to a tool description, or nothing at all.
+
+    A mask announces itself, and this is where — an agent reads descriptions afresh every session,
+    the same reason a deprecation is labelled rather than hidden. What it announces is only what the
+    surface already said: the property names are in the spec, so naming them as withheld tells a
+    caller nothing the schema did not. A row predicate will add no sentence here, and the asymmetry
+    is the rule in `governance.py`: the schema is public, the data is not."""
+    if not masked:
+        return ""
+    return f" Withheld by governance policy: {', '.join(masked)}."
+
+
 # ---- per-object tools ----------------------------------------------------------
 
 
@@ -162,6 +183,7 @@ def _subject(obj: ObjectType) -> str:
 
 def _get_tool(resolver: Resolver, obj: ObjectType) -> ToolSpec:
     pk = obj.pk_property
+    masked = resolver.masked(obj.api_name)
     schema = {
         "type": "object",
         "properties": {"key": {**pk.type.json_schema(), "description": f"the {pk.name} of the {obj.api_name}"}},
@@ -176,18 +198,29 @@ def _get_tool(resolver: Resolver, obj: ObjectType) -> ToolSpec:
             "key": json_safe(args["key"]),
             "found": row is not None,
             "object": json_safe(row) if row is not None else None,
+            "masked": list(masked),
         }
 
     return ToolSpec(
         name=f"get_{snake_case(obj.api_name)}",
-        description=_described(obj.status, f"Fetch one {_subject(obj)} by its {pk.name}."),
+        description=_described(obj.status, f"Fetch one {_subject(obj)} by its {pk.name}.") + _withheld(masked),
         input_schema=schema,
         handler=handler,
     )
 
 
 def _search_tool(resolver: Resolver, obj: ObjectType) -> ToolSpec:
-    filterable = {name: obj.properties[name] for name in obj.searchable if name in obj.properties}
+    masked = resolver.masked(obj.api_name)
+    # A masked property leaves the filter schema as well as the projection. The resolver refuses a
+    # filter on one whatever the schema says — that is the enforcement, and it is below MCP where
+    # `loom query` meets it too — but advertising an argument that fails on every call is the thing
+    # `cmd_serve` already refuses to do when an engine cannot serve a tool. Subtracting from the
+    # surface, never adding to it: the rule from `governance.py`, seen at the surface.
+    filterable = {
+        name: obj.properties[name]
+        for name in obj.searchable
+        if name in obj.properties and name not in masked
+    }
     filter_props = {}
     for name, prop in filterable.items():
         match = "case-insensitive substring match" if prop.type.kind == "string" else "exact match"
@@ -214,33 +247,43 @@ def _search_tool(resolver: Resolver, obj: ObjectType) -> ToolSpec:
             limit=args.get("limit"),
             offset=args.get("offset", 0),
         )
-        return _page(obj, rows, args)
+        return _page(obj, rows, args, masked)
 
-    searchable = ", ".join(filterable) or "no properties are declared searchable"
+    if filterable:
+        searchable = ", ".join(filterable)
+    elif any(name in masked for name in obj.searchable):
+        # Not "no properties are declared searchable", which would be false: they are declared, and
+        # this deployment withholds them. A description that misreports the spec is worse than one
+        # that reports a policy.
+        searchable = "nothing — every searchable property is withheld here"
+    else:
+        searchable = "no properties are declared searchable"
     return ToolSpec(
         name=f"search_{snake_case(obj.api_name)}",
-        description=_described(obj.status, f"Search {_subject(obj)} by {searchable}."),
+        description=_described(obj.status, f"Search {_subject(obj)} by {searchable}.") + _withheld(masked),
         input_schema=schema,
         handler=handler,
     )
 
 
 def _list_tool(resolver: Resolver, obj: ObjectType) -> ToolSpec:
+    masked = resolver.masked(obj.api_name)
     schema = {"type": "object", "properties": dict(_PAGE_SCHEMA), "additionalProperties": False}
 
     def handler(args: dict) -> Any:
         rows = resolver.list(obj.api_name, limit=args.get("limit"), offset=args.get("offset", 0))
-        return _page(obj, rows, args)
+        return _page(obj, rows, args, masked)
 
     return ToolSpec(
         name=f"list_{snake_case(obj.api_name)}",
-        description=_described(obj.status, f"List {_subject(obj)}, ordered by {obj.primary_key}."),
+        description=_described(obj.status, f"List {_subject(obj)}, ordered by {obj.primary_key}.")
+        + _withheld(masked),
         input_schema=schema,
         handler=handler,
     )
 
 
-def _page(obj: ObjectType, rows: list[dict], args: dict) -> dict:
+def _page(obj: ObjectType, rows: list[dict], args: dict, masked: Sequence[str] = ()) -> dict:
     limit = args.get("limit") or DEFAULT_PAGE_SIZE
     offset = args.get("offset", 0)
     return {
@@ -250,6 +293,10 @@ def _page(obj: ObjectType, rows: list[dict], args: dict) -> dict:
         "offset": offset,
         # An agent has no other way to tell "that's everything" from "the page filled up".
         "hasMore": len(rows) == min(limit, MAX_PAGE_SIZE),
+        # Always present, empty when nothing is withheld. A key that appears only under a policy
+        # would make "this deployment governs nothing" and "this Loom is too old to say"
+        # indistinguishable, which is the one thing an envelope reporting a mask must not do.
+        "masked": list(masked),
         "objects": json_safe(rows),
     }
 
@@ -334,6 +381,10 @@ def _traverse_tool(resolver: Resolver) -> ToolSpec:
             "limit": limit,
             "offset": args.get("offset", 0),
             "hasMore": len(rows) == min(limit, MAX_PAGE_SIZE),
+            # The target's mask, not the source's: a traverse projects the objects at the other end,
+            # so what is withheld here is a fact about where you landed. Read per call rather than
+            # bound at build like the per-object tools', because this one tool spans every route.
+            "masked": list(resolver.masked(direction.target_object_type)),
             "objects": json_safe(rows),
         }
 
@@ -440,7 +491,13 @@ def _run_tool(runtime: ActionRuntime, action: Action, actor: str | None) -> Tool
 
     return ToolSpec(
         name=f"run_{snake_case(action.api_name)}",
-        description=_described(action.status, _run_description(action, target, pk.name)),
+        # The target's mask is announced here too: `before` and `after` come back as declared
+        # properties minus what a policy withholds, so an agent reading this description is reading
+        # the shape of the result it will get. It can never name a property this action touches —
+        # that pairing is refused before a deployment starts — so the sentence only ever describes
+        # neighbours on the row.
+        description=_described(action.status, _run_description(action, target, pk.name))
+        + _withheld(runtime.policies.masked(target.api_name)),
         input_schema=schema,
         handler=handler,
     )

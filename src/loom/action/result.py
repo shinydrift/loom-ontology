@@ -134,10 +134,14 @@ class ActionResult:
     """The whole outcome of one `run_<action>` / `loom run`.
 
     `before` and `after` are the object **as the ontology sees it** — property-named, and carrying
-    only declared properties. The columns no property maps are carried across the write untouched
-    (that is the point of the full-row read) but they are deliberately *not* reported: they are
-    somebody else's data, and putting them in an agent-facing result would leak past a governance
-    layer that has not yet been written.
+    only declared properties, *minus* whatever a governance policy withholds. The columns no
+    property maps are carried across the write untouched (that is the point of the full-row read)
+    but they are deliberately *not* reported: they are somebody else's data, and putting them in an
+    agent-facing result would leak past the governance layer below.
+
+    A masked property leaves by the same door and for a sharper reason: `dryRun` returns these two
+    without changing anything, so a mask enforced only on the read path would be one preview away
+    from being read. A masked column is still *carried* across the write — see `_Run._project`.
 
     `read_snapshot_id` is the Iceberg snapshot the pre-write read saw, and the write asserts it: the
     two commit as one decision or the write is declined. `attempts` is how many times the runtime

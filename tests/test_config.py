@@ -226,18 +226,58 @@ def test_missing_catalogs_is_an_error(tmp_path: Path):
     assert any("no 'catalogs' declared" in e.message for e in diag.errors)
 
 
-def test_declared_governance_policies_refuse_to_start(tmp_path: Path):
-    """Silently ignoring an access policy is worse than not booting."""
+def test_governance_policies_are_parsed(tmp_path: Path):
+    """The block that used to be refused wholesale now loads — see `test_governance.py` for what a
+    policy may say. What survives from that refusal is the rule underneath it: a key Loom cannot
+    enforce is still refused, one key at a time rather than one block at a time."""
+    config, diag = _load(
+        tmp_path,
+        """
+        catalogs: { c: { type: iceberg-rest, uri: x } }
+        governance:
+          policies:
+            - { name: hide-pii, objectType: Customer, mask: [ssn] }
+        """,
+    )
+    assert diag.errors == []
+    assert [(p.name, p.object_type, p.mask) for p in config.policies] == [("hide-pii", "Customer", ("ssn",))]
+
+
+def test_unenforceable_policy_keys_refuse_to_start(tmp_path: Path):
+    """Silently ignoring an access policy is worse than not booting, and that did not change when
+    enforcement landed — it moved down to the key. A row predicate Loom cannot compile reads, to
+    whoever wrote it, exactly like one it obeyed."""
     _, diag = _load(
         tmp_path,
         """
         catalogs: { c: { type: iceberg-rest, uri: x } }
         governance:
           policies:
-            - { on: Customer, where: "tier == 'gold'" }
+            - name: eu-only
+              objectType: Order
+              mask: [notes]
+              rows: "object.region == 'EU'"
+              when: "principal.id == 'analyst'"
         """,
     )
-    assert any("not implemented yet" in e.message and "refusing to start" in e.message for e in diag.errors)
+    assert any("'rows'" in e.message and "not enforced yet" in e.message for e in diag.errors)
+    assert any("'when'" in e.message and "attest" in e.message for e in diag.errors)
+
+
+def test_a_policy_written_with_on_is_reported_not_crashed(tmp_path: Path):
+    """`on:` is the obvious spelling for `objectType:` and YAML 1.1 resolves the bare key to the
+    boolean `True`. It has to arrive as an unexpected key rather than as a `TypeError` out of
+    difflib, which is what `check_keys` used to do with a key that was not a string."""
+    _, diag = _load(
+        tmp_path,
+        """
+        catalogs: { c: { type: iceberg-rest, uri: x } }
+        governance:
+          policies:
+            - { name: p, on: Customer, mask: [ssn] }
+        """,
+    )
+    assert any("unexpected key 'True'" in e.message for e in diag.errors)
 
 
 def test_empty_governance_block_is_fine(tmp_path: Path):

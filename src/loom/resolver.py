@@ -6,16 +6,20 @@ only an object-type api name and property names that must exist in the model. Th
 "the LLM never receives raw SQL" structural rather than a convention — there is no code path from
 a tool call to arbitrary SQL, because the resolver only ever emits `ir` nodes it built itself.
 
-It's also where governance will enforce (M5): row predicates and column masks belong *here*,
-below the MCP layer, so a direct API caller and an agent get filtered identically.
+It's also where governance enforces (M5): column masks — and row predicates after them — belong
+*here*, below the MCP layer, so a direct API caller and an agent get filtered identically. A mask
+is applied to the **projection**, which is the strongest place available: a withheld property is
+never selected, so it is never in a result set for anything above to forget to drop. See
+`governance.py` for what a policy may say and why none of them names a caller.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+from .governance import PolicySet
 from .model import LinkType, ObjectType, Ontology, Property, coerce_value
 from .query.engine import Engine
 from .query.ir import Column, Comparison, Contains, Eq, GetByKey, Project, Search, TableRef, ThroughRef, Traverse
@@ -58,6 +62,9 @@ class LinkDirection:
 class Resolver:
     ontology: Ontology
     engine: Engine
+    policies: PolicySet = field(default_factory=PolicySet)
+    """What this deployment withholds. Empty by default — a resolver built without one governs
+    nothing, which is what every construction of one that predates M5 meant and still means."""
 
     # ---- reads -----------------------------------------------------------------
 
@@ -199,10 +206,28 @@ class Resolver:
     def _table(obj: ObjectType, alias: str) -> TableRef:
         return TableRef(catalog=obj.backing_catalog, table=obj.backing_table, alias=alias)
 
-    @staticmethod
-    def _projection(obj: ObjectType, alias: str) -> tuple[Column, ...]:
+    def masked(self, object_type: str) -> tuple[str, ...]:
+        """The properties a policy withholds from every read of this type.
+
+        Public because the surface has to be able to *say* it — see `governance.py` on why a mask
+        announces itself and a row predicate will not — and because saying it is the only part of a
+        mask that belongs above this layer. The withholding itself is already done by the time
+        anything can ask."""
+        return self.policies.masked(object_type)
+
+    def _projection(self, obj: ObjectType, alias: str) -> tuple[Column, ...]:
+        """The columns a read selects: declared properties, minus what a policy withholds.
+
+        Withheld by never being *asked for*, rather than by being dropped from the rows on the way
+        back. It costs nothing and it is a stronger claim: a masked value is not in the result set,
+        so there is no layer above this one that could return it by forgetting to filter, and none
+        of them has to know a policy exists. `bind_policies` refuses a mask on a primary key, which
+        is what guarantees this tuple is never empty."""
+        masked = self.policies.masked(obj.api_name)
         return tuple(
-            Column(alias=alias, column=p.column, output=p.name) for p in obj.properties.values()
+            Column(alias=alias, column=p.column, output=p.name)
+            for p in obj.properties.values()
+            if p.name not in masked
         )
 
     def _filters(self, obj: ObjectType, filters: Mapping[str, Any]) -> tuple[Comparison, ...]:
@@ -212,6 +237,17 @@ class Resolver:
             if prop is None:
                 known = ", ".join(obj.properties) or "none"
                 raise ResolverError(f"'{obj.api_name}' has no property '{name}' (known: {known})")
+            policy = self.policies.masked_by(obj.api_name, name)
+            if policy is not None:
+                # A refusal rather than an empty result, and the difference is the whole point: a
+                # filter on a withheld property is an oracle for its value — a substring filter
+                # binary-searches it in a handful of calls, and an exact one confirms a guess. The
+                # refusal gives away only what the mask already announced.
+                raise ResolverError(
+                    f"'{obj.api_name}.{name}' is withheld by governance policy '{policy}', so it "
+                    "cannot be filtered on either — a filter on a property you cannot read answers "
+                    "the question the mask refused"
+                )
             if prop.type.kind == "string" and name in obj.searchable and value is not None:
                 out.append(Contains(alias=_TARGET, column=prop.column, value=str(value)))
             else:
@@ -271,12 +307,23 @@ def build_resolver(ontology: Ontology, config, catalogs: Mapping[str, Any] | Non
 
     It is not an invariant of `Resolver` itself, which stays constructible from any engine. That is
     what lets a test drive the resolver with a fake, and an adapter be exercised before anybody has
-    decided which ontology it will serve; the pairing is what has to be checked, not the pair."""
+    decided which ontology it will serve; the pairing is what has to be checked, not the pair.
+
+    **And this is where a governance policy is bound**, for the reason above rather than a second
+    one — M4's capability slice said it was borrowing M5's principle a milestone early, and this is
+    the milestone paying it back through the same function. `loom query` and `loom serve` refuse the
+    same policies and withhold the same properties, because there is one place that turns a config
+    and a spec into something that can read. Binding here rather than in `loom validate` is the same
+    boundary seen from the other side: a spec that is valid stays valid whatever a deployment
+    withholds of it, and `loom validate` does not require a `loom.yaml` to exist at all."""
     from .catalog import open_catalogs
+    from .governance import bind_policies
     from .negotiate import check_capabilities
     from .query.engines import open_engine
 
     open_cats = catalogs if catalogs is not None else open_catalogs(config)
     engine = open_engine(config.engine, open_cats)
     check_capabilities(ontology, engine.capabilities())
-    return Resolver(ontology=ontology, engine=engine)
+    return Resolver(
+        ontology=ontology, engine=engine, policies=bind_policies(ontology, config.policies)
+    )

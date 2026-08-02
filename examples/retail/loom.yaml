@@ -37,3 +37,21 @@ mcp:
   # host: 127.0.0.1
   # port: 8000
   # path: /mcp
+
+# What this deployment withholds. Uncomment and `loom query`, `loom run` and every generated tool
+# stop returning `ltv` — enforced in the resolver's projection, so the column is not in the SQL
+# rather than dropped from the rows on the way back.
+#
+# A policy names no caller, and that is deliberate: `loom query` has no transport, so nothing can
+# ever attest an identity to it, and governance that only existed over an authenticated socket would
+# leave the direct half of "a direct call and an agent call filter identically" ungovernable. So
+# policies are per *deployment* — run one per audience — and `when:` is reserved for the day a
+# caller can be attested, refused until then rather than approximated.
+#
+# Try masking `tier` instead and the server refuses to start: `upgradeTier` writes it, and a
+# deployment cannot both withhold a property and change it. See docs/spec-v0.md §6.1.
+# governance:
+#   policies:
+#     - name: hide-ltv
+#       objectType: Customer
+#       mask: [ltv]
