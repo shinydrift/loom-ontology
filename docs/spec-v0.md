@@ -569,6 +569,17 @@ governance:                       # optional · row/column policies enforced in 
   policies: []                    # (grammar TBD — forward reference, not in v0)
 ```
 
+**`engine.type` is negotiated against the ontology, not just resolved.** An adapter reports what it
+can do, and a spec implies what will be asked of it: declaring a link means a traverse joins two
+backing tables, declaring a *string* property `searchable` means a filter is a case-insensitive
+substring match (an enum is a closed set and matches exactly, so it implies nothing), and the page
+arguments §7 puts on every read tool mean a second page is an `OFFSET` — that last one required by
+the surface rather than by anything a spec says. An engine that cannot do one of them is **refused
+where the two are wired together**, so `loom query` and `loom serve` refuse identically, and the
+message names the declaration to go and look at. The surface is never narrowed to fit: §7's tool set
+is a function of the spec, and matching exactly where this section promised substring would return
+rows rather than fail, which is the one failure an agent cannot see.
+
 The four address keys mean nothing without an address, so setting any of them under
 `transport: stdio` is an **error** rather than something quietly dropped — the same rule
 `governance.policies` follows, for the same reason: a config that is silently ignored reads, to

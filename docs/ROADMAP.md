@@ -452,7 +452,7 @@ M3):
 
 ---
 
-## ⏳ M4 — MCP write surface + transport hardening
+## ✅ Done — M4: MCP write surface + transport hardening
 
 *Goal: the action runtime shows up as tools; serve over more than stdio.*
 
@@ -465,10 +465,14 @@ useless without failing anything, which is worth a test here rather than a hope.
 
 Both have landed. The surface came first (`run_<action>`), then the second transport — which turned
 out to be about neither the tools nor the runtime, both unchanged, but about everything that stops
-being true when a process stops belonging to the client that spawned it.
+being true when a process stops belonging to the client that spawned it. The third slice is the one
+box neither of them touched: whether the engine underneath can serve the surface at all.
 
 - [x] Per action: `run_<action>` with JSON Schema from parameters, description from the spec.
-- [ ] Capability negotiation at serve — validate spec features vs. `engine.capabilities()`.
+- [x] Capability negotiation — validate what a spec demands against `engine.capabilities()`, at the
+      point where the two are wired rather than at serve. *`negotiate.py`: three requirements, one
+      of which is not a spec feature; a refusal rather than a narrowing; and the line around
+      `native_merge` drawn where it belongs.*
 - [x] HTTP transport alongside stdio. *`mcp.transport: http`, with an address in `loom.yaml` and a
       write surface bounded by the bind. The tool set, the registry and the runtime are unchanged;
       what changed is everything that stops being true when a process stops belonging to one caller.*
@@ -477,13 +481,13 @@ being true when a process stops belonging to the client that spawned it.
       serializes `ActionResult` rather than composing anything, and the actor was already an
       argument.*
 
-**The header stays ⏳, and capability negotiation is the only thing holding it.** It is the one box
-left, and it was kept out of the transport slice on purpose: it has no transport content at all —
-the answer is identical over stdio and HTTP — so bundling it would mean a change about a port
-deciding whether an existing spec still serves. It also has an unresolved question of its own that
-deserves being answered rather than smuggled: `Capabilities` carries `joins`, `offset`,
-`case_insensitive_like` and `native_merge`, nothing validates a spec against any of them, and
-`native_merge` is a *write-path* field sitting on the read path's port.
+The header was held by capability negotiation alone, and the box was kept out of the transport
+slice on purpose: it has no transport content at all — the answer is identical over stdio and HTTP
+— so bundling it would have meant a change about a port deciding whether an existing spec still
+serves. It also carried an unresolved question of its own that deserved answering rather than
+smuggling: `Capabilities` carries `joins`, `offset`, `case_insensitive_like` and `native_merge`,
+nothing validated a spec against any of them, and `native_merge` is a *write-path* field sitting on
+what looked like the read path's port. The third slice below is that question and its answer.
 
 **Seven decisions taken in the first slice** (`run_<action>` — the surface over the runtime):
 
@@ -665,6 +669,71 @@ by anyone who can reach the port):
   are handed one assembled server from `build_mcp_server`, which is asserted with no socket in
   sight, and `test_no_tool_can_take_a_query`'s walk is re-run over the schemas as received across
   the wire.
+
+**Five decisions taken in the third slice** (capability negotiation — the one box the milestone was
+waiting on, and the question it was carrying):
+
+- **Three requirements, and one of them is not a spec feature — so the box's own wording is
+  corrected rather than satisfied.** It read "validate spec features vs. `engine.capabilities()`",
+  and two of the three are exactly that: `joins` is demanded by declaring a link, because a traverse
+  joins two backing tables; `case_insensitive_like` by declaring a *string* property searchable,
+  because `Resolver._filters` emits a `Contains` for that condition and an `Eq` for everything else
+  — so a searchable **enum** demands nothing, and `Customer.tier` is the case that shows the rule is
+  about the property's type rather than the `searchable:` list. `offset` is not a spec feature at
+  all: every generated `search_` / `list_` / `traverse` tool carries the page arguments for every
+  ontology there is, because they are Loom's own vocabulary and not the spec's (§7's two argument
+  namespaces, seen from the third side). It is a constant requirement of the **surface**. It is
+  checked anyway, because the question a deployment is asking is not "does my spec use features this
+  engine has" but "can this engine serve the tools I am about to advertise" — and the answer has to
+  cover the parts of that surface no spec chose. Strip every link and every searchable property from
+  an ontology and `offset` is still required; there is a test that does exactly that.
+
+- **A refusal, never a narrowing — and the third degradation is the one that decides it.** Loom
+  already refuses rather than degrades in three places argued separately (`cmd_serve` would rather
+  not start than advertise tools that fail on every call; `loom apply` refuses a breaking plan whole
+  with no `--force`; `mcp.writes: true` refuses a non-loopback bind), and what makes them agree is
+  visible from here. The narrowings available are dropping `traverse`, stripping `offset` out of the
+  page schema, and compiling `Contains` down to `Eq`. The first two make the generated surface a
+  function of the **engine**, which spends the one claim — the surface is a function of the spec and
+  nothing else — that the transport slice just proved survives a second transport, and spends it on
+  a config mismatch. The third is worse than both and worse than failing: an exact match where the
+  spec promised substring **returns rows**, so nothing errors, nothing retries, and the agent
+  believes an answer that is wrong. A capability mismatch is also the worse *shape* of failure to
+  leave running — an engine without `OFFSET` serves page 1 of everything and fails page 2, so it
+  works until it doesn't, and by then a client is holding the tool list.
+
+- **`native_merge` is a routing hint, and the line gets drawn around negotiation rather than around
+  the port.** A **requirement** is something a spec can demand and an engine can fail. Nothing can
+  demand `native_merge`: writes go through the catalog's `RowWriter`, which every catalog
+  implements, so an engine that cannot `MERGE` is a slower way to serve an ontology and never a
+  reason to refuse one — it selects an implementation, not a possibility. Which means the complaint
+  ("a write-path field on the read path's port") had the wrong premise: `Capabilities` was never the
+  read path's structure. It describes an **engine**, and this is where an engine is asked what it
+  is; that the engine only reads today does not make the question a read-path question. What was
+  actually wrong was `Engine`'s docstring, which called `capabilities()` "what the serve-time
+  negotiation reads" as though that were all of it, and it is fixed where it was written. The
+  distinction is then made checkable rather than conventional: `NEGOTIATED | NOT_NEGOTIATED` must
+  cover the dataclass exactly, under a test, so a fourth flag fails until somebody says which kind
+  of fact it is. Without that, the quiet answer available is "a third kind: unread" — which is how
+  `loom.managed` got written by `apply` and read by nothing for two milestones.
+
+- **It happens where a spec and an engine are wired, not at serve.** "At serve" is where a mismatch
+  is *observed*, not where it belongs. `build_resolver` is the one function that pairs the two, so
+  checking there means `loom query` refuses exactly what `loom serve` refuses; checking in
+  `cmd_serve` would leave a dev command reading successfully out of an engine the served surface
+  will not stand on, which is the shape of back door `loom query` was deliberately built not to be.
+  It is the same principle M5 states for governance — enforce below MCP so a direct call and an
+  agent call get the same answer — arriving one milestone early because this is the first check that
+  had a choice about which rung to sit on. It is deliberately *not* an invariant of `Resolver`,
+  which stays constructible from any engine: the pairing is what has to be checked, not the pair,
+  and that is what lets a test drive the resolver with a fake and an adapter be exercised before
+  anybody has decided what it will serve.
+
+- **The write path is not negotiated, and that is not an omission.** `ActionRuntime` reads a whole
+  row and writes it back through the catalog's ports; it never compiles a plan, so it asks the
+  engine for nothing and there is nothing to check. An engine that fails negotiation still runs
+  actions — `loom run` is unaffected. `loom serve` refuses anyway, because it builds both halves and
+  one of them cannot stand, which is the honest answer for a surface that is advertised as a set.
 
 ---
 
