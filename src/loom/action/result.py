@@ -53,12 +53,17 @@ OBJECT_EXISTS = "object_exists"
 AMBIGUOUS_KEY = "ambiguous_key"
 WRITE_FAILED = "write_failed"
 CONFLICT = "conflict"
-"""The row moved between the read and the write.
+"""The table moved between the read and the write, and the write was declined.
 
-Defined now and raised by nobody. This slice *records* the snapshot every read-then-write saw
-(`ActionResult.read_snapshot_id`) but does not check it, so the concurrency slice is a check and a
-single new `Failure` — not a new result shape that every caller written against this one would
-have to learn. It is the only retryable code, which is why `retryable` exists at all."""
+The only retryable code, which is why `retryable` exists at all — and the only one the runtime
+retries *for* you before reporting. Seeing it means `MAX_ATTEMPTS` runs each lost the race, so it
+says the table is contended rather than that a single unlucky commit slipped in.
+
+`detail` is the part that matters, because "conflict, retry" alone is advice an agent cannot act on:
+it carries `expectedSnapshotId`, `foundSnapshotId`, `attempts`, the declared properties that
+`changed` under the run, and `contended` — whether any of those are properties this action reads or
+writes. A busy table and a contested row are different situations and the caller has to be able to
+tell them apart. See `_Run._conflict`."""
 
 RETRYABLE = frozenset({CONFLICT})
 """Codes where running the same call again is a sensible response. Everything else needs the
@@ -101,9 +106,16 @@ class ActionResult:
     somebody else's data, and putting them in an agent-facing result would leak past a governance
     layer that has not yet been written.
 
-    `read_snapshot_id` is the Iceberg snapshot the pre-write read saw. **Recorded, not enforced.**
-    The write itself is one Iceberg transaction; the read and the write together are not, and the
-    gap between them is the next slice's."""
+    `read_snapshot_id` is the Iceberg snapshot the pre-write read saw, and the write asserts it: the
+    two commit as one decision or the write is declined. `attempts` is how many times the runtime
+    read, evaluated and tried before this result — `1` for almost everything, more when a conflict
+    was retried, and reported because "applied" after three internal re-reads is a different fact
+    from "applied", and `before` is then the row of the *final* attempt, the one actually written
+    over.
+
+    `before` and `after` are still the object as the ontology sees it, and so is everything the
+    conflict path reports: `detail["changed"]` is diffed through the same projection, so the columns
+    no property maps are compared no more than they are shown."""
 
     action: str
     object_type: str
@@ -113,6 +125,7 @@ class ActionResult:
     before: Mapping[str, Any] | None = None
     after: Mapping[str, Any] | None = None
     read_snapshot_id: int | None = None
+    attempts: int = 1
     failures: tuple[Failure, ...] = ()
 
     @property
@@ -122,6 +135,20 @@ class ActionResult:
     @property
     def retryable(self) -> bool:
         return any(f.retryable for f in self.failures)
+
+    @property
+    def concurrency(self) -> str:
+        """What the snapshot id beside it does and does not claim.
+
+        Status-dependent for one reason: a preview writes nothing, so there is nothing for a check
+        to have been carried into, and printing "enforced" next to a snapshot id would read as a
+        claim on the table — that the row is being held while somebody decides. It is not. The run
+        that follows a preview does its own read, and that read is what gets asserted. This is the
+        same rule the previous slice set when it refused to print a bare snapshot id: the sentence
+        beside the number is load-bearing."""
+        if self.status == PREVIEWED:
+            return "not checked — a preview writes nothing, and holds nothing"
+        return "enforced — the write asserts the snapshot the read saw"
 
     def as_json(self) -> dict[str, Any]:
         """The serialization `run_<action>` will hand an agent. Values are left as they are; the
@@ -135,9 +162,10 @@ class ActionResult:
             "key": self.key,
             "before": dict(self.before) if self.before is not None else None,
             "after": dict(self.after) if self.after is not None else None,
-            # Named for what it is. A field called `snapshotId` would read as something that was
-            # checked.
+            # Named for what it is: the snapshot the *read* saw. It is now also what the write
+            # asserted, which is what `concurrency` beside it says.
             "readSnapshotId": self.read_snapshot_id,
-            "concurrency": "recorded, not enforced",
+            "concurrency": self.concurrency,
+            "attempts": self.attempts,
             "failures": [f.as_json() for f in self.failures],
         }

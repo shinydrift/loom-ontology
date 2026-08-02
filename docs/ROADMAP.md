@@ -193,11 +193,12 @@ that same ontology as MCP tools, driven end to end over stdio.
 - [x] Effect compiler → Iceberg **catalog-level** write (equality-delete on PK + append), one txn.
       All three operations: `create` / `modify` / `delete`, behind a third port (`RowWriter`).
 - [x] `loom run` — one declared action, through the same entry point `run_<action>` will call.
-- [ ] Optimistic concurrency — version/snapshot check; conflict → typed retryable error.
-      *The snapshot is already captured and reported; what is missing is the check.*
+- [x] Optimistic concurrency — snapshot check carried into the commit; conflict → typed retryable
+      error, retried up to `MAX_ATTEMPTS` first.
 - [ ] Edit-log (audit) table — actor, action, before/after, snapshot id.
+      *`conflict`'s `detail` already carries expected/found/changed — the shape this wants.*
 - [x] Tests: create / modify / delete happy paths, against the fake catalog and against live
-      pyiceberg. The concurrent-conflict path lands with the check.
+      pyiceberg — plus a real competing commit landing between a run's read and its write, on both.
 
 **Eight decisions taken in the first slice** (parameter binding, rule evaluation, one row written):
 
@@ -231,6 +232,7 @@ that same ontology as MCP tools, driven end to end over stdio.
   id at-or-before the data, so a later check can report a conflict that wasn't one but can never
   miss one that was. Scan-then-snapshot silently blesses a lost update. No unused
   `expect_snapshot_id=` was added to the port — a parameter nothing passes is not a seam.
+  *(The second slice made this true and revised the last sentence — see below.)*
 
 - **`{{ customer }}` and `newTier != object.tier` are one language, and always were.**
   `expr.parse()` already stripped a whole-string `{{ … }}` wrapper; that is now the stated rule
@@ -279,6 +281,89 @@ that same ontology as MCP tools, driven end to end over stdio.
   one writes: if the dev command can do something the generated tools can't, the ontology has a
   back door. It takes an action apiName and named parameters — the shape `run_<action>` will take —
   and calls the same `ActionRuntime.run`, asserted rather than assumed.
+
+**Six decisions taken in the second slice** (optimistic concurrency — the check the first slice
+left open, and said it was leaving open):
+
+- **The check is carried into the commit, not performed before it — so "enforced" is the honest
+  word.** The port grows `expect_snapshot_id` and the pyiceberg implementation lowers it into an
+  `assert-ref-snapshot-id` requirement on the transaction, staged *before* the write op so it
+  replaces the one the snapshot producer stages for itself. The catalog validates requirements
+  against metadata it re-reads and swaps the metadata pointer conditionally on what it validated
+  against; a commit that lands in between loses. The alternative — the runtime re-reading, comparing,
+  then writing — has a window between the comparison and the commit, so it *narrows* the race rather
+  than closing it, and the docs would have had to say narrowing the way the first slice said
+  recorded-not-enforced. They don't, because it doesn't.
+
+  Two revisions to what the first slice predicted. The argument is **required, not optional**: one
+  that can be omitted is a check that can be skipped by forgetting, and there is no value meaning
+  "don't check" — `None` is the real expectation "I read a table with no snapshots". And it is on
+  **all three** verbs, not two. The guarantee rests on a library's deduplication rule, so the
+  implementation re-checks that its own requirement survived onto the transaction and refuses loudly
+  if it didn't: a silent downgrade from a closed race to a narrower one is the worst outcome
+  available, because everything above would go on claiming enforced.
+
+- **"The row moved" means the table moved, and somebody else's write to a column Loom never mapped
+  counts.** Iceberg's commit protocol can assert a ref's snapshot and nothing finer, so the only
+  narrower test is comparing the row — and a row comparison cannot be carried into a commit. Choosing
+  it would trade the guarantee for the precision. Coarse-and-closed beats narrow-and-open, and the
+  false conflicts that follow (the snapshot is read *before* the rows, deliberately) are absorbed by
+  the retry rather than by loosening the order.
+
+  This settles the unmapped-column question **without qualifying the never-inspect rule** — it is the
+  same posture stated twice. A `modify` writes those columns back from a read taken before the
+  competing commit, so committing anyway would restore a stale value over somebody else's newer one.
+  Loom refuses to look at the column *and* refuses to overwrite it blind; the snapshot check is how
+  it manages the second without doing the first, since it compares no columns at all.
+
+- **A conflict is retried here, bounded at three, and the count is on the result.** Returning the
+  first conflict is what the roadmap line said and it is the weaker choice: a table-level check
+  refuses on any concurrent commit, so something has to absorb them, and pushing that onto every
+  caller means every caller writing the same retry loop — including the ones that are language
+  models. Each attempt re-reads and re-evaluates every rule and effect expression; nothing is
+  replayed, or a `now()` would freeze at a read that lost. The bound is about liveness, not
+  correctness. The real objection — a retry can succeed against a row the caller never saw — is
+  answered by what `validation` rules are *for*: they state which states the caller will act on, and
+  they are re-checked against the newer row, which is stricter than the caller's own stale read.
+  Where the competing write genuinely invalidates the action, the retry returns `validation_failed`
+  or `object_not_found`, the real reason. So the retry turns most races into nothing and the rest
+  into a decision.
+
+- **All three operations are checked, and the reasons differ.** `modify` for the carry-across above.
+  `create` because its read is the PK existence check and two concurrent creates both pass it, then
+  both append — manufacturing exactly the duplicate `ambiguous_key` refuses ever after and Loom can
+  never repair; checked, both read the same snapshot and only one can commit against it, which is
+  what finally makes the existence check mean something for writers coming through Loom. `delete`
+  against its own counter-argument: "the row is gone either way" holds only if the competing write
+  was also a delete, and if it was a `modify` the row is not gone, it changed — in the one operation
+  nothing can undo. When the competing write really was a delete, the retry finds nothing and returns
+  `object_not_found`, which is that outcome said accurately rather than a delete claiming work it
+  didn't do.
+
+- **The prompt is outside the window: the run re-reads, and approval is about the shape.** Checking
+  the *preview's* snapshot would put a person's thinking time inside a transaction, and it fails the
+  test that decides this — `run_<action>` has no prompt, so a design keyed to a preview is one the
+  MCP caller can never join. It also contradicts a decision already taken: `loom run` re-runs all
+  four steps because a preview is not a recording. The CLI says so above the `y/N` instead of
+  printing a snapshot id that would read as a hold, and reports afterwards if the table moved while
+  someone was deciding. `ActionResult.concurrency` is status-dependent for the same reason: a preview
+  writes nothing, so claiming "enforced" beside its snapshot id would be the exact misreading.
+
+- **The seam for testing a race is the port, not a hook.** A hook nothing in production calls drifts
+  out of step with the path that matters, and a conflict path that only fires under load is one
+  nobody knows works. Because reads and writes go through a narrow port, a test wraps a catalog in an
+  adversary whose `scan` commits a competing write before returning — the interleaving driven by the
+  runtime's own call sequence, so it is as deterministic as any other assertion. Against real
+  pyiceberg the adversary commits through a **second, independently opened catalog handle**: a
+  genuine concurrent writer producing a real commit that really advances `main`. Nothing in the
+  runtime knows a test exists. That is the ports decision paying out; a hook would only have been
+  needed if the runtime talked to pyiceberg directly.
+
+  `conflict`'s `detail` is settled here rather than later because the edit log wants the same shape:
+  expected, found, attempts, which declared properties moved (diffed through the same projection
+  `before`/`after` use, so unmapped columns are compared no more than they are reported), and whether
+  any of them is one this action reads or writes. An agent told only "conflict, retry" will hammer a
+  table that is merely busy and give up just as readily when its intent has really been overtaken.
 
 ---
 

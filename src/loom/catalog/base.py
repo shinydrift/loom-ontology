@@ -31,6 +31,27 @@ class CatalogError(RuntimeError):
     which catalog backend they were handed."""
 
 
+class ConcurrencyError(CatalogError):
+    """A row write was refused because the table had moved since the caller read it.
+
+    A subclass, so a caller that only knows about `CatalogError` still catches it and degrades to
+    "the write failed" — which is true, if less useful. The action runtime catches this one first
+    and turns it into a `conflict`, and it lives on the port for the same reason `CatalogError`
+    does: telling a lost race from a broken metastore must not require pyiceberg imported one layer
+    up.
+
+    `found` is best-effort and advisory. It is read *after* the refusal, so it may already be newer
+    than the snapshot that actually beat us; it is a diagnosis, never a thing to branch on."""
+
+    def __init__(
+        self, message: str, *, table: str, expected: int | None, found: int | None = None
+    ) -> None:
+        super().__init__(message)
+        self.table = table
+        self.expected = expected
+        self.found = found
+
+
 @dataclass(frozen=True)
 class Column:
     name: str
@@ -81,13 +102,14 @@ class Catalog(Protocol):
 
         A *read* verb, on the read port, because it answers a question about what was read: which
         version of this table did I just see. The action runtime records it alongside every
-        read-then-write so the concurrency slice has something to check the write against; nothing
-        enforces it yet, and the runtime says so rather than implying the two halves are one
-        transaction.
+        read-then-write and hands it back as `RowWriter`'s `expect_snapshot_id`, which is what makes
+        the read and the write behave as one decision.
 
-        Callers that record it must read it **before** the rows, not after. That order makes the
-        recorded snapshot at-or-before the data, so a later check can report a conflict that wasn't
-        one — but can never miss one that was."""
+        Callers must read it **before** the rows, not after. That order makes the recorded snapshot
+        at-or-before the data, so the check reports a conflict that wasn't one — but can never miss
+        one that was. Both halves of that are deliberate: the false conflicts are the price of the
+        guarantee, not a defect in it, and they are absorbed by the runtime retrying rather than by
+        loosening the order."""
         ...
 
 
@@ -181,28 +203,56 @@ class RowWriter(Protocol):
     the port take the whole row keeps that carry-across visible in the runtime, where the policy
     is and where a fake catalog can prove it, instead of hiding it in an implementation.
 
-    When the concurrency slice lands, `replace_row` and `delete_row` grow one optional argument —
-    the snapshot the row was read at — and the implementation turns it into a compare-and-swap.
-    Everything that argument will need is already captured (`Catalog.current_snapshot_id`); the
-    check is the only thing missing.
+    **Every verb takes `expect_snapshot_id`, and it is required.** The previous slice predicted an
+    *optional* argument on two of the three; both halves of that turned out to be wrong.
+
+    Required rather than optional, because an argument that can be omitted is a check that can be
+    skipped by forgetting — the sibling of the rule that kept it out of the port until something
+    passed it. There is no value meaning "don't check": `None` is a real expectation, namely "I read
+    a table that had no snapshots", which asserts the branch still does not exist. A caller that
+    genuinely has no expectation has not read anything, and has no business writing one row over
+    another.
+
+    All three rather than two, because `insert_row` follows a read as well — the primary-key
+    existence check — and two concurrent creates on one key otherwise both pass it and both append,
+    manufacturing exactly the duplicate row the runtime refuses as `ambiguous_key` every time it
+    meets one afterwards.
+
+    **The check must be atomic with the write.** Implementations lower it into the commit itself —
+    for Iceberg, an `assert-ref-snapshot-id` requirement validated by the catalog against live
+    metadata as the metadata pointer swaps. An implementation that re-reads, compares and then
+    writes has not implemented this port: that narrows the race rather than closing it, and the
+    word `expect` here promises closed. A backend that cannot express the assertion must raise
+    rather than approximate one. Refusal is `ConcurrencyError`, and nothing is written.
     """
 
     name: str
 
-    def insert_row(self, table: str, row: Mapping[str, Any]) -> None:
-        """Append exactly one row, keyed by column name."""
+    def insert_row(self, table: str, row: Mapping[str, Any], *, expect_snapshot_id: int | None) -> None:
+        """Append exactly one row, keyed by column name, if the table is still at
+        `expect_snapshot_id`."""
         ...
 
     def replace_row(
-        self, table: str, key_column: str, key_value: Any, row: Mapping[str, Any]
+        self,
+        table: str,
+        key_column: str,
+        key_value: Any,
+        row: Mapping[str, Any],
+        *,
+        expect_snapshot_id: int | None,
     ) -> None:
         """Delete the rows where `key_column` equals `key_value` and append `row`, in **one
         transaction**: a reader sees the old row or the new one, never neither and never both.
 
-        `row` must be the whole row, including the columns no property maps."""
+        `row` must be the whole row, including the columns no property maps — which is also why
+        this verb is checked. The carried columns come from a read, so committing over a table that
+        has moved writes somebody else's newer value back to what it used to be."""
         ...
 
-    def delete_row(self, table: str, key_column: str, key_value: Any) -> None:
+    def delete_row(
+        self, table: str, key_column: str, key_value: Any, *, expect_snapshot_id: int | None
+    ) -> None:
         """Delete the rows where `key_column` equals `key_value`.
 
         A row, not a column and not a table: Loom's never-drop rule is about refusing to *infer* a

@@ -289,7 +289,8 @@ def test_run_writes_a_row_and_prints_a_typed_result(tmp_path, capsys):
     # A decimal reaches the caller as a string, never through a float — the same rule the read
     # tools follow, because it is the same `json_safe`.
     assert result["after"]["total"] == "42.50"
-    assert result["concurrency"] == "recorded, not enforced"
+    assert result["concurrency"] == "enforced — the write asserts the snapshot the read saw"
+    assert result["attempts"] == 1
 
     assert main(["query", "Order", str(ontology), "--key", "o1"]) == 0
     assert '"total": "42.50"' in capsys.readouterr().out
@@ -309,6 +310,31 @@ def test_run_exits_nonzero_on_a_refusal_and_names_the_rule(tmp_path, capsys):
     assert "! object_exists" in captured.err
     assert "nothing was written." in captured.err
     assert json.loads(captured.out)["failures"][0]["code"] == "object_exists"
+
+
+def test_the_prompt_says_it_is_holding_nothing_while_you_decide(tmp_path, capsys):
+    """The confirmation prompt sits inside the window this slice is about, and the honest thing to
+    print above a `y/N` is that answering slowly is safe *because* nothing is reserved — not because
+    it is.
+
+    The run that follows does its own read and asserts that one. So what a person approves is the
+    shape of the change, which is also the only thing `run_<action>` could be said to approve, since
+    it has no prompt at all. A design where the checked snapshot came from the preview would be one
+    the MCP caller could never join, and it would put a human's thinking time inside a transaction.
+    """
+    ontology = _seeded(tmp_path)
+    main(["run", "createOrder", str(ontology), "--param", "orderId=o1",
+          "--param", "customerId=c1", "--param", "total=1.00", "--yes"])  # so the table has one
+    capsys.readouterr()
+
+    assert main(["run", "createOrder", str(ontology), "--param", "orderId=o2",
+                 "--param", "customerId=c1", "--param", "total=2.00", "--dry-run"]) == 0
+
+    err = capsys.readouterr().err
+    assert "previewed at snapshot" in err and "nothing is held" in err
+    assert "the run reads again and asserts that read" in err
+    # Never the word that would turn the number above it into a promise about the table.
+    assert "recorded, not yet enforced" not in err
 
 
 def test_run_names_an_unknown_action_without_a_traceback(tmp_path, capsys):

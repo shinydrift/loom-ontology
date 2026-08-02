@@ -10,6 +10,12 @@ you just read. Writes are two *separate* ports, so holding a `Catalog` — which
 the engines and `loom serve` are ever given — carries no ability to write at all, and holding one
 writer carries no ability to do the other's job. `loom apply` reaches for `writer_for()` and gets
 schema verbs only; the action runtime reaches for `row_writer_for()` and gets row verbs only.
+
+Every `RowWriter` verb takes the snapshot its caller read and asserts it *inside* the commit, so a
+read-then-write behaves as one decision without the port ever growing a lock, a session, or a verb
+that spans two tables. A backend that cannot express that assertion must refuse rather than
+approximate one — the port promises a closed race, not a narrowed one — and a write that loses comes
+back as `ConcurrencyError`, which the action runtime turns into a `conflict`.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ from .base import (
     CatalogError,
     CatalogWriter,
     Column,
+    ConcurrencyError,
     RowWriter,
     SchemaEdit,
     TableSchema,
@@ -32,6 +39,7 @@ __all__ = [
     "CatalogError",
     "CatalogWriter",
     "Column",
+    "ConcurrencyError",
     "RowWriter",
     "SchemaEdit",
     "TableSchema",
