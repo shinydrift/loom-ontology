@@ -71,6 +71,49 @@ def desired_tables(ontology: Ontology, diag: Diagnostics) -> dict[TableKey, Desi
     return tables
 
 
+def apply_renames(
+    tables: Mapping[TableKey, DesiredTable],
+    renames: Mapping[TableKey, Mapping[str, str]],
+    diag: Diagnostics,
+) -> dict[TableKey, DesiredTable]:
+    """Overlay `renamedFrom` the spec doesn't carry — the rollback path's one input to planning.
+
+    A restored spec says `column: lifetime_value` and nothing more, because `renamedFrom` points
+    *forward*: a spec written before a rename cannot name the column that rename has to be undone
+    from. `rollback` reads that out of `_loom_meta` and hands it here, and from this point the plan
+    is the ordinary one — `diff._renamed`, the same four live shapes, the same refusal when both
+    columns exist.
+
+    The overlay wins over a `renamedFrom` already in the file. The spec's key describes a migration
+    that may or may not have been spent against *this* lake; the overlay is derived from what the
+    history says actually happened to it."""
+    out: dict[TableKey, DesiredTable] = {}
+    for key, table in tables.items():
+        overlay = renames.get(key)
+        if not overlay:
+            out[key] = table
+            continue
+        for name, old in sorted(overlay.items()):
+            # Rule 10 (spec §2) again, at the one scope a synthesised key can break it: nothing has
+            # validated this overlay, and a rename onto a column the restored spec also maps is as
+            # wrong here as it would be in a file.
+            if old in table.columns:
+                diag.error(
+                    f"rolling back '{table.table}' would rename '{old}' back to '{name}', but the "
+                    f"restored spec maps both columns",
+                    hint="Loom never drops a column, so a rename cannot take one another property "
+                    "is live on — roll back to a version on the other side of that rename",
+                )
+        out[key] = replace(
+            table,
+            columns={
+                name: replace(col, renamed_from=overlay[name]) if name in overlay else col
+                for name, col in table.columns.items()
+            },
+        )
+    return out
+
+
 def _add_object(
     obj: ObjectType, ontology: Ontology, tables: dict[TableKey, DesiredTable], diag: Diagnostics
 ) -> None:

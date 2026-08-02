@@ -61,6 +61,10 @@ class TableOutcome:
     table: str
     action: str  # create | alter
     columns: tuple[str, ...] = ()  # "column: detail", as the plan rendered them
+    # The renames this table performed, as `(new name, old name)`. `columns` says the same thing in
+    # prose, for a human reading the history; this says it as data, because `rollback` has to
+    # *invert* it and a rollback that mis-parsed a display string would rename the wrong column.
+    renames: tuple[tuple[str, str], ...] = ()
     namespace_created: str = ""  # the namespace, if this run had to create it
     error: str = ""
 
@@ -73,6 +77,8 @@ class TableOutcome:
         entry: dict[str, Any] = {"table": f"{self.catalog}.{self.table}", "action": self.action}
         if self.columns:
             entry["columns"] = list(self.columns)
+        if self.renames:
+            entry["renames"] = dict(self.renames)
         if self.namespace_created:
             entry["namespace_created"] = self.namespace_created
         if self.error:
@@ -104,8 +110,13 @@ def apply_plan(
     *,
     actor: str | None = None,
     now: datetime | None = None,
+    rollback_of: int | None = None,
 ) -> ApplyResult:
-    """Execute `plan` and record it. The only entry point; `loom apply` is a thin shell over it."""
+    """Execute `plan` and record it. The only entry point; `loom apply` is a thin shell over it.
+
+    `rollback_of` is the version a `loom rollback` restored, and the only thing it changes is the
+    shape of the recorded summary — a rollback executes through exactly this path, under exactly
+    these rules, because it is an apply of a spec that happens to be an old one."""
     breaking = tuple(t for t in plan.changes if t.severity is Severity.BREAKING)
     if breaking:
         return ApplyResult(status=REFUSED, blocked=breaking, error=_refusal(breaking))
@@ -144,7 +155,9 @@ def apply_plan(
     # Recorded even when a table failed — a partial apply is exactly the run whose history someone
     # will want to read — but marked as such, so the "already applied" check never trusts it.
     row_status = STATUS_PARTIAL if failure else STATUS_APPLIED
-    recorded, record_error = _record(stores, pending, snapshot, outcomes, version, row_status, actor, now)
+    recorded, record_error = _record(
+        stores, pending, snapshot, outcomes, version, row_status, actor, now, rollback_of
+    )
     # A recording failure after committed DDL is reported, not raised: the schema change cannot be
     # taken back, and the next run re-plans against the live catalog, finds nothing to do, and
     # records the spec then.
@@ -189,6 +202,7 @@ def _to_record(
 
 def _execute(change: TableChange, writer: CatalogWriter, properties: Mapping[str, str]) -> TableOutcome:
     columns = tuple(f"{c.column}: {c.detail}" for c in change.columns)
+    renames = tuple((c.column, c.renamed_from) for c in change.columns if c.kind == "rename")
     created_namespace = ""
     try:
         if change.action == "create":
@@ -198,8 +212,10 @@ def _execute(change: TableChange, writer: CatalogWriter, properties: Mapping[str
         else:
             writer.alter_table(change.table, [_edit(c) for c in change.columns], properties)
     except CatalogError as e:
-        return TableOutcome(change.catalog, change.table, change.action, columns, created_namespace, str(e))
-    return TableOutcome(change.catalog, change.table, change.action, columns, created_namespace)
+        return TableOutcome(
+            change.catalog, change.table, change.action, columns, renames, created_namespace, str(e)
+        )
+    return TableOutcome(change.catalog, change.table, change.action, columns, renames, created_namespace)
 
 
 def _column(change: ColumnChange) -> Column:
@@ -221,17 +237,27 @@ def _record(
     row_status: str,
     actor: str | None,
     now: datetime | None,
+    rollback_of: int | None = None,
 ) -> tuple[dict[str, int], str]:
     """Append the history rows. Returns the versions actually written and the first error, if any.
 
     A catalog only ever records the tables *it* holds, so a two-catalog spec produces two rows that
     each describe their own half — but both carry the whole spec and the same version, because
     that is what was applied.
+
+    A rollback records the same tables under a `rollback_of` naming the version it restored. It
+    goes in the summary rather than in `status` or in a column of its own: `status` is what the
+    *next* run's "is this spec already applied here?" check reads, and after a rollback the lake
+    genuinely is at the restored spec, so anything but `applied` would make that check believe
+    something false. A new column is not an option either — `_ensure_table` only ever creates, so
+    one would never reach a `_loom_meta` that already exists.
     """
     recorded: dict[str, int] = {}
     error = ""
     for name in pending:
-        summary = [o.as_json() for o in outcomes if o.catalog == name]
+        summary: Any = [o.as_json() for o in outcomes if o.catalog == name]
+        if rollback_of is not None:
+            summary = {"rollback_of": rollback_of, "tables": summary}
         try:
             entry = stores[name].record(
                 snapshot, summary, version=version, status=row_status, actor=actor, now=now

@@ -83,9 +83,10 @@ Two decisions shape the framework:
 ## Status
 
 Early, but the **read path works end to end**: a YAML spec over real Iceberg tables, served to an
-MCP client as typed tools. The **migration path** now runs too — `loom plan` classifies what a spec
-change would do to the physical tables and `loom apply` executes it, bootstrapping an empty
-warehouse from nothing but a spec. The action runtime (row-level writeback) is next.
+MCP client as typed tools. The **migration path** is now complete — `loom plan` classifies what a
+spec change would do to the physical tables, `loom apply` executes it (bootstrapping an empty
+warehouse from nothing but a spec), and `loom rollback` puts an earlier spec back. The action
+runtime (row-level writeback) is next.
 
 | Component | State |
 |-----------|-------|
@@ -104,7 +105,7 @@ warehouse from nothing but a spec. The action runtime (row-level writeback) is n
 | Migration diff + dry run (`migrate/`) | ✅ `loom plan` |
 | Migration executor + `_loom_meta` state store | ✅ `loom apply` |
 | `renamedFrom` — column renames as field-id remaps | ✅ |
-| Migration rollback | ⏳ |
+| Migration rollback | ✅ `loom rollback` |
 | Action runtime — single-object writeback | ⏳ |
 | MCP `run_<action>` tools + HTTP transport | ⏳ |
 | Governance (row/column policies) | ⏳ |
@@ -118,7 +119,7 @@ warehouse from nothing but a spec. The action runtime (row-level writeback) is n
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 264 tests
+pytest                              # 290 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 2 action(s)
 ```
 
@@ -299,6 +300,56 @@ spec is deployed to more than one lake, and after a rename ships to production, 
 the other side of it. "You can delete this now" would be true of one catalog and false of another
 from the same file. `_loom_meta` records which version did the rename, which is the honest place
 for that answer.
+
+## Rolling back
+
+An apply that went wrong needs an answer other than hand-editing the YAML back to what it was.
+`loom rollback` restores the spec `_loom_meta` recorded, re-plans it against the live catalog, and
+executes that — the same loop as `apply`, over an older spec:
+
+```
+$ loom rollback ./ontology --to 1
+Loom rollback — ./ontology
+Restoring the spec recorded at version 1 (from local).
+Rows are untouched — `apply` only ever ran DDL, so this only reverses DDL.
+
+  ~ local.crm.customers — 1 change(s) · Customer
+      ~ ltv_usd  renamed from lifetime_value  safe
+          the column keeps field id 2, so no data file is rewritten; readers outside the
+          ontology that select 'lifetime_value' by name will need updating
+
+Plan: 0 to create, 1 to change · 1 safe
+
+Left in place — a rollback never drops, so these stay live and unmanaged:
+  · local.crm.customers: region — added after version 1
+
+Spec files:
+  ~ customer.yaml — restored
+```
+
+**Only renames actually reverse, and it says so rather than pretending otherwise.** Of the four
+things Loom can do to a column, a rename is the one that undoes itself: the same field id comes
+back under the old name, and no data file is rewritten. An add reverses to a *drop* — and Loom
+never drops — so `region` above stays live, the restored spec no longer maps it, and it is
+unmanaged from here on. That is the honest report, which is why it's printed rather than left to be
+found later. A table created since is left whole for the same reason.
+
+Reversing a promotion is a narrowing and reversing a loosening is a tightening, and both are
+breaking, so those rollbacks are refused whole like any other breaking plan. That isn't a hole:
+once the column is a `long`, the spec that says `int` no longer describes this lake, and the way
+out is forward.
+
+Two more things follow from `_loom_meta` being history rather than state. **A rollback is an
+append** — a new row carrying the restored spec's text and hash, never a deleted one — so the next
+`loom apply` sees a spec that is already live and does nothing. And the **reverse rename comes out
+of that history**: `renamedFrom` points forward, so the version-1 spec can't name the column it has
+to be renamed back from, but version 2 recorded what it renamed and rollback inverts it (composing
+the chain if there were several).
+
+**It reverses DDL and only DDL.** `apply` never wrote a row, so `rollback` never deletes one — no
+snapshot rollback, no expiry. Rows written since are not Loom's to throw away. Spec files are the
+last thing it writes and only if the run wasn't refused, so a rollback you decline leaves the lake
+*and* the working tree exactly as they were.
 
 The validator accumulates every problem and reports them in one pass with source locations:
 

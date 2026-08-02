@@ -2,8 +2,9 @@
 
 `plan` is pure read: it derives the tables the spec *wants* (`schema.py`), compares them against
 what the catalog actually holds (`diff.py`), and prints the classified result (`render.py`).
-`apply` executes that same plan (`executor.py`) and records it (`meta.py`). What remains of M2 is
-rollback.
+`apply` executes that same plan (`executor.py`) and records it (`meta.py`). `rollback` restores a
+spec out of that record and re-plans it (`rollback.py`) — the same diff, the same executor, the
+same refusal, run against an older spec.
 
 Five rules shape the whole package:
 
@@ -22,6 +23,10 @@ Five rules shape the whole package:
 - **A breaking plan is refused whole.** Not partially applied. See `executor._refusal`.
 - **Writes go through a separate port.** `apply` asks the catalog layer for a `CatalogWriter`;
   everything else in Loom holds a read-only `Catalog` and could not execute DDL if it tried.
+
+The never-drop rule is the one that shapes `rollback` most: it means a rollback undoes renames and
+nothing else. Adds stay live and unmanaged, and reversing a promotion or a loosening is itself
+breaking, so it is refused whole. See `rollback.py`.
 """
 
 from __future__ import annotations
@@ -36,7 +41,19 @@ from .diff import (
 )
 from .executor import APPLIED, FAILED, REFUSED, UP_TO_DATE, ApplyResult, TableOutcome, apply_plan
 from .meta import META_TABLE, AppliedRecord, MetaStore, SpecSnapshot, snapshot_spec
-from .render import render_apply, render_plan
+from .render import render_apply, render_plan, render_rollback
+from .rollback import (
+    FileChanges,
+    LeftBehind,
+    RollbackError,
+    RollbackTarget,
+    file_changes,
+    latest_version,
+    left_behind,
+    materialize,
+    resolve_target,
+    restore_files,
+)
 from .schema import DesiredColumn, DesiredTable, desired_tables
 
 __all__ = [
@@ -49,9 +66,13 @@ __all__ = [
     "ColumnChange",
     "DesiredColumn",
     "DesiredTable",
+    "FileChanges",
+    "LeftBehind",
     "META_TABLE",
     "MetaStore",
     "MigrationPlan",
+    "RollbackError",
+    "RollbackTarget",
     "Severity",
     "SpecSnapshot",
     "TableChange",
@@ -60,7 +81,14 @@ __all__ = [
     "apply_plan",
     "desired_tables",
     "diff_ontology",
+    "file_changes",
+    "latest_version",
+    "left_behind",
+    "materialize",
     "render_apply",
     "render_plan",
+    "render_rollback",
+    "resolve_target",
+    "restore_files",
     "snapshot_spec",
 ]
