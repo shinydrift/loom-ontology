@@ -209,10 +209,22 @@ python examples/retail/seed.py                        # create + populate the Ic
 loom validate --physical examples/retail/ontology     # check the spec against live metadata
 loom query Customer examples/retail/ontology --key c1 # → one row, through DuckDB
 loom query Customer examples/retail/ontology --key c2 --link orders   # → a link traversal
+loom query DailySalesPerformance examples/retail/ontology --key 2026-02-11 # → precomputed daily KPIs
 loom run upgradeTier examples/retail/ontology \
   --param customer=c3 --param newTier=gold            # → one row rewritten, one row recorded
-loom serve examples/retail/ontology                   # → 7 MCP tools over stdio
+loom serve examples/retail/ontology                   # → 10 MCP tools over stdio
 ```
+
+The retail example also demonstrates a small production-shaped analytics workflow. `seed.py`
+materializes `sales.daily_sales_performance` from the current `sales.orders` Iceberg snapshot and
+Loom exposes it as the ordinary typed `DailySalesPerformance` object (including
+`get_daily_sales_performance`, `search_daily_sales_performance`, and
+`list_daily_sales_performance`). Revenue, order count, and unique-customer count are therefore
+computed once during refresh, not on every agent request. Every materialized row carries
+`refreshedAt`, `sourceTable`, and `sourceSnapshotId`, so a retrieved answer says exactly when and
+from which source snapshot it was derived. To refresh after loading orders, call
+`refresh_daily_sales_performance(catalog)` from `examples/retail/sales_performance.py`; rerunning
+`seed.py` performs the same full refresh for the local demonstration warehouse.
 
 That run also created `_loom_meta.edits` and appended to it — no `loom apply` in this lake's history
 at all, because the log is created by whatever run needs it first rather than by a migration:
@@ -235,8 +247,10 @@ Point any MCP client at that last command and the ontology shows up as typed too
 
 ```
 $ loom serve examples/retail/ontology
-loom serve — 2 object type(s), 1 link type(s), 3 action(s) → 7 tool(s) over stdio
-  get_customer  get_order  list_customer  list_order  search_customer  search_order  traverse
+loom serve — 3 object type(s), 1 link type(s), 3 action(s) → 10 tool(s) over stdio
+  get_customer  get_daily_sales_performance  get_order  list_customer
+  list_daily_sales_performance  list_order  search_customer  search_daily_sales_performance
+  search_order  traverse
   read-only · mcp.writes is false, so 3 declared action(s) are not exposed
     (`loom run` still reaches them — the runtime is not what is switched off, the surface is)
 ```
@@ -245,13 +259,14 @@ Three actions and no `run_` tools, because **serving writes is a choice a deploy
 one a spec makes. `loom serve` used to be incapable of changing anything and people pointed it at
 real lakes on that basis; letting an upgrade plus an unrelated spec edit quietly make one mutable is
 not a default worth having. Add two lines under `mcp:` in `loom.yaml` and the same command serves
-ten tools:
+thirteen tools:
 
 ```
 $ loom serve examples/retail/ontology     # mcp: { writes: true, actor: agent:support-bot }
-loom serve — 2 object type(s), 1 link type(s), 3 action(s) → 10 tool(s) over stdio
-  get_customer  get_order  list_customer  list_order  run_forget_customer  run_record_order
-  run_upgrade_tier  search_customer  search_order  traverse
+loom serve — 3 object type(s), 1 link type(s), 3 action(s) → 13 tool(s) over stdio
+  get_customer  get_daily_sales_performance  get_order  list_customer
+  list_daily_sales_performance  list_order  run_forget_customer  run_record_order  run_upgrade_tier
+  search_customer  search_daily_sales_performance  search_order  traverse
   writes enabled · 3 action(s) exposed, every run recorded as actor 'agent:support-bot'
 ```
 
@@ -262,15 +277,17 @@ Change one more line and the same tools are served over a socket instead of a pi
 
 ```
 $ loom serve examples/retail/ontology     # mcp: { transport: http }
-loom serve — 2 object type(s), 1 link type(s), 3 action(s) → 7 tool(s) over http
-  get_customer  get_order  list_customer  list_order  search_customer  search_order  traverse
+loom serve — 3 object type(s), 1 link type(s), 3 action(s) → 10 tool(s) over http
+  get_customer  get_daily_sales_performance  get_order  list_customer
+  list_daily_sales_performance  list_order  search_customer  search_daily_sales_performance
+  search_order  traverse
   read-only · mcp.writes is false, so 3 declared action(s) are not exposed
     (`loom run` still reaches them — the runtime is not what is switched off, the surface is)
   listening on http://127.0.0.1:8000/mcp · cleartext HTTP, no TLS — terminate it in front
   one call at a time · tool calls are serialized, so a slow query blocks the server rather than queueing beside another
 ```
 
-The same seven tools, because **a transport is not an input to the surface** — a spec compiles to
+The same ten tools, because **a transport is not an input to the surface** — a spec compiles to
 one tool set and both transports are handed it. What differs is what a *process* is. `host`, `port`
 and `path` live in `loom.yaml` rather than on the command line, for the reason `writes` does: a flag
 lets one invocation contradict the file an operator reviews, and "who can reach this" is exactly the
