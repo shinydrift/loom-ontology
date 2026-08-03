@@ -156,7 +156,7 @@ from .result import (
     ActionResult,
     Failure,
 )
-from .runtime import MAX_ATTEMPTS, ActionError, ActionRuntime, build_runtime
+from .runtime import MAX_ATTEMPTS, ActionError, ActionRuntime, WriteBinding, bind_writes, build_runtime
 
 __all__ = [
     "AMBIGUOUS_KEY",
@@ -185,5 +185,7 @@ __all__ = [
     "EditRecord",
     "Failure",
     "build_runtime",
+    "bind_writes",
+    "WriteBinding",
     "require_edit_log",
 ]

@@ -1,8 +1,16 @@
 """The expression mini-language — §5 of the spec grammar.
 
 Deliberately tiny so it stays portable across query engines and safe to evaluate: references
-(`param`, `object.prop`), literals, comparison/boolean/arithmetic operators, and a fixed
-function allow-list. No loops, lambdas, assignment, or arbitrary code.
+(`param`, `object.prop`, `principal.claim`), literals, comparison/boolean/arithmetic operators, and
+a fixed function allow-list. No loops, lambdas, assignment, or arbitrary code.
+
+**Three reference forms, and one rule places all of them: a reference is legal where its
+declaration is in scope.** A bare name is an action *parameter*, declared by the action. `object.x`
+is a *property*, declared by the object type. `principal.x` is a token *claim*, declared by
+`mcp.auth.claims` in a `loom.yaml` — so it is legal in a governance policy and nowhere else, and
+`validator.py` refuses it in an ontology by name. That is what keeps an ontology deployment-blind:
+the spec still references only what the spec declares, and the file that describes a deployment is
+the file that may describe its callers. See `governance.py` and `predicate.py`.
 
 This module only *parses and shape-checks* expressions into an AST. Binding references to real
 parameters/properties, evaluating the AST against a bound row, and later lowering it to engine SQL
@@ -26,14 +34,24 @@ FUNCTIONS: dict[str, tuple[int, int | None]] = {
     "coalesce": (1, None),
 }
 
-BINARY_OPS = frozenset({"||", "&&", "==", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/"})
+BINARY_OPS = frozenset({"||", "&&", "==", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "contains"})
 UNARY_OPS = frozenset({"!", "-"})
 """Every operator the grammar has, named here so a *subset* of it can be declared elsewhere and
 checked against the whole.
 
 `predicate.py` lowers part of this language into SQL and must account for the rest key by key;
-`ENFORCED_KEYS`/`RESERVED_KEYS` do the same thing for the policy grammar. `-` appears in both sets
-because one symbol is two operators, and a reason to refuse it covers both."""
+`ENFORCED_KEYS` does the same thing for the policy grammar. `-` appears in both sets because one
+symbol is two operators, and a reason to refuse it covers both.
+
+**`contains` is a word rather than a symbol, and it is the one operator no ontology can use.** Its
+left operand is a list of strings, and no *property* type is a list — complex types are backlog — so
+the only thing in the language it can stand against today is an array-valued token claim
+(`principal.groups contains 'auditors'`). It is here rather than in a grammar of its own because
+there is one expression language: a policy guard and a validation rule are parsed by this function,
+and a second parser for four-line conditions would be the second grammar this module exists to not
+have. It becomes generally useful the day `array` lands as a property type. The cost is that
+`contains` is now a reserved word — a parameter or property spelled that way cannot be referenced —
+which is why it is a word this vocabulary does not otherwise use."""
 
 _KEYWORD_LITERALS = {"true": True, "false": False, "null": None}
 
@@ -107,6 +125,7 @@ def _walk(node: object, visit) -> None:
 # ---- tokenizer -----------------------------------------------------------------
 
 _PUNCT = ["||", "&&", "==", "!=", "<=", ">=", "(", ")", ",", ".", "!", "<", ">", "+", "-", "*", "/"]
+_WORD_OPS = frozenset({"contains"})
 
 
 def _tokenize(s: str) -> list[tuple[str, object]]:
@@ -140,7 +159,11 @@ def _tokenize(s: str) -> list[tuple[str, object]]:
             j = i
             while j < n and (s[j].isalnum() or s[j] == "_"):
                 j += 1
-            toks.append(("ident", s[i:j]))
+            word = s[i:j]
+            # The one word-shaped operator. Lexed here rather than recognised in the parser so that
+            # `contains` is an operator everywhere or nowhere — a token that is sometimes a name and
+            # sometimes an operator is how a grammar grows a case nobody can read.
+            toks.append(("op", word) if word in _WORD_OPS else ("ident", word))
             i = j
             continue
         for p in _PUNCT:
@@ -159,7 +182,7 @@ def _tokenize(s: str) -> list[tuple[str, object]]:
 # Higher binds tighter.
 _PRECEDENCE = {
     "||": 1, "&&": 2,
-    "==": 3, "!=": 3, "<": 3, "<=": 3, ">": 3, ">=": 3,
+    "==": 3, "!=": 3, "<": 3, "<=": 3, ">": 3, ">=": 3, "contains": 3,
     "+": 4, "-": 4, "*": 5, "/": 5,
 }
 

@@ -229,6 +229,22 @@ class _ExprChecker:
                 return PropType("boolean")
             return inner  # unary minus preserves numeric type
         if isinstance(node, Binary):
+            if node.op == "contains":
+                # Refused rather than inferred-as-unknown, which is what this optimistic checker
+                # would otherwise do with it. `contains` tests membership in a **list**, and no
+                # property or parameter type is a list — so in an ontology it is an operator that
+                # can never be satisfied, and the honest failure for one of those is at load rather
+                # than as an `expression_error` on somebody's run. It exists for a governance
+                # guard over a list-valued claim (§6.1), and it becomes writable here the day
+                # `array` lands as a property type.
+                self.diag.error(
+                    f"'contains' cannot be used in action '{self.act.api_name}' — no property or "
+                    "parameter type is a list",
+                    self.loc,
+                    "'contains' tests membership in a list claim, which only a governance policy's "
+                    "'when:' guard has",
+                )
+                return None
             lt = self._infer(node.left)
             rt = self._infer(node.right)
             if node.op in _COMPARISONS or node.op in _BOOLEANS:
@@ -260,6 +276,22 @@ class _ExprChecker:
                 self.diag.error(f"'object.{prop}' is not a property of the target object", self.loc)
                 return None
             return self.object_props[prop]
+        if ref.path[0] == "principal":
+            # **The one reference form an ontology may not use**, and the refusal is what keeps a
+            # spec deployment-blind. A claim is declared in `loom.yaml` (`mcp.auth.claims`), beside
+            # the issuer that mints it, so it is in scope for a governance policy and nowhere else —
+            # see `expr.py` for the rule that places all three forms. A rule that named a caller
+            # would also make an action's precondition depend on who is running it, which is
+            # authorization inside a validation rule: what a caller may do is `mcp.writes` and
+            # `governance`, in the file a deployment is configured by.
+            self.diag.error(
+                f"'{'.'.join(ref.path)}' names the caller, which an ontology cannot see "
+                f"(in action '{self.act.api_name}')",
+                self.loc,
+                "a spec describes what exists, not who is asking — 'principal.<claim>' is declared "
+                "in loom.yaml and may only be used by a governance policy there",
+            )
+            return None
         self.diag.error(f"unsupported reference '{'.'.join(ref.path)}' (use a parameter or object.<prop>)", self.loc)
         return None
 

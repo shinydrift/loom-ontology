@@ -2,9 +2,9 @@
 
 `mcp.actor` names a **deployment**; `default_actor()` infers an **OS user**. Neither is a caller.
 This module is the third kind spec-v0 named and M4 could not build: a principal **attested** by a
-transport that checked it. It is the whole of what M6's first slice adds, and it adds nothing else —
-a policy still names no principal, and `governance.when:` is still refused. What lands here is a
-*source*, on the one transport that can carry one.
+transport that checked it. It shipped as a *source* with one reader — the edit log — and the slice
+after it gave the source its second: a `governance` policy may now name a caller, and
+`PolicyProgram.select` reads a `Principal`'s claims to decide one.
 
 **Loom is a resource server. It is never an authorization server.** That line is what makes
 "validate tokens yourself" and "refuse to be an auth server" the same decision rather than opposed
@@ -63,10 +63,11 @@ path of every tool call, and a JWT signed by a key Loom already holds needs no s
 
 **Where the principal goes, and where it does not.** It reaches `ActionRuntime.run` and lands in the
 edit log beside `mcp.actor` — see `log.EditRecord.principal` for why *beside* rather than instead
-of. It does **not** reach the resolver, and that is permanent: what will vary per call when
-`governance.when:` lands is a decided `PolicySet`, selected above the resolver, never an identity
-threaded into it. See `governance.py` for the argument and `ROADMAP.md` for the slice that builds
-it.
+of. It reaches `PolicyProgram.select`, which is *above* the resolver and above the action runtime,
+and what comes out of there is a decided `PolicySet`. It does **not** reach the resolver, and that is
+permanent rather than pending: a principal is constant for the duration of a call, so everything it
+conditions folds to a literal before the call begins, and every enforcement site reads a set that is
+already decided. See `governance.py` for the argument.
 """
 
 from __future__ import annotations
@@ -76,6 +77,8 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+from .types import PropType
 
 if TYPE_CHECKING:
     from .config import McpAuth
@@ -105,6 +108,66 @@ JWKS_TIMEOUT = 10
 """Seconds to wait for the issuer's key set. Bounded so a slow issuer cannot pin a tool call open."""
 
 
+@dataclass(frozen=True)
+class ClaimType:
+    """The declared type of one token claim — the whole of what a policy may know about a caller.
+
+    **Claims are declared, and this is the type vocabulary they are declared in.** `governance`
+    policies may name `principal.<claim>`, and a reference nothing declares is a reference nothing
+    can check: a typo would be caught by neither the parser nor the bind, and it fails *closed* (see
+    `predicate.guard_truth`), so the deployment would over-withhold silently. Declaring them buys the
+    two things every other reference form already has — a refusal that names the typo, and an actual
+    comparability check against the property it is compared with.
+
+    **Declared in `loom.yaml` and never in an ontology**, which is what keeps the spec
+    deployment-blind: `mcp.auth.claims` sits beside the issuer that mints them, in the same file as
+    the policy that reads them. See `expr.py` for the rule that places all three reference forms.
+
+    The vocabulary is deliberately three entries. `string` and `string[]` are what a real token
+    carries where a policy cares — `sub`, `dept`, `tenant`, `groups`, `roles` — and `boolean` is
+    free. **There is no number**, because a JSON number's Loom type is ambiguous (`int`? `double`?)
+    and nothing motivating needs one; adding one later accepts a config that is refused today, which
+    is the direction this codebase widens in."""
+
+    kind: str
+    array: bool = False
+
+    @property
+    def spelling(self) -> str:
+        return f"{self.kind}[]" if self.array else self.kind
+
+    def element_type(self) -> PropType:
+        """The claim's value as a Loom type, so a comparison against a property can be *checked*.
+
+        For an array claim this is the type of its *elements*, which is the only thing `contains`
+        ever compares — a list itself is comparable to nothing in this language."""
+        return PropType(self.kind)
+
+
+CLAIM_TYPES: Mapping[str, ClaimType] = {
+    "string": ClaimType("string"),
+    "string[]": ClaimType("string", array=True),
+    "boolean": ClaimType("boolean"),
+}
+"""Every type a claim may be declared as. See `ClaimType` for why the list is this short."""
+
+BUILT_IN_CLAIMS: Mapping[str, ClaimType] = {
+    "sub": ClaimType("string"),
+    "iss": ClaimType("string"),
+}
+"""The two claims a deployment never declares, because `TokenVerifier` already requires them.
+
+Both are `require`d by the decoder, so a policy naming either is reading something every believable
+token carries — they are the only claims a `when:` can name that can never be undecided. They may
+not be redeclared: a config giving `sub` some other type would be describing a token this deployment
+would have refused.
+
+**`sub` is safe to compare here even though it is unsafe to record alone.** `Principal.label` exists
+because a bare subject silently merges two people the day a second issuer is trusted; a policy is
+evaluated inside one deployment, and `McpAuth` names exactly one issuer, so within a policy `sub` is
+unambiguous by construction. The edit log outlives that guarantee. A predicate does not."""
+
+
 class AuthError(RuntimeError):
     """A token this deployment will not believe, or a verifier it cannot build.
 
@@ -130,11 +193,14 @@ class Principal:
     issuer, and the merge would be invisible in the recorded value.
 
     `claims` is what the token said, after verification, and it is carried whole rather than
-    narrowed. Nothing reads it in this slice — it is what `governance.when:` will evaluate against,
-    and it is here now because a `Principal` that dropped it would have to be widened later by a
-    slice that also has to argue about the grammar. That is the one exception this module makes to
-    *no field written and never read*, and it is made explicitly rather than quietly: the field is
-    populated, asserted in tests, and named in the slice that consumes it."""
+    narrowed. **It has its reader**: `governance.PolicyProgram.select` evaluates a policy's `when:`
+    against it and folds `principal.<claim>` into a row predicate's literals. It was populated one
+    slice before that reader existed — the one exception this module made to *no field written and
+    never read* — and the exception has now closed rather than lapsed.
+
+    Carried whole rather than narrowed to the declared claims, because narrowing here would put the
+    config's vocabulary inside the transport boundary: `ClaimType` decides what a *policy* may read,
+    and a `Principal` is what the token said."""
 
     subject: str
     issuer: str
@@ -164,6 +230,46 @@ class Principal:
         if not subject or not issuer:
             return None
         return cls(subject=str(subject), issuer=str(issuer), client_id=str(token.client_id), claims=claims)
+
+
+def readable_claims(
+    principal: Principal | None, declared: Mapping[str, ClaimType]
+) -> Mapping[str, Any]:
+    """What a policy may read of this caller: declared claims whose values are the declared type.
+
+    Three things are dropped here rather than downstream, and all three drop for one reason —
+    **anything a policy cannot decide about must be absent rather than wrong**, because absence is
+    already defined (undecided, and undecided withholds) while a wrong value would be *decided*
+    against a type nobody checked:
+
+    - a claim the token carries and the config never declared: not a claim of this deployment;
+    - a claim whose value is not its declared type — a token contradicting the config that described
+      it. Substituting it would let the two planes disagree, since SQL and `_equal` do not compare a
+      string with a number the same way;
+    - `null`, which is the same statement: a claim with no value decides nothing about a caller.
+
+    Called once per call, above the resolver, so `fold` and `guard_truth` read one already-checked
+    mapping rather than re-deriving what is usable from two places that could disagree."""
+    if principal is None:
+        return {}
+    out: dict[str, Any] = {}
+    for name, claim_type in {**declared, **BUILT_IN_CLAIMS}.items():
+        value = principal.claims.get(name)
+        if value is None:
+            continue
+        if claim_type.array:
+            if isinstance(value, (list, tuple)) and all(_is_a(v, claim_type.kind) for v in value):
+                out[name] = list(value)
+        elif _is_a(value, claim_type.kind):
+            out[name] = value
+    return out
+
+
+def _is_a(value: Any, kind: str) -> bool:
+    """Whether a JSON value is the declared kind. `bool` is checked first because it is an `int`."""
+    if kind == "boolean":
+        return isinstance(value, bool)
+    return isinstance(value, str)
 
 
 def current_principal() -> Principal | None:

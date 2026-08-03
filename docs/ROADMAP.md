@@ -1034,7 +1034,7 @@ turns out no policy can say):
 
 ---
 
-## 🔵 In progress — M6: A per-caller identity over MCP
+## ✅ Done — M6: A per-caller identity over MCP
 
 *Goal: a caller this deployment checked, and a policy that can name one.*
 
@@ -1125,7 +1125,7 @@ whatever milestone makes a handler `async`. That correction is worth roughly hal
 
 ---
 
-### First slice — attestation, with a source and a reader (this PR)
+### First slice — attestation, with a source and a reader
 
 Sliced this way for a reason worth recording, because it is **not** the seam-first plan this
 milestone was scoped with. A seam-only slice — `PolicyProgram`, per-call selection, `when:` still
@@ -1187,17 +1187,90 @@ Three things found by building it, each of which changed the code:
 neither — it is the third kind spec-v0 named), and it still reaches the edit log. What it no longer
 does is reach it *alone*.
 
-### Next slice — `when:`, and the seam it needs
+### Second slice — `when:`, and the half of a policy that may name a caller (this PR)
 
-- `bind_policies` → a program; per-call selection into the `PolicySet` the resolver already takes;
-  the same-object assertion for programs with no conditional policies.
-- The `when:` grammar over the principal's claims, and the fold that turns a principal-valued
-  predicate into a literal.
-- The refusal from decision 2, at the pairing point, for every surface that cannot attest.
-- `when:` moves `RESERVED_KEYS` → `ENFORCED_KEYS`, which **empties** `RESERVED_KEYS` and leaves
-  `Reserved` a dataclass nothing constructs. That is the `loom.managed` shape this codebase has
-  already paid for once, so the slice either deletes the machinery or writes down why it stays. The
-  partition test holds either way; `MOVED_KEYS`/`audit` is unaffected.
+Everything the first slice's four decisions predicted, plus one refusal they did not: **half a
+policy may name the caller.** `rows:` may be conditioned — by a `when:` guard, by a
+`principal.<claim>` inside the predicate, or both — and `mask:` may not, ever.
+
+**1. A conditional mask is refused, and the argument is §6.1's own first rule.** *The schema is
+public; the data is not.* A mask announces itself in the tool description, in the `filter` schema and
+in `masked` on every result, and §7 says the tool set and its argument namespaces are a function of
+the spec. A per-caller mask therefore has three possible spellings, and each is something this
+codebase already refuses somewhere else: assemble the tool set per caller (the surface becomes a
+function of the caller); announce the worst case to everyone (narrowing the surface to fit, which §6
+will not do even for an engine); or stop announcing (the rule a mask exists under). A row predicate
+announces nothing, which is exactly why conditioning it costs the surface nothing at all. *HR sees
+`ssn` and nobody else does* keeps M5's answer: two deployments.
+
+This also **retires a prediction** made in `build_tools`: "the day an attested principal arrives per
+call, this is one of the two places that stops being true — and the tool set becomes something
+assembled per caller rather than per process." It is instead the day that was closed off, and the
+docstring now says so where it said the other thing. That is the third such correction this milestone
+and the fourth in two slices.
+
+**2. The refusal for an unattestable surface lives in `select(None)`, and `build_resolver`'s
+invariant needed narrowing rather than reopening.** The obvious spelling — a `surface=` argument on
+the pairing function — would have reopened *`loom query` refuses exactly what `loom serve` refuses*,
+and would have got the case wrong anyway: `McpConfig.attests` is true for an attesting config that
+`loom query` still cannot attest anybody with. What refuses instead is one step lower and names no
+surface: a read needs a **decided** policy set, and asking for one while naming nobody is what fails.
+So `bind_reads`/`bind_writes` are the pairing, surface-blind, holding every static refusal; and
+`build_resolver` = `bind_reads(...).for_(None)`, `build_runtime` = `bind_writes(...).for_(None)`.
+`loom query`, `loom run` and a stdio `loom serve` reach it at build, before anything is read; an
+HTTP server with `mcp.auth` never reaches it, because it selects per call. The invariant is corrected
+where it is written: it is a claim about **pairings**, and what differs between the two commands is
+an *ability*, not a check.
+
+**3. A missing claim fails closed, and the rule that reconciles it with decision 2.** An attested
+caller whose token lacks a claim a guard names leaves the guard **undecided**, and an undecided guard
+**applies** the policy — the direction that subtracts more, and the same direction `admits` fails in
+for a row. That is the opposite of decision 2's *refuse*, and both are right under one rule:
+**decidable at pairing time with somebody to tell → refuse; decidable only per call, with only the
+caller to tell → withhold silently.** An operator is present at bind and reads stderr; per call the
+only party in the exchange is the caller, and "a policy did or did not apply to you" is §6.1's
+existence oracle. Two consequences worth stating: absence is **not** `null` (if it were,
+`principal.dept != null` would be *false* for a caller with no `dept`, and a missing claim would have
+*widened* what they see), and a claim whose value contradicts its declared type is treated as absent
+rather than compared.
+
+**4. Claims are declared, in `loom.yaml`.** This is the first time the expression language would have
+referenced something no declaration describes, and the answer is to declare it rather than to make an
+exception: `mcp.auth.claims` names each claim and its type (`string`, `string[]`, `boolean`), beside
+the issuer that mints them and in the same file as the policy that reads them. The ontology still
+references only what the ontology declares — `principal.` is **refused in a spec** — so the language
+keeps one rule for all three reference forms: *a reference is legal where its declaration is in
+scope.* Without it a typo'd claim would be caught by nothing and would fail closed *and* silent,
+which is the mask-typo failure inverted. `sub` and `iss` are built in (the verifier requires them)
+and cannot be redeclared.
+
+**5. `contains`, and the subset rule restated rather than bent.** Group membership needs `contains`
+over a list claim, and `predicate.py` refuses operators on the rule that *a predicate is lowerable
+only when Loom, not the engine, decides what every operator means*. That rule is about expressions
+answered **twice**. A `when:` guard is answered **once**, in process, over a list only Loom holds —
+no engine sees it — so `contains` is legal in a guard and refused in `rows:`, where it would need an
+IR node and a second evaluator to agree with. A scalar claim inside `rows:` needs neither: it folds
+to a `Const` the lowerable subset already carries, so the slice adds **no new SQL shape**.
+
+Two things found by building it:
+
+- **A missing claim inside `rows:` has to become an undecided *leaf*, not a deny-all policy.**
+  Substituting `null` is wrong in the dangerous direction — `==` is null-safe here, so
+  `object.ownerId == principal.sub` would come back *true* for every row whose owner is null. A
+  `DENY_ALL` sentinel would have to be understood at both enforcement sites, which is the one thing
+  the milestone promised not to touch, and it over-subtracts under `||`. What the fold emits instead
+  is `null < null`: SQL answers `NULL`, §5 refuses to order a null, both planes call it undecided by
+  rules they already had, and Kleene propagation does the rest. The differential test covers it.
+- **The announcement set needed a name and a refusal.** The tool set and the banner are built from
+  masks, which no caller changes — but they were being built from a `Resolver`, and a resolver
+  holding policies nobody selected would fail *open* by one conditional policy. So
+  `PolicyProgram.announcements()` is `decided=False`, and `Resolver._table` refuses to read with it.
+  Every read goes through that method, which makes the check total rather than a habit.
+
+`RESERVED_KEYS` and `Reserved` are **deleted** with the last of their entries, as this milestone said
+they would be. The partition test they anchored is replaced by the stronger statement it stood in
+for: every key `POLICY_KEYS` accepts is read into a field of `Policy`. `MOVED_KEYS`/`audit` is
+unaffected, and `check_keys` still refuses a key nobody declared.
 
 ---
 

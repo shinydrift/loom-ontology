@@ -55,20 +55,41 @@ mcp:
   #
   # With this set, `writes: true` is permitted on a non-loopback bind — the one thing a public bind
   # could not do before, because every write can now be recorded under the caller who asked for it.
+  #
+  # `claims:` is what a *policy* may read of a caller, declared here rather than discovered from a
+  # token. It is a declaration and never a requirement: a caller whose token lacks one is attested
+  # exactly as before, and a policy naming the missing claim simply applies (see below). Declaring
+  # them is what buys a refusal for a typo — `principal.dpet` is caught at startup instead of
+  # quietly withholding more than you asked for.
   # auth:
   #   issuer: https://issuer.example.com
   #   audience: loom-retail
   #   jwks_uri: https://issuer.example.com/.well-known/jwks.json
+  #   claims:
+  #     groups: string[]
 
 # What this deployment withholds. Uncomment and `loom query`, `loom run` and every generated tool
 # stop returning `ltv` — enforced in the resolver's projection, so the column is not in the SQL
 # rather than dropped from the rows on the way back.
 #
-# A policy names no caller, and that is deliberate: `loom query` has no transport, so nothing can
+# A policy needs no caller, and that is deliberate: `loom query` has no transport, so nothing can
 # ever attest an identity to it, and governance that only existed over an authenticated socket would
-# leave the direct half of "a direct call and an agent call filter identically" ungovernable. So
-# policies are per *deployment* — run one per audience — and `when:` is reserved for the day a
-# caller can be attested, refused until then rather than approximated.
+# leave the direct half of "a direct call and an agent call filter identically" ungovernable. So a
+# policy with no `when:` and no `principal.` is per *deployment* — every caller of this file gets it,
+# `loom query` included.
+#
+# With `auth:` above declared, a policy may name the caller — but only in its `rows:` half. `when:`
+# says which callers a policy applies to, and `principal.<claim>` inside `rows:` folds the caller
+# into the predicate itself. `mask:` may not be conditioned at all: a mask announces itself in every
+# tool description and in the `filter` schema, so a per-caller mask would make the tool set a
+# function of who is asking rather than of the spec. Serving two audiences different *columns* is
+# still two deployments.
+#
+# Two things worth knowing before you write one. A caller whose token lacks a claim the guard names
+# leaves it *undecided*, and an undecided guard **applies** the policy — the direction that shows
+# less, because there is nobody in the exchange to report an undecided guard to. And `loom query`,
+# `loom run` and a stdio server refuse this file outright once a policy names a caller: they can
+# never attest one, and applying the rest would show them more than the served surface shows.
 #
 # Try masking `tier` instead and the server refuses to start: `upgradeTier` writes it, and a
 # deployment cannot both withhold a property and change it. See docs/spec-v0.md §6.1.
@@ -96,3 +117,8 @@ mcp:
 #     - name: current-customers-only
 #       objectType: Customer
 #       rows: "object.tier != 'closed'"
+#     # Needs `auth:` above, and only over `transport: http`.
+#     - name: gold-desk
+#       objectType: Customer
+#       when: "principal.groups contains 'gold-desk'"
+#       rows: "object.tier == 'gold'"

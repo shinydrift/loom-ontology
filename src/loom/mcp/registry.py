@@ -43,6 +43,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from ..auth import current_principal
+from ..governance import PolicyProgram
 from ..model import Action, ObjectType
 from ..resolver import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Resolver
 
@@ -107,10 +108,27 @@ def json_safe(value: Any) -> Any:
     return value
 
 
+def _reading(resolver: Resolver, program: PolicyProgram | None) -> Resolver:
+    """The resolver for the call in flight — this one, or this one governed for its caller.
+
+    **This is the only line in the tool layer that knows a policy can name a caller**, and what it
+    passes down is a *decided* `PolicySet`, never an identity: `select` reads the principal, answers
+    every guard and folds every `principal.` reference into a literal, and what comes back names
+    nobody. `program is None` is a resolver that was already decided — which is every direct
+    construction of one, and every test that builds a tool set from a resolver alone.
+
+    For a program with nothing conditional this returns the *same object* it was given, so a
+    deployment that predates this milestone is provably unchanged rather than argued to be."""
+    if program is None:
+        return resolver
+    return resolver.governed_by(program.select(current_principal()))
+
+
 def build_tools(
     resolver: Resolver,
     runtime: ActionRuntime | None = None,
     actor: str | None = None,
+    program: PolicyProgram | None = None,
 ) -> list[ToolSpec]:
     """Introspect the ontology into the tool set this deployment exposes.
 
@@ -118,23 +136,29 @@ def build_tools(
     way of saying `mcp.writes` is on — the surface is what the deployment permits, not what the spec
     declares, and the banner counts what was built rather than what could have been.
 
-    **A policy is read here, once, and that is a claim with a lifetime.** Masks are resolved into
-    the schemas and descriptions at build time because they cannot change between two calls of a
-    process: policies are deployment-scoped, so there is exactly one answer for every caller of this
-    server (`governance.py` says why none of them names a principal). The day an attested principal
-    arrives per call, this is one of the two places that stops being true — the other being the one
-    `Resolver` and one `ActionRuntime` `build_server` holds — and the tool set becomes something
-    assembled per caller rather than per process."""
+    **A mask is read here, once, and that stayed true when a principal arrived.** Masks are resolved
+    into the schemas and descriptions at build time because they cannot change between two calls of a
+    process. M5 wrote that as a consequence of policies being deployment-scoped and predicted that
+    "the day an attested principal arrives per call, this is one of the two places that stops being
+    true — and the tool set becomes something assembled per caller rather than per process."
+
+    **That prediction was wrong, and the milestone that could have made it true is the one that
+    closed it off instead.** A mask *announces itself* — here, in the `filter` schema, and in
+    `masked` on every result — so conditioning one on the caller would make the tool set a function
+    of the caller rather than of the spec (§7). `governance.parse_policies` refuses `mask:` beside
+    `when:` for exactly that reason, so the announcement half of a policy is per deployment forever
+    and this build happens once. What arrives per call is `program`, and it reaches only the
+    *handlers*, where it changes which rows come back and nothing about the tool."""
     tools: list[ToolSpec] = []
     for obj in resolver.ontology.object_types.values():
-        tools.append(_get_tool(resolver, obj))
-        tools.append(_search_tool(resolver, obj))
-        tools.append(_list_tool(resolver, obj))
+        tools.append(_get_tool(resolver, obj, program))
+        tools.append(_search_tool(resolver, obj, program))
+        tools.append(_list_tool(resolver, obj, program))
     if resolver.ontology.link_types:
-        tools.append(_traverse_tool(resolver))
+        tools.append(_traverse_tool(resolver, program))
     if runtime is not None:
         for action in resolver.ontology.actions.values():
-            tools.append(_run_tool(runtime, action, actor))
+            tools.append(_run_tool(runtime, action, actor, program))
     return tools
 
 
@@ -182,7 +206,7 @@ def _subject(obj: ObjectType) -> str:
     return f"{obj.display_name or obj.api_name}" + (f" — {obj.description}" if obj.description else "")
 
 
-def _get_tool(resolver: Resolver, obj: ObjectType) -> ToolSpec:
+def _get_tool(resolver: Resolver, obj: ObjectType, program: PolicyProgram | None = None) -> ToolSpec:
     pk = obj.pk_property
     masked = resolver.masked(obj.api_name)
     schema = {
@@ -193,7 +217,7 @@ def _get_tool(resolver: Resolver, obj: ObjectType) -> ToolSpec:
     }
 
     def handler(args: dict) -> Any:
-        row = resolver.get(obj.api_name, args["key"])
+        row = _reading(resolver, program).get(obj.api_name, args["key"])
         return {
             "objectType": obj.api_name,
             "key": json_safe(args["key"]),
@@ -210,7 +234,7 @@ def _get_tool(resolver: Resolver, obj: ObjectType) -> ToolSpec:
     )
 
 
-def _search_tool(resolver: Resolver, obj: ObjectType) -> ToolSpec:
+def _search_tool(resolver: Resolver, obj: ObjectType, program: PolicyProgram | None = None) -> ToolSpec:
     masked = resolver.masked(obj.api_name)
     # A masked property leaves the filter schema as well as the projection. The resolver refuses a
     # filter on one whatever the schema says — that is the enforcement, and it is below MCP where
@@ -242,7 +266,7 @@ def _search_tool(resolver: Resolver, obj: ObjectType) -> ToolSpec:
     }
 
     def handler(args: dict) -> Any:
-        rows = resolver.search(
+        rows = _reading(resolver, program).search(
             obj.api_name,
             args.get("filter") or {},
             limit=args.get("limit"),
@@ -267,12 +291,14 @@ def _search_tool(resolver: Resolver, obj: ObjectType) -> ToolSpec:
     )
 
 
-def _list_tool(resolver: Resolver, obj: ObjectType) -> ToolSpec:
+def _list_tool(resolver: Resolver, obj: ObjectType, program: PolicyProgram | None = None) -> ToolSpec:
     masked = resolver.masked(obj.api_name)
     schema = {"type": "object", "properties": dict(_PAGE_SCHEMA), "additionalProperties": False}
 
     def handler(args: dict) -> Any:
-        rows = resolver.list(obj.api_name, limit=args.get("limit"), offset=args.get("offset", 0))
+        rows = _reading(resolver, program).list(
+            obj.api_name, limit=args.get("limit"), offset=args.get("offset", 0)
+        )
         return _page(obj, rows, args, masked)
 
     return ToolSpec(
@@ -305,7 +331,7 @@ def _page(obj: ObjectType, rows: list[dict], args: dict, masked: Sequence[str] =
 # ---- traverse ------------------------------------------------------------------
 
 
-def _traverse_tool(resolver: Resolver) -> ToolSpec:
+def _traverse_tool(resolver: Resolver, program: PolicyProgram | None = None) -> ToolSpec:
     """One generic tool rather than one per link — and the rule that says so is narrower than it
     first looked.
 
@@ -364,7 +390,7 @@ def _traverse_tool(resolver: Resolver) -> ToolSpec:
 
     def handler(args: dict) -> Any:
         direction = resolver.link_direction(args["objectType"], args["link"])
-        rows = resolver.traverse(
+        rows = _reading(resolver, program).traverse(
             args["objectType"],
             args["key"],
             args["link"],
@@ -403,7 +429,9 @@ def _traverse_tool(resolver: Resolver) -> ToolSpec:
 # ---- run ------------------------------------------------------------------------
 
 
-def _run_tool(runtime: ActionRuntime, action: Action, actor: str | None) -> ToolSpec:
+def _run_tool(
+    runtime: ActionRuntime, action: Action, actor: str | None, program: PolicyProgram | None = None
+) -> ToolSpec:
     """One declared action as one tool.
 
     Three things about it are decisions rather than defaults.
@@ -431,10 +459,10 @@ def _run_tool(runtime: ActionRuntime, action: Action, actor: str | None) -> Tool
     The runtime takes both per call and invents neither. `actor` is a string an operator declared
     about a deployment, so binding it into this closure loses nothing. A principal is a fact about
     *this exchange*: it is read inside the handler, on every call, from the context the transport
-    populated. That is the first thing in this module that differs between two calls of one process,
-    and it is deliberately the only one — the tool set, the schemas and the descriptions are still a
-    function of the spec, exactly as §7 says, because what varies is a value passed through a tool
-    rather than anything about the tool.
+    populated. It is read for two things now — the name the edit log records, and the `PolicySet`
+    this run is governed by — and the tool is unmoved by both: the schemas and the descriptions are
+    still a function of the spec, exactly as §7 says, because a mask cannot be conditioned and a row
+    filter announces nothing.
     """
     target = runtime.ontology.object_types[action.target_object_type]
     pk = target.pk_property
@@ -490,7 +518,10 @@ def _run_tool(runtime: ActionRuntime, action: Action, actor: str | None) -> Tool
         # build time and must not be cached across calls. `current_principal()` is `None` on every
         # surface that cannot attest, which is every surface this closure served before today.
         caller = current_principal()
-        result = runtime.run(
+        # One read of the principal, two readers of it, and they take it in different shapes: the
+        # edit log records a *name* (`label`), while governance needs the claims to decide a policy
+        # with — and `select` gives back a decided set, so what reaches `run` is still no identity.
+        result = runtime.governed_by(program.select(caller) if program else runtime.policies).run(
             action.api_name,
             args.get(PARAMETERS_ARG) or {},
             actor=actor,

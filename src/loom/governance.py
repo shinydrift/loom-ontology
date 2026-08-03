@@ -6,43 +6,53 @@ in `Resolver._projection` and in `_Run._project` for a masked property, in `Reso
 `_Run._admitted` for a withheld row — so `loom query`, a `get_` tool and an action's `before` all
 withhold the same thing for the same reason.
 
-**No policy in this milestone names a principal, and that is the decision the grammar is built
-around.** The obvious shape for a policy is "this caller sees these rows", and it was rejected for a
-reason that is structural rather than a matter of sequencing: `loom query` and `loom run` have no
-transport, so nothing can ever attest an identity to them, and a spawned stdio server carries no
-bearer token either. A grammar that could only express a policy against an authenticated caller
-would therefore make the *direct* half of M5's own claim — a direct call and an agent call filter
-identically — ungovernable by construction, and would leave governance existing only over HTTP,
-which is precisely the transport-dependent surface M4's second slice spent a slice proving Loom does
-not have.
+**A policy may name the caller, and exactly half of one may.** `rows:` can be conditioned on who is
+asking — by a `when:` guard, by a `principal.<claim>` inside the predicate, or both — and `mask:`
+cannot, ever. That split is the whole shape of this grammar and it follows from the first of the two
+rules below: *the schema is public; the data is not.*
 
-So what M5 enforces is **deployment-scoped**: one `loom.yaml` filters one way, for every caller of
-it, and you serve two audiences by running two deployments. `mcp.actor` gains no second reader — it
-remains a string an operator declared about a deployment, reaching the edit log and nothing else.
+- A **mask announces itself**, in the tool description, in the `filter` schema and in `masked` on
+  every result. §7 says the tool set, its names and its argument namespaces are a function of the
+  spec, and a policy may only *subtract* from what one advertises. A subtraction that varies per
+  caller has three possible spellings and this codebase refuses all three: assemble the tool set per
+  caller (the surface becomes a function of the caller), announce the worst case to everyone
+  (narrowing the surface to fit, which §6 refuses to do even for an engine, whose limits are far
+  less deliberate than a deployment's), or stop announcing. So `mask:` beside `when:` is refused at
+  load, and "HR sees `ssn` and nobody else does" keeps M5's answer: two deployments.
+- A **row predicate announces nothing** — a withheld row is simply absent, `get_` says
+  `found: false`, and no description gains a sentence. That is exactly what makes it free to
+  condition: nothing about the surface moves, and the only thing that differs between two callers is
+  which rows come back.
 
-**A principal now has a source, and `when:` is still refused — the two are less connected than this
-docstring first assumed.** M6's first slice landed `mcp.auth`: a bearer token verified against an
-issuer's key set, over the one transport that can carry one, recorded in the edit log beside
-`mcp.actor`. What that changed here is *nothing yet*, and the reason is the paragraph above rather
-than a missing slice: `loom query`, `loom run` and a stdio server still cannot attest anybody, so a
-`when:` policy would filter one surface and be skipped on three. That is why the slice that turns it
-on also **refuses** to build any surface that cannot attest against a config carrying it — one file
-meaning one thing, with two surfaces declining it, rather than one file meaning two things depending
-on who reads it. The invariant that forces the refusal is this module's own: *policies subtract,
-never add*, so skipping a conditional policy would leave the unattested caller seeing **more**, and
-`loom query` would be the way around the filter.
+**What M5 decided, and what survived it.** M5's policies were **deployment-scoped**: one `loom.yaml`
+filtered one way for every caller, because nothing could attest a caller at all. The argument was
+structural rather than a matter of sequencing — `loom query` and `loom run` have no transport, a
+spawned stdio server carries no bearer token, and a grammar expressible *only* against an
+authenticated caller would have made the direct half of M5's own claim ungovernable and left
+governance existing only over HTTP. None of that is repealed. What changed is that `mcp.auth` gives
+one surface a caller it has checked, so the grammar now has a conditional half **and a refusal for
+every surface that cannot decide it**: `PolicyProgram.select(None)` refuses rather than applying the
+unconditional policies alone, because policies subtract and never add — skipping the guarded ones
+would show the unattested caller **more**, and `loom query` would be the way around the filter. One
+file meaning one thing, with the surfaces that cannot read it declining loudly.
 
-Until that slice, `when:` is refused rather than accepted-and-ignored, which is `_check_governance`'s
-own posture one level down: a config that is silently ignored reads, to whoever wrote it, exactly
-like one that was obeyed.
-
-**When it lands, a principal still will not reach the resolver, and that is now permanent rather
-than pending.** What varies per call is a decided `PolicySet`, selected *above* the resolver — which
+**A principal does not reach the resolver, and that is permanent rather than pending.** What varies
+per call is a decided `PolicySet`, selected *above* the resolver by `PolicyProgram.select` — which
 works because a principal is constant for the duration of a call, so everything it conditions folds
-before the call begins, including a predicate that names the caller. Every enforcement site below
-stays as it is, reading a set that is already decided. The M5 sentence that gives way is the one on
-`PolicySet.masks` — *resolved once at bind* becomes *resolved once per caller* — and it gives way
-exactly where it predicted it would.
+to a literal before the call begins, including a predicate that names the caller. Every enforcement
+site below is untouched, reading a set that is already decided. The M5 sentence that was expected to
+give way — `PolicySet.masks`' *resolved once at bind* — **did not**, because masks turned out not to
+be conditionable at all; what gives way is only the sentence about `filters`.
+
+**Where a missing claim goes, and why it is not the same answer as an unattestable surface.** Both
+are cases of *cannot decide*, and they end differently under one rule: **decidable at pairing time
+with somebody to tell → refuse; decidable only per call, with only the caller to tell → withhold
+silently.** A surface that cannot attest is known at bind, and an operator is there reading stderr,
+so it refuses. A token missing a claim a guard names is known only when the call arrives, and the
+only party in the exchange is the caller — telling them a policy did or did not apply to them is the
+existence oracle this module refuses everywhere else. So the guard is undecided, and an undecided
+guard **applies** the policy, which subtracts more. It is the same direction `admits` fails in for a
+row, arrived at by the same rule.
 
 **Two rules decide almost everything else.**
 
@@ -83,11 +93,21 @@ already had to name exactly this set for the conflict detail — so a deployment
 never starts, and the runtime needs no new branch. It is also what keeps the edit log's guarantee
 true word for word: *what the record does not name, the run did not change*.
 
-**It is checked in `build_resolver`**, beside `check_capabilities`, and for the reason that slice
-wrote down when it borrowed this milestone's principle a milestone early: that function is the one
-place a spec and a deployment are paired, so `loom query` refuses exactly what `loom serve` refuses.
-Not in `loom validate`, which validates an ontology and does not require a `loom.yaml` at all — a
-spec that is valid stays valid whatever a deployment withholds of it.
+**It is checked where a spec and a deployment are paired** — `bind_reads` and `bind_writes`, beside
+`check_capabilities` — for the reason M4's capability slice wrote down when it borrowed this
+milestone's principle a milestone early: that is the one place the two meet, so `loom query` refuses
+exactly what `loom serve` refuses. Not in `loom validate`, which validates an ontology and does not
+require a `loom.yaml` at all — a spec that is valid stays valid whatever a deployment withholds of
+it.
+
+That sentence needed **narrowing** when policies learned to name a caller, and the narrowing is
+worth stating because three slices have cited it. It is a claim about **pairings**, and every
+refusal in this module is still surface-blind: the four mask refusals, the predicate subset, the
+guard grammar and an undeclared claim all fire identically wherever they are bound. What differs
+between `loom query` and `loom serve` is not a check but an **ability** — `build_resolver` is
+`bind_reads(...).for_(None)`, and it is the `for_(None)` that a conditional program refuses. Nothing
+gained a `surface=` argument, which would have been wrong as well as ugly: `McpConfig.attests` is
+true for an attesting config that `loom query` still cannot attest anybody with.
 
 **What a policy is not, and where `audit:` went.** That key was reserved in this grammar for two
 slices, and it has *left* rather than landed, because neither half of what it named is a policy in
@@ -112,11 +132,16 @@ row can no longer tell an expired edit from a lost one. So there is no key for i
 it is a command Loom has not built (spec-v0 "Open edges"), and a config key that is only a default
 for a command nobody runs is exactly the `loom.managed` shape this codebase has already paid for.
 
-A key that will never land must **leave** this grammar rather than sit in it. `ENFORCED_KEYS` and
-`RESERVED_KEYS` partition `POLICY_KEYS` under a test, and *reserved forever* is a third kind that
-test cannot see — as invisible as the accepted-and-ignored kind it was written to catch. So
-`RESERVED_KEYS` now means one thing only, a named future slice turns this on, and `when:` is the
-whole of it.
+A key that will never land must **leave** this grammar rather than sit in it, because *reserved
+forever* is a third kind no partition test can see — as invisible as the accepted-and-ignored kind
+the partition was written to catch.
+
+**And `RESERVED_KEYS` has now left too, with the last of its entries.** `when:` was the whole of it
+and `when:` is enforced, so what remained was a `Reserved` dataclass nothing constructs and a
+partition with one live side: the `loom.managed` shape, one level up. What the partition was
+standing in for is asserted directly instead — every key this grammar accepts is read into a field
+of `Policy` — and a key nobody declared is refused by `check_keys` as it always was. A future
+reservation re-adds eight lines and its own test.
 """
 
 from __future__ import annotations
@@ -125,27 +150,24 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from ._shape import check_keys, suggest
+from .auth import ClaimType, Principal, readable_claims
 from .errors import Diagnostics, SourceLoc
 from .expr import Binary, Expr, ExprError
 from .expr import parse as parse_expr
 from .model import Ontology, properties_in_play
 from .predicate import check as check_predicate
+from .predicate import check_guard, fold, guard_truth
 
-ENFORCED_KEYS = frozenset({"name", "objectType", "mask", "rows"})
-"""The keys a policy may carry today, all of which change what a caller gets."""
+ENFORCED_KEYS = frozenset({"name", "objectType", "mask", "rows", "when"})
+"""The keys a policy may carry, all of which change what a caller gets.
 
-
-@dataclass(frozen=True)
-class Reserved:
-    """A key the grammar names, refuses, and will one day honour.
-
-    Named rather than omitted so that `governance:` can be reviewed for what it will hold, and
-    refused rather than ignored for the reason the block itself is refused when Loom cannot enforce
-    it. `why` is what the message says; `hint` is the way out that exists today."""
-
-    why: str
-    hint: str
-
+**There is no `RESERVED_KEYS` any more, and its deletion is the point rather than tidying.** It held
+one entry, `when`, which this milestone enforces; a `Reserved` dataclass nothing constructs and a
+partition test with one side empty is the `loom.managed` shape this codebase has already paid for —
+structure whose second case does not exist. What the partition bought is bought instead by
+`test_governance.py`'s check that every key here is read into a `Policy` field, which catches the
+third kind directly (accepted, unenforced, silent) rather than by bookkeeping. `check_keys` already
+refuses a key nobody named. A future reservation re-adds eight lines and its own test."""
 
 MOVED_KEYS: Mapping[str, str] = {
     "audit": "'no log, no write' is a switch on a whole deployment rather than a policy — it names "
@@ -162,32 +184,7 @@ deployed, so nothing written against `audit:` has to change. It is here because 
 coming. The honest end of a reservation names its destination, rather than falling through to
 `unexpected key 'audit'` with nothing behind it."""
 
-RESERVED_KEYS: Mapping[str, Reserved] = {
-    "when": Reserved(
-        why="a principal-conditioned policy needs a caller every surface of this deployment can "
-        "attest, and only an HTTP transport with 'mcp.auth' can — 'loom query', 'loom run' and a "
-        "stdio server can never attest anybody, so a policy conditioned on a caller would filter "
-        "one surface and be skipped on three",
-        hint="policies are deployment-scoped: run one deployment per audience, with the policies "
-        "that audience gets. 'mcp.auth' now attests a caller and records it in the edit log; what "
-        "is not built yet is conditioning a policy on one",
-    ),
-}
-"""Every other key, with the reason it is refused.
-
-Together with `ENFORCED_KEYS` this covers `POLICY_KEYS` exactly, under a test — the same device
-`negotiate.NEGOTIATED` uses, so a fifth key has to be declared as one kind or the other instead of
-arriving as a third: silently accepted. That third kind is how `loom.managed` got written by `apply`
-and read by nothing for two milestones.
-
-A reservation has exactly two honest ends, and both have now happened. `rows` was here and is
-**enforced**, which is what the reservation was for: nothing written against the refusal had to
-change, because a config that was refused is a config nobody deployed. `audit` was here and
-**left** — see `MOVED_KEYS` and this module's docstring — because a key that will never land is a
-third kind of its own, and the partition test below cannot see it. What is left in here therefore
-means one thing: a named future slice turns it on."""
-
-POLICY_KEYS = ENFORCED_KEYS | set(RESERVED_KEYS)
+POLICY_KEYS = ENFORCED_KEYS
 
 EDIT_LOG_OPTIONAL = "optional"
 EDIT_LOG_REQUIRED = "required"
@@ -215,12 +212,27 @@ class Policy:
     expression language and this is it: `rows: "object.tier == 'gold'"` and an action's
     `rule: "newTier != object.tier"` are the same grammar, parsed by the same function. What it may
     *contain* is narrower — see `predicate.py` — and that is checked against the ontology at bind,
-    not here."""
+    not here.
+
+    `when` is that same language over the caller instead of the row, and it composes with `rows` as
+    an **implication**: a policy whose guard is false withholds nothing. That is what stops it being
+    sugar for a longer `rows:` — the same text moved inside the predicate would withhold
+    *everything* when the guard is false, which is the opposite disposition. A guard carries no
+    `mask`; see this module's docstring for why announcement stays per deployment."""
 
     name: str
     object_type: str
     mask: tuple[str, ...] = ()
     rows: Expr | None = None
+    when: Expr | None = None
+
+    @property
+    def conditional(self) -> bool:
+        """Whether this policy's effect depends on who is calling.
+
+        A guard or a `principal.` reference inside the predicate — both fold at selection, and
+        either one means this policy cannot be decided without a caller."""
+        return self.when is not None or (self.rows is not None and _names_a_principal(self.rows))
 
 
 @dataclass(frozen=True)
@@ -232,27 +244,31 @@ class PolicySet:
     means what it meant.
 
     `masks` is the resolution rather than a cache: object type -> property -> the policy that
-    withheld it. Resolved once at bind rather than per read, because the answer cannot change
-    between two calls of a process — which is a consequence of policies being deployment-scoped, and
-    the thing that stops being true when a principal arrives per call.
+    withheld it. **Resolved once at bind, for every caller, and that is now a rule rather than a
+    consequence.** M5 wrote it as a consequence of policies being deployment-scoped, and named the
+    condition under which it lapses ("the thing that stops being true when a principal arrives per
+    call"). It did not lapse: a principal arrives per call and a mask still cannot be conditioned on
+    one, because a mask *announces itself* — into the tool description, the `filter` schema and the
+    `masked` field — and an announcement that varies per caller makes the tool set a function of the
+    caller rather than of the spec (§7). `PolicyProgram.select` asserts it: every selection returns
+    the identical `masks` object.
 
-    That condition is now half met and the sentence is still true, which is worth stating because it
-    is the seam the next slice cuts on. `mcp.auth` attests a principal per call, but no policy is
-    conditioned on one, so the resolution still cannot change between two calls. When `when:` lands,
-    what changes is *when* this is resolved and never *where* it is read: a `PolicySet` stays a
-    decided, frozen set that the resolver holds, and the selection moves one rung above it. A
-    program with no conditional policies will return the same object for every caller, so this class
-    keeps meaning exactly what it means today for every config that exists.
+    What does vary is `filters`, and only because a row predicate announces nothing. Object type ->
+    the policies that filter it, in declared order, each with the expression it filters by. Kept as
+    a list rather than pre-combined so a refusal, a banner or a test can still name *which* policy is
+    doing the withholding — `predicate_for` is the combination, and it is a conjunction because
+    policies subtract and never add.
 
-    `filters` is the same statement for rows: object type -> the policies that filter it, in
-    declared order, each with the expression it filters by. Kept as a list rather than pre-combined
-    so a refusal, a banner or a test can still name *which* policy is doing the withholding —
-    `predicate_for` is the combination, and it is a conjunction because policies subtract and never
-    add."""
+    `decided` is what separates a set that governs a caller from one that only describes the
+    deployment. `PolicyProgram.announcements()` builds an undecided set for the tool builder, whose
+    filters are the expressions *as written* — with `principal.` still in them — so a banner can name
+    which policies filter what. Reading a row with it is refused rather than allowed to fail open:
+    see `Resolver._table`."""
 
     policies: tuple[Policy, ...] = ()
     masks: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     filters: Mapping[str, tuple[tuple[str, Expr], ...]] = field(default_factory=dict)
+    decided: bool = True
 
     def __post_init__(self) -> None:
         # A `PolicySet` holding policies whose masks are not in the resolution is the failure this
@@ -291,10 +307,14 @@ class PolicySet:
             )
         # Both statements again for rows, because a filter that is declared and not resolved is the
         # same failure as a mask that is: a config that reads like protection and enforces none.
+        # A guarded policy may legitimately be absent — that is what a guard *is* — so the statement
+        # narrows to the policies whose applying was never in question. Every unguarded `rows:` is
+        # still in the resolution or this set was not built by `bind_policies`.
         unfiltered = [
             p.name
             for p in self.policies
             if p.rows is not None
+            and p.when is None
             and p.name not in {name for entries in self.filters.values() for name, _ in entries}
         ]
         if unfiltered:
@@ -352,6 +372,114 @@ class PolicySet:
         for _, expr in entries[1:]:
             root = Binary("&&", root, expr.root)
         return Expr(root=root, raw=" && ".join(f"({expr.raw})" for _, expr in entries))
+
+
+@dataclass(frozen=True)
+class PolicyProgram:
+    """Policies bound to an ontology, and not yet decided for a caller.
+
+    **This is the seam the whole milestone turns on, and it splits `bind_policies` by *time* rather
+    than by responsibility.** Bind time keeps every static spec × config refusal — all four mask
+    refusals, the predicate subset, the guard grammar, undeclared properties and undeclared claims —
+    firing whether or not a caller ever arrives. Per call adds only *selection*: which already-bound
+    policies apply to this principal, and what their predicates say once the caller is folded into
+    them. Every enforcement site below is untouched, because what reaches them is still a
+    `PolicySet` that is already decided.
+
+    **A principal reaches here and stops.** It is read for two things — a guard's answer and a fold's
+    literals — and neither survives the call: what leaves is a set of expressions naming nobody. That
+    is what keeps *the resolver receives no identity* true by construction rather than by scope.
+
+    `claims` is `mcp.auth.claims` plus the built-ins, carried because selection needs the declared
+    types to decide what of a token is readable at all (`auth.readable_claims`)."""
+
+    policies: tuple[Policy, ...] = ()
+    masks: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    filters: Mapping[str, tuple[Policy, ...]] = field(default_factory=dict)
+    claims: Mapping[str, ClaimType] = field(default_factory=dict)
+    _decided: PolicySet | None = field(default=None, compare=False, repr=False)
+    """The one answer, built once, for a program no caller can change — see `select`.
+
+    None when the program *is* conditional, which is not an optimisation: a set built from
+    unfolded expressions naming a principal is exactly the thing that must not be reachable, so it
+    is not built."""
+
+    def __post_init__(self) -> None:
+        if not self.conditional:
+            object.__setattr__(self, "_decided", self._as_written())
+
+    @property
+    def conditional(self) -> bool:
+        """Whether any policy here needs a caller before it can be decided."""
+        return any(p.conditional for p in self.policies)
+
+    def select(self, principal: Principal | None) -> PolicySet:
+        """The policies that apply to this caller, decided, with the caller folded out.
+
+        **`select(None)` on a conditional program is the refusal decision 2 asks for, and it names
+        no surface.** `loom query`, `loom run` and a stdio server reach it at build, before anything
+        is read, because they are asking for a decided set while naming nobody; an HTTP server with
+        `mcp.auth` never reaches it, because it selects per call with a principal in hand. That is
+        one function rather than a check three call sites re-derive from `McpConfig.attests` — which
+        would also get `loom query` wrong, since an attesting *config* read by a command with no
+        transport still attests nobody.
+
+        The alternative — treat an unattested caller as principal-less and apply only the
+        unconditional policies — is disqualified by this module's own invariant: policies subtract,
+        never add, so skipping the guarded ones gives that caller **less** subtraction. `loom query`
+        would become the way to read what the governed MCP surface withholds.
+
+        **A guard that cannot be decided applies the policy.** Undecided is not false: a token that
+        carries no `dept` has not said it is outside HR. Applying is the withholding direction, and
+        it is the same direction `admits` fails in for a row. The rule under both, and under the
+        refusal above: *decidable at pairing time with somebody to tell → refuse; decidable only per
+        call, with only the caller to tell → withhold silently*, because "a policy did or did not
+        apply to you" is the existence oracle §6.1 refuses.
+
+        A program with nothing conditional returns the **same object** every time, so every
+        deployment that predates this milestone is provably unchanged rather than argued to be."""
+        if self._decided is not None:
+            return self._decided
+        if principal is None:
+            named = ", ".join(p.name for p in self.policies if p.conditional)
+            raise PolicyError(
+                f"governance policy {named} names the caller, and nobody is attested here — this "
+                "surface can never name a caller, so it cannot decide which policies apply. "
+                "'mcp.auth' over 'transport: http' attests one; 'loom query', 'loom run' and a "
+                "spawned stdio server cannot. Refusing rather than applying the policies that are "
+                "left, which would show this caller more than the served surface shows"
+            )
+        values = readable_claims(principal, self.claims)
+        filters: dict[str, tuple[tuple[str, Expr], ...]] = {}
+        for object_type, policies in self.filters.items():
+            applied = tuple(
+                (p.name, fold(p.rows, values))
+                for p in policies
+                if p.when is None or guard_truth(p.when, values) is not False
+            )
+            if applied:
+                filters[object_type] = applied
+        return PolicySet(policies=self.policies, masks=self.masks, filters=filters)
+
+    def announcements(self) -> PolicySet:
+        """What this deployment says about itself, for the tool set and the banner — never for a read.
+
+        Masks, which are the same for every caller by construction, plus the row filters **as
+        written** so a startup banner can still name which policy filters what. It is `decided=False`
+        because those expressions may still name a principal, and a read performed with it would be
+        a read nobody selected: `Resolver._table` refuses it rather than letting it fail open."""
+        return self._as_written(decided=False)
+
+    def _as_written(self, decided: bool = True) -> PolicySet:
+        return PolicySet(
+            policies=self.policies,
+            masks=self.masks,
+            filters={
+                object_type: tuple((p.name, p.rows) for p in policies if p.rows is not None)
+                for object_type, policies in self.filters.items()
+            },
+            decided=decided,
+        )
 
 
 def parse_edit_log(raw: object, loc: SourceLoc, diag: Diagnostics) -> str:
@@ -422,9 +550,6 @@ def parse_policies(raw: object, loc: SourceLoc, diag: Diagnostics) -> tuple[Poli
             continue
         seen.add(name)
 
-        for key, reserved in RESERVED_KEYS.items():
-            if key in entry:
-                diag.error(f"{ctx} sets '{key}', but {reserved.why}", loc, reserved.hint)
         for key, moved in MOVED_KEYS.items():
             if key in entry:
                 diag.error(f"{ctx} sets '{key}', which is no longer a policy key", loc, moved)
@@ -434,7 +559,7 @@ def parse_policies(raw: object, loc: SourceLoc, diag: Diagnostics) -> tuple[Poli
             diag.error(f"{ctx} needs an 'objectType' naming the type it governs", loc)
             continue
 
-        mask, rows = entry.get("mask"), entry.get("rows")
+        mask, rows, when = entry.get("mask"), entry.get("rows"), entry.get("when")
         if mask is None and rows is None:
             # Not a warning. A policy that withholds nothing is the shape this module exists to
             # prevent: it reads, to whoever wrote it and to whoever reviews the deployment, exactly
@@ -442,7 +567,25 @@ def parse_policies(raw: object, loc: SourceLoc, diag: Diagnostics) -> tuple[Poli
             diag.error(
                 f"{ctx} withholds nothing", loc,
                 "give it a 'mask' of property names, a 'rows' predicate, or both — a policy with no "
-                "effect reads like protection",
+                "effect reads like protection"
+                + ("; 'when:' says who a policy applies to, not what it withholds" if when else ""),
+            )
+            continue
+        if mask is not None and when is not None:
+            # **The refusal this slice is built around.** A mask announces itself — in every tool
+            # description, in the `filter` schema, in `masked` on every result — and §7 says the
+            # tool set and its argument namespaces are a function of the spec. A mask that varies
+            # per caller has three possible spellings and this module refuses all three: assemble
+            # the tool set per caller (the surface becomes a function of the caller), announce the
+            # worst case to everyone (narrowing the surface to fit, which §6 refuses to do even for
+            # an engine), or stop announcing (the rule a mask exists under). Rows carry no
+            # announcement, which is exactly why they may be conditioned at no cost to the surface.
+            diag.error(
+                f"{ctx} masks a property and carries 'when:', which cannot vary per caller", loc,
+                "a mask announces itself in the tool description, the filter schema and every "
+                "result, so conditioning it would make the tool set a function of the caller "
+                "rather than of the spec. Condition 'rows:' instead, or serve the two audiences "
+                "from two deployments",
             )
             continue
 
@@ -459,6 +602,24 @@ def parse_policies(raw: object, loc: SourceLoc, diag: Diagnostics) -> tuple[Poli
                 continue
             columns = tuple(dict.fromkeys(m.strip() for m in mask))
 
+        guard: Expr | None = None
+        if when is not None:
+            if not isinstance(when, str) or not when.strip():
+                diag.error(f"{ctx}: 'when' must be an expression, got {when!r}", loc)
+                continue
+            try:
+                guard = parse_expr(when)
+            except ExprError as e:
+                diag.error(f"{ctx}: 'when' is not a valid expression: {e}", loc)
+                continue
+            if rows is None:
+                diag.error(
+                    f"{ctx} carries 'when:' and withholds nothing", loc,
+                    "a guard says which callers a policy applies to; without a 'rows:' predicate "
+                    "there is no policy for it to guard",
+                )
+                continue
+
         predicate: Expr | None = None
         if rows is not None:
             # Parsed here and checked against the ontology at bind, the same two phases the whole
@@ -474,12 +635,22 @@ def parse_policies(raw: object, loc: SourceLoc, diag: Diagnostics) -> tuple[Poli
                 continue
 
         out.append(
-            Policy(name=name, object_type=object_type.strip(), mask=columns, rows=predicate)
+            Policy(
+                name=name,
+                object_type=object_type.strip(),
+                mask=columns,
+                rows=predicate,
+                when=guard,
+            )
         )
     return tuple(out)
 
 
-def bind_policies(ontology: Ontology, policies: Sequence[Policy]) -> PolicySet:
+def bind_policies(
+    ontology: Ontology,
+    policies: Sequence[Policy],
+    claims: Mapping[str, ClaimType] | None = None,
+) -> PolicyProgram:
     """Resolve policies against the ontology they govern, or refuse the pairing.
 
     Every problem at once rather than the first, for `check_capabilities`' reason: an operator
@@ -499,10 +670,20 @@ def bind_policies(ontology: Ontology, policies: Sequence[Policy]) -> PolicySet:
     - a property an **action** reads in a rule or writes in an effect — see the module docstring.
       This is the one refusal that is about a combination rather than a declaration: the spec is
       fine and the policy is fine, and it is the deployment of the two together that cannot stand.
-    """
+
+    **All four are checked as though every policy always applies, and conditionality changes
+    nothing here** — which costs nothing, because a mask may not carry `when:` at all. They are mask
+    refusals about a *spec*, and a spec does not vary per caller; checking them per caller would be a
+    deployment that starts and then fails for one caller, which is the shape "refuse rather than
+    degrade" exists to prevent.
+
+    `claims` is `mcp.auth.claims`, which is what a `when:` guard and a `principal.` reference in a
+    predicate are checked against. A policy naming a claim where none is declared is refused here
+    for the same reason a mask naming an undeclared property is: it protects a misspelling."""
     problems: list[str] = []
     masks: dict[str, dict[str, str]] = {}
-    filters: dict[str, list[tuple[str, Expr]]] = {}
+    filters: dict[str, list[Policy]] = {}
+    declared_claims = dict(claims or {})
 
     for policy in policies:
         obj = ontology.object_types.get(policy.object_type)
@@ -559,14 +740,25 @@ def bind_policies(ontology: Ontology, policies: Sequence[Policy]) -> PolicySet:
             # reads — and on one the same policy masks, which is Loom filtering rather than the
             # caller. What it may not do is be a predicate the two planes could answer differently,
             # which is the whole of what `predicate.check` refuses.
-            refusals = check_predicate(policy.rows, obj, ontology.object_types)
+            refusals = check_predicate(policy.rows, obj, ontology.object_types, declared_claims)
             problems += [
                 f"policy '{policy.name}' filters rows of '{obj.api_name}' by "
                 f"'{policy.rows.raw}': {refusal}"
                 for refusal in refusals
             ]
-            if not refusals:
-                filters.setdefault(obj.api_name, []).append((policy.name, policy.rows))
+            guard_refusals = (
+                check_guard(policy.when, declared_claims) if policy.when is not None else []
+            )
+            problems += [
+                f"policy '{policy.name}' applies when '{policy.when.raw}': {refusal}"
+                for refusal in guard_refusals
+            ]
+            if not refusals and not guard_refusals:
+                filters.setdefault(obj.api_name, []).append(policy)
+        elif policy.when is not None:  # pragma: no cover - parse_policies refuses a guard with no rows
+            problems.append(
+                f"policy '{policy.name}' carries a guard and no 'rows:' predicate to guard"
+            )
 
     if problems:
         lines = ["governance policies do not fit this ontology:"]
@@ -581,11 +773,17 @@ def bind_policies(ontology: Ontology, policies: Sequence[Policy]) -> PolicySet:
         }
         for api_name, props in masks.items()
     }
-    return PolicySet(
+    return PolicyProgram(
         policies=tuple(policies),
         masks=ordered,
         filters={name: tuple(entries) for name, entries in filters.items()},
+        claims=declared_claims,
     )
+
+
+def _names_a_principal(expr: Expr) -> bool:
+    """Whether an expression reads the caller. One definition, read by `Policy.conditional`."""
+    return any(len(ref.path) == 2 and ref.path[0] == "principal" for ref in expr.refs())
 
 
 def _link_uses(ontology: Ontology, object_type: str, property_name: str) -> list[str]:

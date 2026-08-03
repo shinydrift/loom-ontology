@@ -20,8 +20,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ..action import ActionError, ActionRuntime, build_runtime
+from ..action import ActionError, ActionRuntime
 from ..config import LoomConfig, McpConfig
+from ..governance import PolicyProgram
 from ..model import Ontology
 from ..resolver import Resolver, ResolverError
 from .registry import ToolSpec, build_tools
@@ -41,9 +42,10 @@ class LoomMCPServer:
         server_name: str = "loom",
         runtime: ActionRuntime | None = None,
         actor: str | None = None,
+        program: PolicyProgram | None = None,
     ) -> LoomMCPServer:
         return cls(
-            tools={t.name: t for t in build_tools(resolver, runtime, actor)},
+            tools={t.name: t for t in build_tools(resolver, runtime, actor, program)},
             server_name=server_name,
         )
 
@@ -113,40 +115,70 @@ def build_server(ontology: Ontology, config: LoomConfig, catalogs: Mapping[str, 
     would each open their own otherwise, which is two connections and two chances to disagree about
     what the lake currently looks like.
 
-    **Where the principal stops, now that there is one.** M6's first slice gave `mcp.auth` a real
-    source for a per-call principal, and it changed *less* here than three earlier docstrings
-    predicted. What moved: `_run_tool`'s handler reads `auth.current_principal()` per call and passes
-    it to `ActionRuntime.run`, which records it in the edit log beside `mcp.actor`. What did not
-    move: **the resolver is still handed no identity**, and now permanently rather than for want of
-    one. A `when:` policy will be resolved into a decided `PolicySet` *above* the resolver, because a
-    principal is constant for the duration of a call and everything it conditions can therefore be
-    folded before the call begins — see `governance.py`.
+    **Where the principal stops, now that a policy can name one.** `_run_tool`'s handler reads
+    `auth.current_principal()` per call, and it is read for exactly two things: the edit log records
+    a *name* beside `mcp.actor`, and `PolicyProgram.select` turns claims into a decided `PolicySet`.
+    **The resolver is still handed no identity**, permanently rather than for want of one — what a
+    handler passes down is a set in which every guard is already answered and every `principal.`
+    reference already a literal, because a principal is constant for the duration of a call.
 
-    So this function still builds **one** `Resolver` and **one** `ActionRuntime`, and that is the
-    right count even with attestation in hand. Two predictions are corrected rather than left
-    standing:
+    So this function holds one *binding* per plane rather than one `Resolver` and one
+    `ActionRuntime`, and the difference is smaller than it sounds: the ontology, the engine and the
+    catalogs are still built once and shared by every call, and what is per call is a `replace()` of
+    a three-field frozen dataclass. **Per-call scope, not per-call construction.** For a deployment
+    whose policies name nobody it is not even that — `select` returns the same object, so
+    `governed_by` returns the same resolver, which is asserted rather than assumed.
 
-    - M4 predicted M5 would move this for governance. It did not: a policy names no principal.
+    Three predictions are corrected rather than left standing, and the third is this slice's:
+
+    - M4 predicted M5 would move this for governance. It did not: a policy that names no principal
+      is the same for every caller.
     - This docstring and `build_mcp_server` then both predicted that the milestone landing
       attestation would have to make these per-caller *and* fix the `t0`/`t1`/`m0` aliases. It did
-      not, and the reason is worth keeping: what forces per-caller construction is a *policy* that
-      varies per caller, and what forces the alias fix is **concurrency**. Attestation introduces
-      neither. Handlers are still synchronous, calls still do not overlap, and a per-call principal
-      is a value passed through a shared object rather than a reason to build a second one."""
+      not, and the reason is worth keeping: what forces per-caller *objects* is a policy that varies
+      per caller, and what forces the alias fix is **concurrency**. They are still two forces. The
+      policies now do vary, and the aliases are still fine: handlers are synchronous, calls do not
+      overlap, and the per-call value is threaded through objects that stay shared. The alias problem
+      belongs to whatever milestone makes a handler `async`.
+    - `registry.build_tools` predicted that this milestone would make the **tool set** per caller
+      too. It did not, and cannot: a mask may not be conditioned, so the announcement half of a
+      policy is the same for every caller and the tool set is built once, from `announcing()`."""
+    from ..action import bind_writes
     from ..catalog import open_catalogs
-    from ..resolver import build_resolver
+    from ..resolver import bind_reads
 
     open_cats = catalogs if catalogs is not None else open_catalogs(config)
-    resolver = build_resolver(ontology, config, open_cats)
-    # Through `build_runtime` rather than constructing one here, so this process governs its write
-    # half through the same function `loom run` does. Both halves bind the same policies from the
-    # same config against the same ontology, which is what stops a served surface and a dev command
-    # from withholding different things.
-    runtime = build_runtime(ontology, config, open_cats) if config.mcp.writes else None
+    # `bind_reads`/`bind_writes` rather than `build_resolver`/`build_runtime`, which are those two
+    # plus `for_(None)`. This is the one surface that *can* name a caller, so it is the one surface
+    # that does not decide its policies at build: it keeps the binding and selects per call. Every
+    # refusal is unchanged and still fires here, because they all live in the pairing.
+    reads = bind_reads(ontology, config, open_cats)
+    # Through the write binding rather than constructing a runtime here, so this process governs its
+    # write half through the same function `loom run` does. Both halves bind the same policies from
+    # the same config against the same ontology, which is what stops a served surface and a dev
+    # command from withholding different things.
+    writes = bind_writes(ontology, config, open_cats) if config.mcp.writes else None
+    if not config.mcp.attests:
+        # The refusal every other surface reaches by *needing* a decided policy set, reached here on
+        # purpose instead. A stdio server is the case: it can carry policies naming a caller and can
+        # never attest one, and finding that out per call would be a server that started and then
+        # failed every read. `select(None)` is the same function `loom query` refuses through, so
+        # there is one sentence and one place it comes from.
+        reads.program.select(None)
     server = LoomMCPServer.from_resolver(
-        resolver, server_name=config.mcp.name, runtime=runtime, actor=config.mcp.actor
+        # The announcing pair builds the tool set: masks, which every caller shares, and nothing
+        # that can read a row. `program` is what the handlers select with, per call.
+        reads.announcing(),
+        server_name=config.mcp.name,
+        runtime=writes.announcing() if writes is not None else None,
+        actor=config.mcp.actor,
+        program=reads.program,
     )
-    return server, resolver
+    # The announcing resolver, deliberately: what a caller of this function wants it for is the
+    # banner — what this deployment withholds and which policies withhold it — and reading with it
+    # is refused rather than answered with a set nobody selected. The reads happen through the
+    # server, per call, where a caller has a name.
+    return server, reads.announcing()
 
 
 def build_mcp_server(loom_server: LoomMCPServer):
@@ -169,17 +201,16 @@ def build_mcp_server(loom_server: LoomMCPServer):
       module constants in `resolver.py`, identical for every object type in every ontology — so two
       concurrent reads do not merely race on the same table, they race on the same three names, and
       the loser answers with the winner's rows. That is the query layer's to fix.
-    - `build_server` builds one `Resolver` and one `ActionRuntime` for the lifetime of the process.
-      That was written as "the same change M5 needs in order to filter by principal", and M5 turned
-      out not to need it: a governance policy is deployment-scoped and names no caller, so one of
-      each is the right count for one deployment. It was then written as belonging to the milestone
-      that attests a principal, "which is where the second half of it — this alias problem — has to
-      be solved anyway". **That is also wrong, and M6's first slice is where it was found out.**
-      Attestation landed, a principal now varies per call, and neither of these moved: what forces
-      per-caller objects is a policy that varies per caller, and what forces the alias fix is two
-      calls in flight at once. A per-call *value* threaded through shared objects needs neither. The
-      alias problem belongs to whatever milestone makes a handler `async`, and until one does, the
-      assertion below is what keeps it unnecessary.
+    - `build_server` holds one binding per plane for the lifetime of the process, and a handler
+      derives a `Resolver` from it per call. That was written as "the same change M5 needs in order
+      to filter by principal", and then as belonging to the milestone that attests a principal,
+      "which is where the second half of it — this alias problem — has to be solved anyway". **Both
+      halves of that prediction were wrong, and the milestone it named is where it was found out.**
+      Policies now do vary per caller and the derivation is a `replace()` of a frozen three-field
+      dataclass — the ontology, the engine, its one connection and the catalogs are still built once
+      and shared. What forces the alias fix is two calls **in flight at once**, which is a different
+      force entirely: it belongs to whatever milestone makes a handler `async`, and until one does,
+      the assertion below is what keeps it unnecessary.
     - The runtime's retry loop reasons about competing commits, not about competing callers in one
       process.
 

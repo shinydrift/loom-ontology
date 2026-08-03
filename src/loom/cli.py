@@ -390,8 +390,14 @@ def _governance_mode(resolver) -> list[str]:
     *something* is governed, which is the half of the question they can already see in the config.
 
     It says *deployment* out loud, because that is the part a reader is most likely to assume
-    otherwise. Every caller of this server gets these same masks; there is no per-caller filtering
-    here, and a server that let somebody believe there was would be the support ticket.
+    otherwise. Every caller of this server gets these same masks — a mask cannot carry `when:`, so
+    that half is deployment-wide by construction and stays true whatever else this deployment does.
+
+    **What varies per caller is named, and it is named because the rest of the line says it does
+    not.** A `when:` guard or a `principal.` reference inside a predicate makes a policy's *rows*
+    depend on who is asking, and an operator reading "filter the rows of Order" has to know whether
+    they are looking at one answer or a family of them. The claims themselves are not printed: this
+    line describes a deployment, and there is no caller yet to describe.
 
     **Row filters are named here and nowhere a caller can see**, which is the one place the two
     halves of a policy are treated differently on purpose. A mask announces itself in every tool
@@ -416,10 +422,17 @@ def _governance_mode(resolver) -> list[str]:
         what.append(f"withhold {'; '.join(withheld)}")
     if filtered:
         what.append(f"filter the rows of {'; '.join(filtered)}")
+    conditional = [p.name for p in resolver.policies.policies if p.conditional]
+    scope = (
+        "  (deployment-wide — every caller of this server is filtered the same way, and `loom query` "
+        "against this config is filtered identically)"
+        if not conditional
+        else f"  (masks are deployment-wide; {', '.join(conditional)} filter rows per attested "
+        "caller, so `loom query` against this config refuses rather than reading unfiltered)"
+    )
     return [
         f"governed · {len(resolver.policies.policies)} policy/policies {' and '.join(what)}",
-        "  (deployment-wide — every caller of this server is filtered the same way, and `loom query` "
-        "against this config is filtered identically)",
+        scope,
     ]
 
 

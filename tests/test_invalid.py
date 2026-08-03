@@ -214,6 +214,51 @@ def test_expr_unknown_parameter(tmp_path):
     """}, "unknown parameter 'ghost'")
 
 
+def test_a_rule_naming_the_caller_is_refused_because_an_ontology_cannot_see_one(tmp_path):
+    """**The one reference form an ontology may not use**, and the refusal is what keeps a spec
+    deployment-blind.
+
+    `principal.<claim>` is declared in `loom.yaml` (`mcp.auth.claims`), beside the issuer that mints
+    it, so it is in scope for a governance policy there and nowhere else — the language's own rule
+    that a reference is legal where its declaration is. A rule naming a caller would also put
+    authorization inside a validation rule: what a caller may do is `mcp.writes` and `governance`,
+    in the file a deployment is configured by."""
+    _expect_error(tmp_path, {
+        "customer.yaml": CUSTOMER,
+        "a.yaml": """
+        action:
+          apiName: doThing
+          description: does a thing
+          targetObjectType: Customer
+          operation: modify
+          parameters: [{ name: key, type: string }]
+          validation: [{ rule: "principal.dept == 'hr'", message: nope }]
+          effects: [{ modifyObject: { key: "{{ key }}", set: {} } }]
+    """}, "names the caller, which an ontology cannot see")
+
+
+def test_contains_is_refused_in_an_ontology_because_no_property_is_a_list(tmp_path):
+    """The operator the language gained for a list-valued *claim*, refused where it can never be
+    satisfied.
+
+    Inferring it as "unknown type" — which is this checker's optimistic default — would accept a
+    rule that fails on every run with an `expression_error`, which is the accepted-and-unenforced
+    shape this codebase refuses everywhere. It becomes writable here the day `array` lands as a
+    property type."""
+    _expect_error(tmp_path, {
+        "customer.yaml": CUSTOMER,
+        "a.yaml": """
+        action:
+          apiName: doThing
+          description: does a thing
+          targetObjectType: Customer
+          operation: modify
+          parameters: [{ name: key, type: string }]
+          validation: [{ rule: "object.tier contains 'go'", message: nope }]
+          effects: [{ modifyObject: { key: "{{ key }}", set: {} } }]
+    """}, "'contains' cannot be used in action 'doThing'")
+
+
 def test_object_ref_in_create_rejected(tmp_path):
     _expect_error(tmp_path, {"a.yaml": """
         objectType: &noop

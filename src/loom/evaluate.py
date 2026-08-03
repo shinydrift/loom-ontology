@@ -70,10 +70,22 @@ class Scope:
     `object_row` is the target object's *current* property values, keyed by property name — None
     for `create`, which has no prior object, exactly as the validator refuses `object.*` there. A
     property the row holds no value for is present and null; a property missing from the mapping
-    entirely is a bug above this line, and says so rather than evaluating to null."""
+    entirely is a bug above this line, and says so rather than evaluating to null.
+
+    `principal_claims` is the verified token payload, and **absence is not null here**. A property
+    missing from a row is a bug; a claim missing from a token is the ordinary shape of a token, so
+    it raises rather than resolving — which is what makes it *undecided* to the one caller that
+    catches `EvalError` per leaf (`predicate.py`), and fail-closed rather than fail-open. If absence
+    were null, `principal.dept != null` would be **false** for a caller who has no `dept`, the guard
+    would not apply, and a missing claim would have widened what that caller sees. See
+    `predicate.guard_truth`.
+
+    None rather than empty is the default because a rule is evaluated with no principal at all, and
+    `principal.*` is refused in an ontology anyway (`validator.py`)."""
 
     parameters: Mapping[str, Any]
     object_row: Mapping[str, Any] | None = None
+    principal_claims: Mapping[str, Any] | None = None
 
 
 def evaluate(expr: Expr, scope: Scope) -> Any:
@@ -122,6 +134,15 @@ def _ref(ref: Ref, scope: Scope) -> Any:
         if ref.path[1] not in scope.object_row:
             raise EvalError(f"'object.{ref.path[1]}' was not read from the row")
         return scope.object_row[ref.path[1]]
+    if len(ref.path) == 2 and ref.path[0] == "principal":
+        # Both branches raise, and they are two different sentences on purpose: one is a policy
+        # evaluated where nobody was attested, the other is an attested caller whose token simply
+        # does not carry the claim. Both are undecided to `predicate.py`, and undecided withholds.
+        if scope.principal_claims is None:
+            raise EvalError(f"'principal.{ref.path[1]}' has no value here — no caller was attested")
+        if ref.path[1] not in scope.principal_claims:
+            raise EvalError(f"this caller's token carries no '{ref.path[1]}' claim")
+        return scope.principal_claims[ref.path[1]]
     raise EvalError(f"unsupported reference '{'.'.join(ref.path)}'")  # pragma: no cover
 
 
@@ -154,11 +175,31 @@ def _binary(node: Binary, scope: Scope) -> Any:
     if node.op in ("==", "!="):
         equal = _equal(left, right)
         return equal if node.op == "==" else not equal
+    if node.op == "contains":
+        return _contains(left, right)
     if node.op in _ORDERED:
         return _ordered(node.op, left, right)
     if node.op in _ARITHMETIC:
         return _arithmetic(node.op, left, right)
     raise EvalError(f"unsupported operator '{node.op}'")  # pragma: no cover
+
+
+def _contains(left: Any, right: Any) -> bool:
+    """Membership in a list of strings — `principal.groups contains 'auditors'`.
+
+    Strict in both operands rather than forgiving, for `_ordered`'s reason: the only thing that could
+    be returned instead of raising is `False`, and a `False` that means *this was not a list* reads
+    exactly like one that means *this list does not hold that*. To the one caller that catches this,
+    raising is `undecided` and `False` is `decided: no` — and those are the two answers a governance
+    guard must not confuse.
+
+    A JSON array of strings is what the type vocabulary allows (`auth.CLAIM_TYPES`), so a list
+    holding anything else is a token disagreeing with the config that described it."""
+    if not isinstance(left, (list, tuple)) or not all(isinstance(v, str) for v in left):
+        raise EvalError(f"'contains' needs a list of strings on the left, got {_name(left)}")
+    if not isinstance(right, str):
+        raise EvalError(f"'contains' needs a string on the right, got {_name(right)}")
+    return right in left
 
 
 def _boolean(value: Any, op: str) -> bool:
