@@ -57,9 +57,13 @@ def test_apply_bootstraps_an_empty_warehouse(project):
     result = _apply(target, ontology, catalogs)
 
     assert result.status == APPLIED, result.error
-    assert sorted(o.table for o in result.applied) == ["crm.customers", "sales.orders"]
+    assert sorted(o.table for o in result.applied) == [
+        "crm.customers",
+        "sales.daily_sales_performance",
+        "sales.orders",
+    ]
     # Namespaces did not exist a moment ago; apply created them rather than failing.
-    assert [o.namespace_created for o in result.applied] == ["crm", "sales"]
+    assert [o.namespace_created for o in result.applied] == ["crm", "sales", ""]
 
     schema = catalogs["local"].describe("crm.customers")
     assert {c.name: c.iceberg_type for c in schema.columns.values()} == {
@@ -75,6 +79,9 @@ def test_apply_bootstraps_an_empty_warehouse(project):
     orders = catalogs["local"].describe("sales.orders")
     assert orders.columns["total_amount"].iceberg_type == "decimal(12,2)"
     assert orders.columns["created_at"].iceberg_type == "timestamptz"
+    performance = catalogs["local"].describe("sales.daily_sales_performance")
+    assert performance.columns["gross_sales"].iceberg_type == "decimal(14,2)"
+    assert performance.columns["source_snapshot_id"].iceberg_type == "long"
 
 
 def test_the_result_is_what_validate_physical_and_the_read_path_expect(project):

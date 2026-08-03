@@ -1,0 +1,15 @@
+objectType:
+  apiName: DailySalesPerformance
+  displayName: Daily Sales Performance
+  description: Precomputed daily order revenue and volume, with refresh and source provenance
+  primaryKey: salesDate
+  title: salesDate
+  backing: { catalog: local, table: sales.daily_sales_performance }
+  properties:
+    - { name: salesDate,        type: date,      column: sales_date, unique: true }
+    - { name: grossSales,       type: decimal, precision: 14, scale: 2, column: gross_sales }
+    - { name: orderCount,       type: long,      column: order_count }
+    - { name: uniqueCustomers,  type: long,      column: unique_customers }
+    - { name: refreshedAt,      type: timestamp, column: refreshed_at }
+    - { name: sourceTable,      type: string,    column: source_table }
+    - { name: sourceSnapshotId, type: long,      column: source_snapshot_id }

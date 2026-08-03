@@ -13,6 +13,7 @@ import importlib.util
 import json
 import shutil
 from datetime import UTC
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -92,6 +93,17 @@ def test_catalog_introspection_reports_real_iceberg_types(catalogs):
         "created_at": "timestamptz",
     }
     assert schema.columns["id"].required is True
+
+
+def test_daily_sales_performance_is_a_physical_precomputed_table(catalogs):
+    rows = catalogs["local"].scan("sales.daily_sales_performance").to_pylist()
+    assert len(rows) == 5
+    feb_11 = next(row for row in rows if str(row["sales_date"]) == "2026-02-11")
+    assert feb_11["gross_sales"] == Decimal("450.00")
+    assert feb_11["order_count"] == 1
+    assert feb_11["unique_customers"] == 1
+    assert feb_11["source_table"] == "sales.orders"
+    assert isinstance(feb_11["source_snapshot_id"], int)
 
 
 def test_physical_validation_catches_a_spec_that_drifts_from_the_table(project, catalogs):
@@ -214,12 +226,22 @@ def test_the_generated_tools_answer_from_the_warehouse(project, catalogs):
         "get_order",
         "search_order",
         "list_order",
+        "get_daily_sales_performance",
+        "search_daily_sales_performance",
+        "list_daily_sales_performance",
         "traverse",
     }
 
     text, is_error = server.call("get_customer", {"key": "c1"})
     assert is_error is False
     assert json.loads(text)["object"]["name"] == "Ada Lovelace"
+
+    text, is_error = server.call("get_daily_sales_performance", {"key": "2026-03-02"})
+    performance = json.loads(text)["object"]
+    assert is_error is False
+    assert performance["grossSales"] == "2100.00"
+    assert performance["orderCount"] == 1
+    assert performance["sourceTable"] == "sales.orders"
 
 
 def test_a_tool_call_carries_money_as_a_string(project, catalogs):

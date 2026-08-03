@@ -28,6 +28,9 @@ from pathlib import Path
 import pyarrow as pa
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from sales_performance import refresh_daily_sales_performance  # noqa: E402
 
 from loom.config import find_config, load_config  # noqa: E402
 from loom.errors import Diagnostics  # noqa: E402
@@ -128,19 +131,22 @@ def seed(example_dir: Path = EXAMPLE_DIR, fresh: bool = True):
         table = catalog.create_table_if_not_exists(identifier, schema=schema)
         if table.scan().to_arrow().num_rows == 0:
             table.append(rows)
+    refresh_daily_sales_performance(catalog)
     return config, catalog
 
 
 def main() -> int:
     config, catalog = seed()
     warehouse = config.catalogs["local"].warehouse
-    print(f"seeded {len(TABLES)} table(s) into {warehouse}")
-    for identifier in TABLES:
+    identifiers = [*TABLES, "sales.daily_sales_performance"]
+    print(f"seeded {len(identifiers)} table(s) into {warehouse}")
+    for identifier in identifiers:
         n = catalog.load_table(identifier).scan().to_arrow().num_rows
         print(f"  {identifier}: {n} row(s)")
     print("\nnext:")
     print("  loom validate --physical examples/retail/ontology")
     print("  loom query Customer examples/retail/ontology --key c1")
+    print("  loom query DailySalesPerformance examples/retail/ontology --key 2026-02-11")
     print("  loom run upgradeTier examples/retail/ontology --param customer=c3 --param newTier=gold")
     print("  loom serve examples/retail/ontology")
     return 0
