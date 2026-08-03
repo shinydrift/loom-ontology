@@ -48,7 +48,8 @@ def project(tmp_path_factory):
     config = load_config(find_config(target / "ontology"), diag)
     ontology, _ = build(target / "ontology")
     diag.raise_if_errors()
-    return ontology, config
+    # The directory comes back too, for the one test that drives `loom query` rather than the API.
+    return ontology, config, target
 
 
 @pytest.fixture(scope="module")
@@ -73,7 +74,7 @@ def test_the_example_validates_against_its_own_warehouse(project, catalogs):
     from loom.loader import load_dir
     from loom.validator import check_physical, validate
 
-    ontology, config = project
+    ontology, config, _ = project
     diag = Diagnostics()
     loaded = load_dir(Path(config.source).parent / "ontology", diag)
     validate(loaded, diag)
@@ -111,7 +112,7 @@ def test_physical_validation_catches_a_spec_that_drifts_from_the_table(project, 
     from loom.loader import load_dir
     from loom.validator import check_physical
 
-    _, config = project
+    _, config, _ = project
     ontology_dir = Path(config.source).parent / "ontology"
     original = (ontology_dir / "customer.yaml").read_text()
     try:
@@ -170,6 +171,36 @@ def test_search_filters_are_anded(resolver):
     assert resolver.search("Customer", {"name": "ace", "tier": "silver"}) == [
         {"customerId": "c2", "name": "Grace Hopper", "tier": "silver", "ltv": 12750.0}
     ]
+
+
+def test_a_date_range_selects_a_month(resolver):
+    """M7's acceptance case, and the query this object type exists to answer. Not expressible at
+    all before typed filters: `salesDate` is a date, which `searchable` could not even name."""
+    rows = resolver.search(
+        "DailySalesPerformance", {"salesDate": {"gte": "2026-02-01", "lt": "2026-03-01"}}
+    )
+    assert [str(r["salesDate"]) for r in rows] == ["2026-02-11", "2026-02-14"]
+
+
+def test_a_range_and_a_substring_are_anded_across_properties(resolver):
+    rows = resolver.search(
+        "DailySalesPerformance",
+        {"salesDate": {"gte": "2026-03-01"}, "sourceTable": {"eq": "sales.orders"}},
+    )
+    assert [str(r["salesDate"]) for r in rows] == ["2026-03-02", "2026-03-09"]
+
+
+def test_an_open_range_over_a_decimal_compares_as_a_decimal(resolver):
+    """`grossSales` is `decimal(14,2)`; the bound is coerced before it reaches the engine."""
+    rows = resolver.search("DailySalesPerformance", {"grossSales": {"gt": "2000.00"}})
+    assert [str(r["salesDate"]) for r in rows] == ["2026-03-02"]
+
+
+def test_an_ordering_comparison_does_not_return_a_null_row(resolver):
+    """c3 has no `ltv`. Undecided is not admitted — and with no negation in this grammar, that is
+    also exactly SQL's answer, which is why the two can't disagree."""
+    assert [c["customerId"] for c in resolver.search("Customer", {"ltv": {"gt": 0}})] == ["c1", "c2"]
+    assert [c["customerId"] for c in resolver.search("Customer", {"ltv": {"eq": None}})] == ["c3"]
 
 
 def test_nullable_property_comes_back_as_none(resolver):
@@ -244,6 +275,54 @@ def test_the_generated_tools_answer_from_the_warehouse(project, catalogs):
     assert performance["sourceTable"] == "sales.orders"
 
 
+def test_the_date_range_answers_through_the_generated_tool(project, catalogs):
+    """The same acceptance query an agent would send, through tool dispatch and its schema."""
+    from loom.mcp.server import build_server
+
+    server, _ = build_server(project[0], project[1], catalogs)
+    schema = server.tools["search_daily_sales_performance"].input_schema
+    operators = schema["properties"]["filter"]["properties"]["salesDate"]["anyOf"][1]["properties"]
+    assert set(operators) == {"eq", "ne", "gt", "gte", "lt", "lte"}
+
+    text, is_error = server.call(
+        "search_daily_sales_performance",
+        {"filter": {"salesDate": {"gte": "2026-02-01", "lt": "2026-03-01"}}},
+    )
+    payload = json.loads(text)
+    assert is_error is False
+    assert [row["salesDate"] for row in payload["objects"]] == ["2026-02-11", "2026-02-14"]
+    assert payload["hasMore"] is False
+
+
+def test_loom_query_takes_the_same_range_the_tool_takes(project, capsys):
+    """The dev command mirrors the generated tools, in the one encoding a shell has."""
+    from loom.cli import main
+
+    argv = [
+        "query",
+        "DailySalesPerformance",
+        str(project[2] / "ontology"),
+        "--filter",
+        "salesDate.gte=2026-02-01",
+        "--filter",
+        "salesDate.lt=2026-03-01",
+    ]
+    assert main(argv) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [row["salesDate"] for row in rows] == ["2026-02-11", "2026-02-14"]
+
+
+def test_a_bare_null_filter_is_refused_through_the_tool(project, catalogs):
+    """An `isError` result an agent can act on, naming the spelling that means what it asked."""
+    from loom.mcp.server import build_server
+
+    server, _ = build_server(project[0], project[1], catalogs)
+    text, is_error = server.call("search_customer", {"filter": {"name": None}})
+    assert is_error is True
+    assert "a bare null is not a filter value" in text
+    assert '{"eq": null}' in text
+
+
 def test_a_tool_call_carries_money_as_a_string(project, catalogs):
     from loom.mcp.server import build_server
 
@@ -290,7 +369,7 @@ def test_a_policy_withholds_from_both_callers_alike(project, catalogs):
     from loom.mcp.server import build_server
     from loom.resolver import build_resolver
 
-    ontology, config = project
+    ontology, config, _ = project
     governed = replace(config, policies=(Policy(name="hide-ltv", object_type="Customer", mask=("ltv",)),))
 
     resolver = build_resolver(ontology, governed, catalogs)
@@ -339,7 +418,7 @@ def test_a_governed_read_never_asks_the_warehouse_for_the_column(project, catalo
     from loom.governance import Policy
     from loom.resolver import build_resolver
 
-    ontology, config = project
+    ontology, config, _ = project
     governed = replace(config, policies=(Policy(name="hide-ltv", object_type="Customer", mask=("ltv",)),))
     resolver = build_resolver(ontology, governed, catalogs)
     resolver.engine = _Spy(resolver.engine)
@@ -366,7 +445,7 @@ def test_a_row_predicate_withholds_the_row_from_every_surface(project, catalogs)
     from loom.mcp.server import build_server
     from loom.resolver import build_resolver
 
-    ontology, config = project
+    ontology, config, _ = project
     governed = replace(
         config,
         mcp=replace(config.mcp, writes=True),

@@ -15,6 +15,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from .config import CONFIG_FILENAME, find_config, load_config
 from .errors import Diagnostics, SourceLoc, SpecError, SpecErrors
@@ -112,13 +113,26 @@ def cmd_query(args) -> int:
     if args.link and not args.key:
         print("error: --link requires --key", file=sys.stderr)
         return 1
-    filters = {}
+    # `PROP=VALUE` and `PROP.OP=VALUE` — the two spellings the generated tool takes, in the one
+    # encoding a shell has. A property name cannot contain a dot, so the split is unambiguous; a
+    # null filter is the one thing not expressible here, because every CLI value is a string.
+    filters: dict[str, Any] = {}
     for pair in args.filter or []:
         if "=" not in pair:
-            print(f"error: --filter expects PROP=VALUE, got '{pair}'", file=sys.stderr)
+            print(f"error: --filter expects PROP=VALUE or PROP.OP=VALUE, got '{pair}'", file=sys.stderr)
             return 1
         name, value = pair.split("=", 1)
-        filters[name] = value
+        name, _, op = name.partition(".")
+        if not op:
+            if name in filters:
+                print(f"error: --filter gives '{name}' both a bare value and operators", file=sys.stderr)
+                return 1
+            filters[name] = value
+        elif isinstance(filters.setdefault(name, {}), dict):
+            filters[name][op] = value
+        else:
+            print(f"error: --filter gives '{name}' both a bare value and operators", file=sys.stderr)
+            return 1
 
     try:
         resolver = build_resolver(ontology, config)
@@ -697,7 +711,12 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")
     q.add_argument("--key", help="primary key — fetch one object")
     q.add_argument("--link", help="with --key, follow this link instead")
-    q.add_argument("--filter", action="append", metavar="PROP=VALUE", help="repeatable search filter")
+    q.add_argument(
+        "--filter",
+        action="append",
+        metavar="PROP[.OP]=VALUE",
+        help="repeatable search filter, ANDed — e.g. tier=gold, salesDate.gte=2026-01-01",
+    )
     q.add_argument("--limit", type=int, default=None)
     q.set_defaults(func=cmd_query)
 

@@ -76,7 +76,14 @@ def test_a_malformed_filter_is_caught_before_any_catalog_is_opened(tmp_path, cap
     """A typo'd flag shouldn't need a reachable metastore to be reported."""
     ontology = _project(tmp_path, config=UNREACHABLE_CONFIG)
     assert main(["query", "Customer", str(ontology), "--filter", "justaname"]) == 1
-    assert "--filter expects PROP=VALUE" in capsys.readouterr().err
+    assert "--filter expects PROP=VALUE or PROP.OP=VALUE" in capsys.readouterr().err
+
+
+def test_a_property_given_both_spellings_at_once_is_refused(tmp_path, capsys):
+    ontology = _project(tmp_path, config=UNREACHABLE_CONFIG)
+    argv = ["query", "Customer", str(ontology), "--filter", "ltv=1", "--filter", "ltv.gte=1"]
+    assert main(argv) == 1
+    assert "both a bare value and operators" in capsys.readouterr().err
 
 
 def test_link_without_a_key_is_refused_before_any_catalog_is_opened(tmp_path, capsys):

@@ -22,7 +22,6 @@ from ..ir import (
     Compare,
     Const,
     Contains,
-    Eq,
     GetByKey,
     Not,
     Or,
@@ -32,6 +31,7 @@ from ..ir import (
     TableRef,
     Traverse,
     predicate_columns,
+    pushdown_hints,
     tables_of,
 )
 
@@ -130,23 +130,22 @@ class DuckDBEngine:
         frm = _quote(alias)
         clauses: list[str] = []
         params: list[Any] = []
-        pushdown: list[tuple[str, Any]] = []
         referenced = self._columns_for(plan, src, alias) | set(src.order_by)
 
         for f in src.filters:
-            referenced.add(f.column)
-            if isinstance(f, Eq):
-                if f.value is None:
-                    clauses.append(f"{_ref(f.alias, f.column)} IS NULL")
-                else:
-                    clauses.append(f"{_ref(f.alias, f.column)} = ?")
-                    params.append(f.value)
-                pushdown.append((f.column, f.value))
-            elif isinstance(f, Contains):
+            if isinstance(f, Contains):
+                referenced.add(f.column)
                 clauses.append(f"{_ref(f.alias, f.column)} ILIKE ? ESCAPE '{_LIKE_ESCAPE}'")
                 params.append(f"%{_escape_like(f.value)}%")
+            elif isinstance(f, Compare):
+                # The same lowering a governance predicate gets, because it is the same node: one
+                # meaning per operator in this dialect, so `eq` on a null column cannot answer one
+                # thing for a caller and another for a policy.
+                referenced |= {column for _, column in predicate_columns(f)}
+                clauses.append(self._compare(f, params))
             else:
                 raise EngineError(f"unsupported filter {type(f).__name__}")
+        pushdown = list(pushdown_hints(src.filters))
 
         scans = (
             ScanRequest(
@@ -250,11 +249,15 @@ class DuckDBEngine:
         raise EngineError(f"unsupported predicate node {type(pred).__name__}")  # pragma: no cover
 
     def _compare(self, cmp: Compare, params: list[Any]) -> str:
-        """**`==` is not `=` here.** §5 says null is a value — `null == null` is true — so the
+        """One comparison — a policy's or a caller's, since M7 they are the same node.
+
+        **`==` is not `=` here.** §5 says null is a value — `null == null` is true — so the
         equality a policy writes lowers to `IS NOT DISTINCT FROM`, which is the same statement in
         SQL's vocabulary. `=` would return unknown instead, and under a `NOT` that flips a row from
         excluded to admitted: the one place the two planes could disagree, closed at the one node
-        where they disagree.
+        where they disagree. A caller's `eq` gets the same spelling and the same rows — for a bound
+        non-null parameter the two are identical, and for `{"eq": null}` this is what v0's
+        `Eq(col, None)` already compiled to.
 
         Ordering is *not* lifted, and that is the other half of the same decision: SQL yields
         unknown for `NULL > 100` and §5 refuses to order a null, so `predicate.admits` calls it

@@ -106,6 +106,12 @@ def session(served_ontology):
             ("run_upgrade_tier", {"parameters": {"customer": "c3", "newTier": "gold"}}),
             ("run_forget_customer", {"parameters": {"customer": "nobody"}}),
             ("get_customer", {"key": "c3"}),
+            # Appended rather than inserted: every assertion below indexes this list positionally.
+            (
+                "search_daily_sales_performance",
+                {"filter": {"salesDate": {"gte": "2026-02-01", "lt": "2026-03-01"}}},
+            ),
+            ("search_customer", {"filter": {"name": None}}),
         ],
     )
 
@@ -177,6 +183,21 @@ def test_search_over_the_wire_filters(session):
     _, _, results = session
     payload = json.loads(results[1].content[0].text)
     assert [c["customerId"] for c in payload["objects"]] == ["c1"]
+
+
+def test_a_typed_range_survives_the_wire(session):
+    """A nested operator object is JSON like any other argument — the acceptance query, spawned."""
+    _, _, results = session
+    payload = json.loads(results[9].content[0].text)
+    assert results[9].is_error is False
+    assert [row["salesDate"] for row in payload["objects"]] == ["2026-02-11", "2026-02-14"]
+
+
+def test_a_bare_null_filter_is_refused_over_the_wire(session):
+    """A refusal an agent branches on, not a transport failure — §7's `isError` rule unchanged."""
+    _, _, results = session
+    assert results[10].is_error is True
+    assert "a bare null is not a filter value" in results[10].content[0].text
 
 
 def test_traverse_over_the_wire_pages(session):

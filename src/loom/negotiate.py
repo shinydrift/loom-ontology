@@ -32,6 +32,17 @@ that survived a second transport intact and should not be spent on a config mism
 worse than either, and worse than failing: an exact match where the spec promised substring returns
 rows, so nothing errors, and the agent believes an answer that is wrong.
 
+**A fourth flag was considered for typed filters and refused, by this module's own rule.** M7 put
+range comparisons in a caller's hands, and the question was whether `>=` is a floor every engine
+meets or a `NEGOTIATED` capability. It is a floor: every dialect that can say `WHERE c = ?` can say
+`WHERE c >= ?`, so a `range_comparisons` flag is one **no adapter could ever set false** — a
+requirement nothing can fail is not a requirement, it is the `loom.managed` shape (a field written
+and read by nothing) wearing `native_merge`'s hat. `case_insensitive_like` is the contrast that makes
+the line real: Trino has no `ILIKE`, so an engine genuinely can fail it. Nothing about typed filters
+changes what is demanded here — a searchable `date` demands nothing new, and `case_insensitive_like`
+is still demanded by a searchable **string**, because `filters.operators()` offers `contains` for
+exactly those properties.
+
 **The write path is not negotiated, and that is not an omission.** `loom run` and the `run_` tools
 go through `ActionRuntime`, which reads a whole row and writes it back through the catalog's ports
 and never compiles a plan — so it asks the engine for nothing and there is nothing to check. An

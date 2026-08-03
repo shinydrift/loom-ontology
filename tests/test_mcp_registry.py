@@ -156,9 +156,38 @@ def test_input_schemas_come_from_the_type_system(ontology):
     # Customer's primary key is a string property.
     assert tools["get_customer"].input_schema["properties"]["key"]["type"] == "string"
     assert tools["get_customer"].input_schema["required"] == ["key"]
-    # `tier` is an enum, so the agent is handed its declared values.
+    # `tier` is an enum, so the agent is handed its declared values — in both filter spellings.
     tier = tools["search_customer"].input_schema["properties"]["filter"]["properties"]["tier"]
-    assert tier["enum"] == ["bronze", "silver", "gold"]
+    bare, operators = tier["anyOf"]
+    assert bare["enum"] == ["bronze", "silver", "gold"]
+    assert operators["properties"]["eq"]["anyOf"][0]["enum"] == ["bronze", "silver", "gold"]
+
+
+def test_the_operators_a_property_advertises_are_a_function_of_its_type(ontology):
+    """An enum is a declared set, so it is testable and not orderable; a string adds substring."""
+    props = _tools(ontology)["search_customer"].input_schema["properties"]["filter"]["properties"]
+    assert set(props["tier"]["anyOf"][1]["properties"]) == {"eq", "ne"}
+    assert set(props["name"]["anyOf"][1]["properties"]) == {
+        "eq", "ne", "gt", "gte", "lt", "lte", "contains",
+    }
+
+
+def test_only_the_equality_operators_admit_a_null(ontology):
+    """§5's 'null is a value you can test, not one you can order', readable in the schema."""
+    name = _tools(ontology)["search_customer"].input_schema["properties"]["filter"]["properties"]["name"]
+    operators = name["anyOf"][1]["properties"]
+    assert {"type": "null"} in operators["eq"]["anyOf"]
+    assert {"type": "null"} in operators["ne"]["anyOf"]
+    assert "anyOf" not in operators["gte"] and operators["gte"] == {"type": "string"}
+
+
+def test_an_operator_name_cannot_shadow_a_property_name(ontology):
+    """§7's namespace rule, one level deeper: property names and operator names never share a
+    level, so a spec may declare a property called `gte`."""
+    filter_schema = _tools(ontology)["search_customer"].input_schema["properties"]["filter"]
+    assert set(filter_schema["properties"]) <= set(ontology.object_types["Customer"].properties)
+    for prop_schema in filter_schema["properties"].values():
+        assert set(prop_schema["anyOf"][1]["properties"]) & set(filter_schema["properties"]) == set()
 
 
 def test_search_exposes_only_declared_searchable_properties(ontology):

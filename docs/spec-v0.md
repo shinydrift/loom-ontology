@@ -91,7 +91,7 @@ objectType:
       renamedFrom: legacy_ltv     # optional · the column `column` used to be — see below
       nullable: true
 
-  searchable: [name, tier]        # optional · property names powering search_<type>
+  searchable: [name, tier]        # optional · the properties search_<type> can filter on
 ```
 
 **Validation rules**
@@ -104,7 +104,11 @@ objectType:
 4. Property `name`s are unique within the object; `column`s are unique within the object.
 5. `enum` properties declare a non-empty, duplicate-free `values` list. `decimal` properties
    declare `precision` (≥1) and `scale` (0 ≤ scale ≤ precision).
-6. `searchable` entries name existing properties whose type is `string` or `enum`.
+6. `searchable` entries name existing properties. **Any type**, since §7.1: the list decides what
+   `search_<type>` may filter on, and every scalar has comparisons worth offering. It was
+   string-or-enum while a filter could only say equality and substring, and lifting that is a
+   widening of what an author *may declare* rather than of any surface — a property still has to be
+   listed here to be filterable at all, and the word still means "substring" for a string.
 7. **Physical check** (at `loom plan` / `loom serve`, against catalog introspection): every
    `backing.table` exists, every `column` exists on it, and every property type is compatible
    with its column's Iceberg type per §1. Missing table/column → error; incompatible type →
@@ -557,6 +561,13 @@ Type-checking happens offline (§4 rule 3); this is what the values themselves d
 - **A rule that cannot be evaluated is not a rule that returned false.** It is its own failure
   code (`expression_error`), because an agent should not retry the two the same way.
 
+A **caller's filter** is not written in this language — it is JSON, in the shape §7.1 gives it — but
+it inherits these two answers rather than getting a third set. `{"eq": null}` is null-safe because
+that is what `==` means here, and an ordering comparison over a null column returns no row because
+§5 refuses to order a null. The one thing a filter adds is a refusal this language has no occasion
+for: a **bare** `null` (§7.1), which is JSON's inability to distinguish an absent key from a null
+one rather than anything about the value domain.
+
 ---
 
 ## 6. Project config — `loom.yaml`
@@ -862,7 +873,7 @@ surface. Nothing here is hand-authored.
 | Spec element                         | Generated MCP tool(s)                                   | Input schema source |
 |--------------------------------------|---------------------------------------------------------|---------------------|
 | `objectType Customer`                | `get_customer(key)`                                     | PK type |
-|                                      | `search_customer(filter, page)`                         | `searchable` props + property types |
+|                                      | `search_customer(filter, page)`                         | `searchable` props + property types → §7.1 |
 |                                      | `list_customer(page)`                                   | pagination |
 | `linkType placedBy` (+ `reverseName`)| contributes `order` / `customer` directions to `traverse(object, link, direction)` | link mapping |
 | `action upgradeTier`                 | `run_upgrade_tier(parameters, dryRun)`                  | `parameters` → JSON Schema; `description` → tool description |
@@ -885,6 +896,12 @@ nested object — `search_`'s declared property filters under `filter`, `run_`'s
 under `parameters`. Names Loom chose stay at the top: `key`, `limit`, `offset`, `objectType`,
 `link`, `dryRun`. That is what makes `dryRun` addable at all, because an ontology may declare a
 parameter called `dryRun` and it can no more be shadowed than a property called `limit` can.
+
+**Typed filters put Loom's words below a spec name, and the rule survives being restated.** It was
+never "Loom's vocabulary appears once": it is that **each level of the argument tree belongs entirely
+to one vocabulary, and they alternate.** Top level Loom's, `filter` the spec's, and — since §7.1 —
+one more level of Loom's inside each property. A property name never appears where an operator does,
+so nothing shadows anything and a spec may declare a property called `gte`.
 
 **`dryRun` is an inspection verb, not an approval step.** It runs bind → read → validate and stops
 before the write, returning `previewed` — the same thing `loom run` prints above its `y/N`, and the
@@ -934,6 +951,48 @@ the projection, the `filter` schema and the result — and can never add to any 
 same direction the engine may not push in: §6 refuses a spec an engine cannot serve rather than
 narrowing the surface to fit, because an engine is an implementation detail, while a policy is the
 deployment's declared intent about its own data.
+
+### 7.1 The filter grammar — what `search_<type>` takes
+
+```yaml
+filter:
+  tier: gold                                    # a bare value — the v0 spelling
+  salesDate: { gte: '2026-01-01', lt: '2026-02-01' }   # comparisons, ANDed
+```
+
+Operators are generated from the **property type** and nothing else:
+
+| type | operators |
+|---|---|
+| `string` | `eq` `ne` `gt` `gte` `lt` `lte`, and `contains` when the property is `searchable` |
+| `int` `long` `double` `decimal` `date` `timestamp` | `eq` `ne` `gt` `gte` `lt` `lte` |
+| `enum` `boolean` `objectRef` | `eq` `ne` |
+
+An `enum` is not ordered: its `values` are a declared set and their order in the file is a list, so
+`tier > 'bronze'` would answer with the engine's collation rather than with anything the spec said.
+An `objectRef` travels as a key, and keys are equal or not.
+
+**A bare value is type-directed sugar** — `contains` for a `searchable` string, `eq` for everything
+else — which is exactly what it meant in v0. It is kept because rewriting it as a plain `eq` would
+return *fewer* rows to every filter already written against a searchable string, with nothing
+raising: a silent narrowing, which §6 already calls worse than a refusal.
+
+**Composition is `AND`**, between operators on one property and between properties. `or`, `in` and
+`not` are deferred: each needs an IR shape, an engine lowering and a transport story of its own, and
+`in` is sugar over an `or` that does not exist yet.
+
+**Null is a value you can test and not one you can order, and a bare `null` is refused.** `{"ltv":
+{"eq": null}}` selects the rows where `ltv` is null (§5.2, unchanged, and the same
+`IS NOT DISTINCT FROM` lowering a policy's `==` gets). `{"ltv": {"gte": null}}` is refused, because
+it is undecided for every row. And `{"ltv": null}` — a bare null — is **refused permanently**: JSON
+cannot distinguish a field a caller left blank from one it meant as null, and an agent emitting null
+for a value it did not have is the likeliest way this argument is ever malformed. v0 answered it as
+`IS NULL`, which is a plausible non-empty result set for a question nobody asked. The generated
+schema says all of this: the two equality operators admit a `null` and the four ordering ones do not.
+
+**An ordering comparison over a null column does not return the row.** SQL's three-valued answer and
+§6.1's *admitted only on true* agree here rather than by coincidence: this grammar has no negation,
+which is the only place the two can differ.
 
 ---
 

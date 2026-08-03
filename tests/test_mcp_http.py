@@ -172,6 +172,10 @@ def session(served):
             ("search_customer", {"filter": {"tier": "gold"}}),
             ("traverse", {"objectType": "Customer", "key": "c2", "link": "orders", "limit": 2}),
             ("traverse", {"objectType": "Customer", "key": "c1", "link": "bogus"}),
+            (
+                "search_daily_sales_performance",
+                {"filter": {"salesDate": {"gte": "2026-02-01", "lt": "2026-03-01"}}},
+            ),
         ],
     )
 
@@ -233,6 +237,8 @@ def test_reads_cross_the_wire(session):
     traversed = _payload(results, 2)
     assert traversed["targetObjectType"] == "Order"
     assert [o["orderId"] for o in traversed["objects"]] == ["o3", "o4"]
+    # A typed range, over a socket: the acceptance query, answering identically to stdio.
+    assert [r["salesDate"] for r in _payload(results, 4)["objects"]] == ["2026-02-11", "2026-02-14"]
 
 
 def test_a_bad_link_is_an_error_result_the_agent_can_recover_from(session):

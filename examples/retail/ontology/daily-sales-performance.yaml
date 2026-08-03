@@ -13,3 +13,7 @@ objectType:
     - { name: refreshedAt,      type: timestamp, column: refreshed_at }
     - { name: sourceTable,      type: string,    column: source_table }
     - { name: sourceSnapshotId, type: long,      column: source_snapshot_id }
+  # A date range is the query this object type exists to answer, and `searchable` is still what
+  # decides a property is filterable at all — so it has to say so. Before typed filters this list
+  # could only hold strings and enums, which is why it was empty.
+  searchable: [salesDate, grossSales, sourceTable]

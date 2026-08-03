@@ -25,6 +25,12 @@ means something by. `get_<object>` and `traverse` are the same rule seen from th
 top-level names (`key`, `objectType`, `link`) are Loom's words, and only the *types* behind them come
 from the spec.
 
+Typed filters put Loom's words *below* a spec name for the first time — `filter: {salesDate: {gte:
+…}}` — and the rule holds because it was never "Loom's vocabulary appears once". It is that **each
+level of the argument tree belongs entirely to one vocabulary, and they alternate**: top level
+Loom's, `filter` the spec's, per-property Loom's again. A property name never appears where an
+operator does, so nothing can shadow anything, and a spec may declare a property called `gte`.
+
 **Where the read tools and the write tools differ, and where they don't.** A `run_` tool takes a
 runtime instead of a resolver, because a modify must see the whole physical row and the resolver
 projects one down to declared properties. Everything else is the same bargain: the name comes from
@@ -42,6 +48,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
+from .. import filters
 from ..auth import current_principal
 from ..governance import PolicyProgram
 from ..model import Action, ObjectType
@@ -246,10 +253,14 @@ def _search_tool(resolver: Resolver, obj: ObjectType, program: PolicyProgram | N
         for name in obj.searchable
         if name in obj.properties and name not in masked
     }
-    filter_props = {}
-    for name, prop in filterable.items():
-        match = "case-insensitive substring match" if prop.type.kind == "string" else "exact match"
-        filter_props[name] = {**prop.type.json_schema(), "description": f"{match} on {name}"}
+    # Generated from the property type and `searchable`, and from nothing else — the same function
+    # `Resolver._filters` enforces against, so the surface cannot advertise an operator the resolver
+    # refuses or hide one it accepts. §7's namespace rule survives one level deeper than it was
+    # written: operator keys are Loom's vocabulary *below* a property name, never beside one, so an
+    # ontology may declare a property called `gte` without shadowing anything.
+    filter_props = {
+        name: filters.property_schema(prop, searchable=True) for name, prop in filterable.items()
+    }
 
     schema = {
         "type": "object",

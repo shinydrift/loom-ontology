@@ -12,10 +12,15 @@ import pytest
 
 from loom import build
 from loom.query.engine import Capabilities, CompiledQuery
-from loom.query.ir import Contains, Eq, GetByKey, Search, Traverse
+from loom.query.ir import ColumnRef, Compare, Const, Contains, Eq, GetByKey, Search, Traverse
 from loom.resolver import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Resolver, ResolverError
 
 VALID = Path(__file__).parent / "fixtures" / "valid"
+
+
+def _eq(column, value):
+    """What a caller's equality lowers to now: the node a policy's `==` lowers to."""
+    return Compare("==", ColumnRef("t0", column), Const(value))
 
 
 class RecordingEngine:
@@ -103,13 +108,13 @@ def test_searchable_enum_matches_exactly(ontology):
     """Enum values are a closed set, so substring matching would only add ambiguity."""
     r = _resolver(ontology)
     r.search("Customer", {"tier": "gold"})
-    assert r.engine.source.filters == (Eq("t0", "tier", "gold"),)
+    assert r.engine.source.filters == (_eq("tier", "gold"),)
 
 
 def test_non_searchable_property_still_filters_exactly(ontology):
     r = _resolver(ontology)
     r.search("Customer", {"ltv": 100})
-    assert r.engine.source.filters == (Eq("t0", "lifetime_value", 100.0),)
+    assert r.engine.source.filters == (_eq("lifetime_value", 100.0),)
 
 
 def test_filtering_on_an_undeclared_property_is_refused(ontology):
@@ -148,20 +153,27 @@ def test_string_digits_coerce_to_the_declared_numeric_type(ontology):
     """An LLM sends `"100"`; a mismatched predicate would push down and match nothing."""
     r = _resolver(ontology)
     r.search("Customer", {"ltv": "100.5"})
-    assert r.engine.source.filters == (Eq("t0", "lifetime_value", 100.5),)
+    assert r.engine.source.filters == (_eq("lifetime_value", 100.5),)
 
 
 def test_decimal_filters_never_go_through_a_float(ontology):
     r = _resolver(ontology)
     r.search("Order", {"total": "1299.99"})
-    assert r.engine.source.filters == (Eq("t0", "total_amount", Decimal("1299.99")),)
+    assert r.engine.source.filters == (_eq("total_amount", Decimal("1299.99")),)
+
+
+def test_an_operator_value_is_coerced_exactly_as_a_bare_one_is(ontology):
+    """One coercion for both spellings, or `{"gte": "100"}` would compare a string to a double."""
+    r = _resolver(ontology)
+    r.search("Customer", {"ltv": {"gte": "100.5"}})
+    assert r.engine.source.filters == (Compare(">=", ColumnRef("t0", "lifetime_value"), Const(100.5)),)
 
 
 def test_timestamp_filters_are_parsed(ontology):
     r = _resolver(ontology)
     r.search("Order", {"placedAt": "2026-02-14T12:00:00+00:00"})
     (f,) = r.engine.source.filters
-    assert f.value.year == 2026 and f.value.month == 2 and f.value.day == 14
+    assert f.right.value.year == 2026 and f.right.value.month == 2 and f.right.value.day == 14
 
 
 def test_a_value_of_the_wrong_type_is_a_clear_error(ontology):
@@ -174,10 +186,18 @@ def test_an_enum_value_outside_the_declared_set_is_refused(ontology):
         _resolver(ontology).search("Customer", {"tier": "platinum"})
 
 
-def test_null_filters_survive_coercion(ontology):
+def test_a_bare_null_filter_is_refused_and_names_the_spelling_that_works(ontology):
+    """v0 answered `{"ltv": None}` as `IS NULL`. It is refused now, and the break is the point:
+    JSON cannot tell a field an agent left blank from one it meant as null, so the v0 answer was a
+    plausible non-empty result set for a caller who asked nothing."""
+    with pytest.raises(ResolverError, match="a bare null is not a filter value"):
+        _resolver(ontology).search("Customer", {"ltv": None})
+
+
+def test_null_is_a_value_where_the_caller_also_wrote_the_operator(ontology):
     r = _resolver(ontology)
-    r.search("Customer", {"ltv": None})
-    assert r.engine.source.filters == (Eq("t0", "lifetime_value", None),)
+    r.search("Customer", {"ltv": {"eq": None}})
+    assert r.engine.source.filters == (_eq("lifetime_value", None),)
 
 
 # ---- traverse ------------------------------------------------------------------
