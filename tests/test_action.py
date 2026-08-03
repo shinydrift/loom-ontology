@@ -72,7 +72,7 @@ class FakeRowCatalog:
     fake can demonstrate. A real catalog implements every port at once and so can never show which
     one was used."""
 
-    def __init__(self, rows=None, snapshot=1, fail_on="", log_fails=False):
+    def __init__(self, rows=None, snapshot=1, fail_on="", log_fails=False, log_create_fails=False):
         self.name = "rest_main"
         self.rows: dict[str, list[dict]] = {"crm.customers": [dict(r) for r in (rows or CUSTOMERS)],
                                             "sales.orders": []}
@@ -80,6 +80,7 @@ class FakeRowCatalog:
         self.log: list[tuple] = []
         self.fail_on = fail_on
         self.log_fails = log_fails
+        self.log_create_fails = log_create_fails
         self.edit_columns = None
         self.commits: dict[tuple, dict] = {}
 
@@ -122,6 +123,18 @@ class FakeRowCatalog:
         self.log.append(("delete", table, key_value))
 
     # --- edit-log port
+    def ensure_log(self, columns):
+        """The create half, on its own. `governance.edit_log: required` calls it at build time, so a
+        fake that only appended could not show that a deployment proves its log before it writes.
+
+        Failing independently of `log_fails` on purpose: a log that can be *created* and then fails
+        to accept a record is exactly the window `require_edit_log` says it does not close, and a
+        fake whose two halves failed together could not exhibit it."""
+        if self.log_create_fails:
+            raise CatalogError("boom: the edit log cannot be created")
+        self.edit_columns = tuple(columns)
+        self.rows.setdefault(EDIT_LOG_TABLE, [])
+
     def append_edit(self, columns, row):
         """One append, to the one table this port can name. No snapshot argument, because there is
         nothing to assert: the caller read nothing and is putting no row over another."""
@@ -262,6 +275,9 @@ class Interloper:
 
     def append_edit(self, columns, row):
         self.inner.append_edit(columns, row)
+
+    def ensure_log(self, columns):
+        self.inner.ensure_log(columns)
 
 
 @pytest.fixture(scope="module")

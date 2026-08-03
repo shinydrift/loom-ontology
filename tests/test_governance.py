@@ -33,6 +33,7 @@ from loom.errors import Diagnostics, SourceLoc
 from loom.expr import parse as parse_expr
 from loom.governance import (
     ENFORCED_KEYS,
+    MOVED_KEYS,
     POLICY_KEYS,
     RESERVED_KEYS,
     Policy,
@@ -111,8 +112,38 @@ def test_every_policy_key_is_either_enforced_or_reserved():
 
 def test_a_reserved_key_is_refused_with_the_reason_it_is_reserved():
     """Refused, never ignored — the rule the whole `governance:` block used to be refused under."""
+    _, diag = _parse([{"name": "p", "objectType": "Customer", "mask": ["ltv"], "when": "x"}])
+    assert any("'when'" in e.message and "attest" in e.message for e in diag.errors)
+
+
+def test_a_key_that_will_never_land_left_the_grammar_rather_than_sitting_in_it():
+    """The fourth fate of a key, and the one the partition test above cannot see.
+
+    `ENFORCED_KEYS | RESERVED_KEYS == POLICY_KEYS` catches a key that is silently accepted. It
+    cannot catch *reserved forever*: a key sitting in `RESERVED_KEYS` that no slice will ever turn
+    on partitions the grammar perfectly and still lies to whoever reads `governance:` to see what it
+    will one day hold. `audit` was that key — neither half of what it named is a policy — so it is
+    gone from the grammar rather than parked in it, and what is left in `RESERVED_KEYS` means one
+    thing: a named future slice turns it on."""
+    assert "audit" not in POLICY_KEYS
+    assert set(RESERVED_KEYS) == {"when"}
+    assert set(MOVED_KEYS).isdisjoint(POLICY_KEYS)
+
+
+def test_a_moved_key_says_where_it_went_rather_than_that_it_is_unknown():
+    """A reservation that ends in a departure still owes an answer to whoever wrote the config.
+
+    Nobody was running one — a config that was refused is a config nobody deployed — but `audit:`
+    was *advertised* as reserved for two slices, in §6.1 and in the refusal it produced. So it is
+    reported once, by the branch that knows the destination, rather than falling through to
+    `unexpected key 'audit'` with nothing behind it."""
     _, diag = _parse([{"name": "p", "objectType": "Customer", "mask": ["ltv"], "audit": {}}])
-    assert any("'audit'" in e.message and "not enforced yet" in e.message for e in diag.errors)
+    (problem,) = [e for e in diag.errors if "'audit'" in e.message]
+    assert "no longer a policy key" in problem.message
+    # Both halves, because the key meant two things and they ended differently: one moved, one is
+    # not coming back.
+    assert "governance.edit_log: required" in (problem.hint or "")
+    assert "no Loom command deletes" in (problem.hint or "")
 
 
 def test_a_principal_conditioned_policy_says_what_is_missing_and_what_to_do_instead():

@@ -20,7 +20,7 @@ import yaml
 
 from ._shape import check_keys, require, suggest
 from .errors import Diagnostics, SourceLoc
-from .governance import Policy, parse_policies
+from .governance import EDIT_LOG_OPTIONAL, Policy, parse_edit_log, parse_policies
 
 CONFIG_FILENAME = "loom.yaml"
 SPEC_VERSION = 0
@@ -45,7 +45,7 @@ _ADDRESS_KEYS = ("host", "port", "path", "allowed_hosts")
 config that sets them under `transport: stdio` is refused rather than ignored — the rule
 `_check_governance` states, applied to a second set of keys that would otherwise be silently
 dropped."""
-_GOVERNANCE_KEYS = {"policies"}
+_GOVERNANCE_KEYS = {"policies", "edit_log"}
 
 
 def is_loopback(host: str) -> bool:
@@ -180,10 +180,19 @@ class LoomConfig:
     catalogs: Mapping[str, CatalogConfig] = field(default_factory=dict)
     engine: EngineConfig = field(default_factory=EngineConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
-    # `governance:` has exactly one key in v0, so the policies arrive flat rather than behind a
-    # config object with one field. Unresolved on purpose: these are policies as *written*, and
-    # nothing here has an ontology to check them against — `build_resolver` binds them.
+    # `governance:` had exactly one key in v0 and now has two, and they still arrive flat rather
+    # than behind a config object: they are two unrelated facts about a deployment — what it
+    # withholds from a caller, and whether it will write without recording — read by two different
+    # planes, not one thing with two fields.
+    #
+    # `policies` is unresolved on purpose: these are policies as *written*, and nothing here has an
+    # ontology to check them against — `build_resolver` and `build_runtime` bind them.
     policies: tuple[Policy, ...] = ()
+    edit_log: str = EDIT_LOG_OPTIONAL
+    """Whether this deployment refuses to run when it cannot record what it writes.
+
+    Read by `build_runtime` alone. The read plane produces no records, so `build_resolver` has
+    nothing to check here — the one governance key that binds a single plane."""
     version: int = SPEC_VERSION
     source: str | None = None  # path it was loaded from, for error messages
 
@@ -230,13 +239,14 @@ def load_config(path: str | Path, diag: Diagnostics) -> LoomConfig | None:
     catalogs = _parse_catalogs(doc.get("catalogs"), loc, diag, base)
     engine = _parse_engine(doc.get("engine"), loc, diag)
     mcp = _parse_mcp(doc.get("mcp"), loc, diag)
-    policies = _parse_governance(doc.get("governance"), loc, diag)
+    policies, edit_log = _parse_governance(doc.get("governance"), loc, diag)
 
     return LoomConfig(
         catalogs=catalogs,
         engine=engine,
         mcp=mcp,
         policies=policies,
+        edit_log=edit_log,
         version=SPEC_VERSION,
         source=str(path),
     )
@@ -452,8 +462,12 @@ def _check_transport_posture(config: McpConfig, raw: dict, loc: SourceLoc, diag:
         )
 
 
-def _parse_governance(raw: object, loc: SourceLoc, diag: Diagnostics):
-    """`governance.policies`, shape-checked here and resolved against an ontology later.
+def _parse_governance(raw: object, loc: SourceLoc, diag: Diagnostics) -> tuple[tuple[Policy, ...], str]:
+    """`governance.policies` and `governance.edit_log`, shape-checked here.
+
+    The policies are resolved against an ontology later; `edit_log` is a posture about a deployment
+    and has nothing in a spec to be resolved against, so what is checked here is the whole of what
+    can be checked without opening a catalog.
 
     This used to refuse every declared policy outright, on the grounds that silently ignoring an
     access policy is far worse than not booting. That rule did not go away when enforcement landed —
@@ -464,9 +478,9 @@ def _parse_governance(raw: object, loc: SourceLoc, diag: Diagnostics):
     ontology is checked here, where a config is read and diagnostics accumulate; what needs the spec
     is checked in `build_resolver`, which is the one place the two are paired."""
     if raw is None:
-        return ()
+        return (), EDIT_LOG_OPTIONAL
     if not isinstance(raw, dict):
         diag.error("'governance' must be a mapping", loc)
-        return ()
+        return (), EDIT_LOG_OPTIONAL
     check_keys(raw, _GOVERNANCE_KEYS, loc, diag, "governance")
-    return parse_policies(raw.get("policies"), loc, diag)
+    return parse_policies(raw.get("policies"), loc, diag), parse_edit_log(raw.get("edit_log"), loc, diag)

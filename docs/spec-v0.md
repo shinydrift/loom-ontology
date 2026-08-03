@@ -576,7 +576,8 @@ mcp:
   port: 8000                      # http only
   path: /mcp                      # http only
   allowed_hosts: []               # http only · Host allow-list; derived on a loopback bind
-governance:                       # optional · row/column policies enforced in the resolver
+governance:                       # optional · what this deployment withholds, and what it demands
+  edit_log: optional              # optional | required · refuse to run if it cannot record a write
   policies:
     - name: hide-ltv              # required, unique — a refusal names it
       objectType: Customer        # the objectType it governs
@@ -584,7 +585,7 @@ governance:                       # optional · row/column policies enforced in 
       rows: "object.deletedAt == null"   # and the rows it will show · §5, narrowed
 ```
 
-### 6.1 `governance.policies`
+### 6.1 `governance`
 
 **No policy names a principal, and that is the design rather than a stage of it.** The obvious
 shape — *this caller sees these rows* — was rejected because `loom query` and `loom run` have no
@@ -597,9 +598,10 @@ it, and two audiences are served by two deployments. `mcp.actor` gains no second
 string about a deployment that reaches the edit log and nothing else, so nothing here is shaped
 around a value that a per-call principal will replace.
 
-`when:` is the clause an attested caller turns on. It is **named and refused** — like every other
-key Loom cannot yet enforce (`audit:`) — because a config that is silently ignored reads, to
-whoever wrote it, exactly like one that was obeyed.
+`when:` is the clause an attested caller turns on, and it is the **only** key still named and
+refused, because a config that is silently ignored reads, to whoever wrote it, exactly like one that
+was obeyed. `audit:` was the other one and is gone from the grammar rather than still sitting in
+it — see "`edit_log` is a posture, not a policy" below.
 
 **Two rules decide the rest.**
 
@@ -681,6 +683,55 @@ of the predicate, which is what a soft delete is. One consequence is deliberate 
 check has to be physical or two creates manufacture a duplicate primary key nothing can repair. On
 that one path a predicate hides rows and not keys, and what it discloses is confined to *something
 exists under the key you supplied*.
+
+**`edit_log` is a posture, not a policy — which is why it sits beside `policies:` rather than in
+it.** `audit:` was reserved inside the policy grammar for two slices, and it named two clauses that
+turned out to belong in different places, so the key left rather than landing.
+
+*"No log, no write"* subtracts an ability, which is the shape a policy has — but it names no
+objectType, because unloggability is a fact about a **catalog**: the log is one table per catalog
+(§9.2), reached through a port a catalog either implements or does not. A per-type spelling would
+let a config say "Customer edits must be logged, Order edits need not" about a single fact
+concerning a single catalog. It is also a switch an operator reads, which is exactly why `writes`
+below is not a policy either.
+
+**What it promises is about a deployment, never about a run**, and the name says so. There is no
+transaction spanning a row's table and `_loom_meta.edits`, so *every applied run is logged* is not
+available at any price. `edit_log: required` says the one thing that is true — **a deployment that
+cannot record what it writes does not start** — and it is checked where the spec and the deployment
+are paired, in `build_runtime`. It is the one governance key that binds a single plane: the read
+path writes no rows, so it produces no records, so `build_resolver` has nothing to check.
+
+Two kinds of unloggability, both knowable before any row is written, which is what makes this a
+startup question:
+
+- **structural** — the catalog implements no edit-log port, so every run against it writes its row
+  and reports `log_failed` afterwards, for as long as the deployment lives;
+- **physical** — the `_loom_meta` namespace or the table cannot be created. Provable only by doing
+  it, so the check **creates the table** rather than probing for one. `table_exists` asks the wrong
+  question (`false` is the ordinary state of a catalog whose first append has not happened), and
+  creating a table records nothing that might not have happened — an empty log is a permission, not
+  an intention, so this does not reopen §9.2's ordering.
+
+A **per-write probe** was rejected, and not only because it narrows the window rather than closing
+it: it is nearly blind. The log lives in the *same catalog* as the row it describes, so a catalog
+nobody can reach already fails the row write, with nothing written and nothing to record. The
+failures worth catching are specific to the log table, and the only probe that sees those is an
+append — which is log-then-write, a table of intentions that may never have happened. So the whole
+of this posture is spent at startup, and no round trip is added to the path of every action.
+
+**Nothing after the write changes under either posture.** An append that fails once the row has
+committed still comes back as `log_failed` beside an unchanged status, because *the row committed,
+so `failed` would tell a caller to retry a delete that already happened* is not an argument a
+config weakens. What survives that window is what always survived it: the commit carries
+`loom.edit_id`, so a lost record is a stamped snapshot with no matching row — a gap a reader can
+find.
+
+**Default `optional`**, for the reason `writes` is off by default: an upgrade and a catalog with no
+edit-log port are two things that happen for unrelated reasons, and neither is a deployment asking
+to stop working.
+
+*Retention is not here, and no key is coming for it* — see §9.2 and "Open edges".
 
 **`engine.type` is negotiated against the ontology, not just resolved.** An adapter reports what it
 can do, and a spec implies what will be asked of it: declaring a link means a traverse joins two
@@ -1071,18 +1122,35 @@ plane down: a table's history should say who changed it without the reader knowi
 exists. It is also the only record of an edit that is atomic with the edit, which is what makes a lost
 log row a gap somebody can find rather than silence.
 
+**Nothing Loom does removes a row from this table**, and that is an invariant rather than a missing
+feature. The sentence above is what write-then-log buys, and it only holds while a reader can
+conclude one thing from a stamp with no matching row: *the record was lost.* Expire records and it
+means two things — lost, or expired — and the reader holding the stamp cannot tell which, which
+spends the single property the ordering was chosen for. So `EditLogWriter` has no delete verb and is
+not getting one, and a retention window is not a policy key (§6.1) but a command Loom has not built.
+
+What that leaves owing is real and is narrower than "retention": declared properties are still
+somebody's data, and this table outlives the row it describes, so a `delete` action erases a
+customer and leaves the ontology's account of them behind. **Erasure does not require deletion.**
+The answer that keeps the invariant is a **redaction in place** — the row kept, `edit_id`,
+`recorded_at`, `action`, `operation` and `status` kept, and `parameters`/`before`/`after`/
+`object_key` emptied — so the skeleton stays citeable, the stamp still finds a row, and the personal
+data is gone. That is a rewrite rather than an append, by a holder that is not the action runtime.
+See "Open edges".
+
 ---
 
 ## Open edges (v0 → v1)
 
 Named deliberately so they're conscious deferrals, not gaps:
 
-- **`governance.policies` row predicates** — the column half is specified and enforced (§6.1). A
-  `rows:` predicate is named in the grammar and refused, because two things have to be settled with
-  it rather than after it: an expression that filters *before* paging has to be lowered into the
-  query rather than evaluated over the rows that came back, and Loom's expression language is
-  deliberately two-valued over one row (§4.1's null rule) where SQL is three-valued — so the same
-  predicate must not admit a row on the read path and drop it on the write path.
+- ~~**`governance.policies` row predicates**~~ — **answered** by §6.1; this bullet outlived the
+  slice that closed it. Both of the things it said had to be settled with the feature rather than
+  after it were: the predicate is lowered into the query on the read path (so it filters before
+  `LIMIT`/`OFFSET`, and `hasMore` does not lie) and evaluated in process over one row on the write
+  path, and the two-valued/three-valued disagreement was resolved by a **third** answer rather than
+  by making either plane imitate the other — true, false, or undecided, admitted only on true, with
+  `==`/`!=` carried into SQL as `IS NOT DISTINCT FROM` so §5's "null is a value" survives intact.
 - **Composite primary keys** — v0 assumes a single-property PK. Multi-column PKs touch `key`
   expressions and `objectRef` encoding.
 - **Complex types** — `array`/`struct`/`map` (see §1).
@@ -1098,17 +1166,27 @@ Named deliberately so they're conscious deferrals, not gaps:
   from the write. What made that safe rather than merely convenient is the fourth refusal in §6.1 —
   an action that writes a masked property is refused where the spec and the deployment are paired —
   so §9.2's *what the record does not name, the run did not change* stays true word for word.
-- **Edit-log retention and erasure** — the redaction half is **answered**: the log masks under the
-  same policies as a read, because `before`/`after` are built by the same projection, and it costs
-  the record nothing (see the carry-across edge above). What is left is narrower and is a real gap.
-  §9.2 still records declared properties and bound parameters of everything *not* masked, in an
-  append-only table that outlives the row it describes, so a `delete` action still erases a customer
-  and leaves the ontology's own account of them behind. Expiring that needs something no port has: a
-  verb that removes a row from `_loom_meta.edits`. `EditLogWriter` has exactly one verb and
-  deliberately no table argument, which is what stops an action from reaching any other table, so a
-  retention window is a command and a port decision rather than a policy key — named here rather
-  than bolted onto §6.1's grammar as a value nothing could enforce. Nothing is deferred about the
-  record's shape: the columns are fixed (§9.2) because the table is only ever created.
+- **Edit-log erasure** — retitled, because "retention" named the wrong operation. Two of the three
+  questions here are now **answered**. Masking: the log masks under the same policies as a read,
+  because `before`/`after` are built by the same projection, and it costs the record nothing (see
+  the carry-across edge above). Expiry-by-deletion: **refused, permanently.** It would make an
+  expired record and a lost one the same sight to a reader holding a stamped snapshot with no
+  matching row, which is the one property §9.2's write-then-log ordering exists to buy — so no port
+  verb removes a row from `_loom_meta.edits`, and there is no `retain:` key in §6.1's grammar and
+  none coming. A config key that is only a default for a command nobody runs is also the shape this
+  codebase has been bitten by once already (`loom.managed`, written by `apply` and read by nothing
+  for two milestones), and nothing in Loom runs on a schedule, so there is no actor for a window to
+  belong to.
+
+  What is genuinely left is **erasure**, which does not require deletion: declared properties are
+  somebody's data and this table outlives the row it describes, so a `delete` action erases a
+  customer and leaves the ontology's account of them behind. The shape that keeps §9.2's invariant
+  is a **redaction in place** — keep the row and empty `parameters`/`before`/`after`/`object_key` —
+  so a stamp still finds a row and what it finds says an edit happened, by whom, to what, and
+  nothing about the person. That is a rewrite rather than an append, so it belongs to a command with
+  a port of its own; the action runtime never gains the verb, which is what keeps "an action can
+  reach `_loom_meta.edits` and nothing else" true. Nothing is deferred about the record's shape: the
+  columns are fixed (§9.2) because the table is only ever created.
 - **A per-caller identity over MCP** — still open, and the HTTP transport narrowed it rather than
   closing it. `run_<action>` records `mcp.actor`, which names a *deployment*; neither transport Loom
   speaks authenticates anybody, so there is no caller to name instead.
@@ -1145,14 +1223,18 @@ Named deliberately so they're conscious deferrals, not gaps:
   `DuckDBEngine` holds one connection registering every scan under the global aliases `t0`/`t1`/`m0`
   (which is also what serializes a served process, §7). Both are the same milestone's work, and
   neither was M5's.
-- **Refusing to act when the log is unavailable** — a run whose record cannot be written still
-  happens, and reports `log_failed`. "No log, no write" is a coherent audit posture and a *policy*,
-  so it belongs with the other policies rather than wired in where no deployment could turn it off.
-  It is named in §6.1's grammar as `audit:` and refused, and what it will be able to promise is
-  already bounded by §9.2's ordering: the record is written *after* the commit, so the policy can
-  convert a *predictable* unloggability into a refusal that changes nothing, and can never undo a
-  write whose append then failed. A policy that read as "every applied run is logged" would be
-  promising something Iceberg's lack of a cross-table transaction does not allow.
+- ~~**Refusing to act when the log is unavailable**~~ — **answered** by §6.1's `edit_log`, and the
+  prediction written here was wrong in two places worth correcting rather than quietly replacing.
+  It said the clause was a *policy* and belonged with the other policies: it is a switch on a whole
+  deployment, names no objectType, and sits beside `policies:` rather than in it, for the same
+  reason `mcp.writes` does. And it said the bound was "convert a predictable unloggability into a
+  refusal that changes nothing", which was right about the limit and wrong about the shape — *all*
+  of it is spent before any row is written, because a per-write probe turned out to be nearly blind
+  (the log shares a catalog with the row, so an unreachable catalog already fails the write itself).
+  What was right is the part that survived unchanged: a clause reading "every applied run is logged"
+  would promise something Iceberg's lack of a cross-table transaction does not allow, so `edit_log`
+  promises about a deployment instead, and an append that fails after the commit still reports
+  `log_failed`.
 - **Chained renames** — `renamedFrom` is one hop (§2.1). Widening it to a list of prior names
   would be backward-compatible with every spec written against v0, if a lake that routinely skips
   applies ever makes it worth the cost.

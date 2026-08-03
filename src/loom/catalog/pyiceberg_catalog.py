@@ -414,20 +414,25 @@ class PyIcebergCatalog:
 
     # --- EditLogWriter -------------------------------------------------------------------
 
+    def ensure_log(self, columns: Sequence[Column]) -> None:
+        """The create half of `append_edit`, callable on its own so a deployment can prove it works.
+
+        The one piece of DDL reachable from the action runtime, bounded by the port rather than by a
+        check in here: neither method takes a table name, so `EDIT_LOG_TABLE` is the only thing
+        either can ever create."""
+        if self.table_exists(EDIT_LOG_TABLE):
+            return
+        self.ensure_namespace(EDIT_LOG_TABLE)
+        self.create_table(EDIT_LOG_TABLE, columns, properties={"loom.managed": "true"})
+
     def append_edit(self, columns: Sequence[Column], row: Mapping[str, Any]) -> None:
         """One record into `EDIT_LOG_TABLE`, which this method creates if it is not there.
 
         Deliberately *not* routed through `_guarded`: there is no snapshot to assert, because the
         caller read nothing and this appends over nothing. Routing it there to reuse the plumbing
         would have manufactured an expectation nobody holds, and made the log table's own traffic
-        able to refuse a write.
-
-        The create is the one piece of DDL reachable from the action runtime, and it is bounded by
-        the port rather than by a check in here: the method takes no table name, so `EDIT_LOG_TABLE`
-        is the only thing it can ever create."""
-        if not self.table_exists(EDIT_LOG_TABLE):
-            self.ensure_namespace(EDIT_LOG_TABLE)
-            self.create_table(EDIT_LOG_TABLE, columns, properties={"loom.managed": "true"})
+        able to refuse a write."""
+        self.ensure_log(columns)
         tbl = self._load(EDIT_LOG_TABLE)
         try:
             tbl.append(self._batch(tbl, [row]))

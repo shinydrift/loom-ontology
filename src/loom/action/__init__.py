@@ -135,7 +135,7 @@ Ten rules shape the package. Each had an obvious-looking alternative:
 
 from __future__ import annotations
 
-from .log import EDIT_COLUMNS, UNKNOWN_ACTOR, EditLog, EditRecord
+from .log import EDIT_COLUMNS, UNKNOWN_ACTOR, EditLog, EditRecord, require_edit_log
 from .result import (
     AMBIGUOUS_KEY,
     APPLIED,
@@ -185,4 +185,5 @@ __all__ = [
     "EditRecord",
     "Failure",
     "build_runtime",
+    "require_edit_log",
 ]
