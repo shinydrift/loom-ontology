@@ -126,13 +126,16 @@ def test_list_tools_returns_the_generated_surface(session):
     _, listing, _ = session
     assert sorted(t.name for t in listing.tools) == [
         "get_customer",
+        "get_daily_sales_performance",
         "get_order",
         "list_customer",
+        "list_daily_sales_performance",
         "list_order",
         "run_forget_customer",
         "run_record_order",
         "run_upgrade_tier",
         "search_customer",
+        "search_daily_sales_performance",
         "search_order",
         "traverse",
     ]
@@ -145,7 +148,7 @@ def test_a_default_deployment_advertises_no_way_to_write(readonly_session):
     lake writable, and it takes a line in `loom.yaml` rather than a spec edit to change that."""
     _, listing, _ = readonly_session
     assert not [t.name for t in listing.tools if t.name.startswith("run_")]
-    assert len(listing.tools) == 7
+    assert len(listing.tools) == 10
 
 
 def test_advertised_schemas_survive_the_protocol(session):
