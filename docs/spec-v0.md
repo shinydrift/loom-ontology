@@ -493,15 +493,23 @@ to describe — a competing writer coming through Loom has its own record in the
 
 Deliberately tiny so it stays portable across engines and safe to evaluate. Used in
 `validation[].rule` (must yield boolean), effect value positions (must yield the target property's
-type), and a governance policy's `rows:` predicate (§6.1, which narrows what it may contain but not
-what any of it means). Written inline or inside `{{ … }}`.
+type), and a governance policy's `rows:` predicate and `when:` guard (§6.1, which narrows what each
+may contain but not what any of it means). Written inline or inside `{{ … }}`.
 
-- **References:** a bare identifier `paramName` resolves to a parameter; `object.propName`
-  resolves to the *current* value of the target object's property (for `modify`/`delete`).
+- **References:** a bare identifier `paramName` resolves to a parameter; `object.propName` resolves
+  to the *current* value of the target object's property (for `modify`/`delete`);
+  `principal.claimName` resolves to a claim of the attested caller. One rule places all three: **a
+  reference is legal where its declaration is in scope.** A parameter is declared by its action, a
+  property by its object type, and a claim by `mcp.auth.claims` in a `loom.yaml` — so `principal.` is
+  legal in a governance policy there and **refused in an ontology**, which is what keeps a spec
+  deployment-blind.
 - **Literals:** string `'...'`, number, `true`/`false`/`null`. An enum value is a string, so it is
   quoted: `'gold'`, never bare — a bare word is always a reference.
 - **Operators:** comparison `== != < <= > >=`, boolean `&& || !`, arithmetic `+ - * /`,
-  string `+` (concat).
+  string `+` (concat), and `contains` (membership in a list). `contains` is the one operator no
+  ontology can use today: its left operand is a list of strings, and no *property* type is a list —
+  it exists for a list-valued claim, and becomes generally useful when `array` lands as a property
+  type. It is a reserved word.
 - **Function allow-list (only these):** `now()`, `lower(s)`, `upper(s)`, `len(s)`,
   `coalesce(a, b, …)`.
 - **No** loops, lambdas, property assignment, external calls, or arbitrary code. Anything
@@ -576,6 +584,12 @@ mcp:
   port: 8000                      # http only
   path: /mcp                      # http only
   allowed_hosts: []               # http only · Host allow-list; derived on a loopback bind
+  auth:                           # http only · the authorization server this deployment believes
+    issuer: https://issuer.example
+    audience: loom-prod
+    jwks_uri: https://issuer.example/jwks
+    clock_skew: 0                 # seconds, bounded — for drift, not for longer sessions
+    claims: { dept: string, groups: "string[]" }   # what a policy may name of a caller
 governance:                       # optional · what this deployment withholds, and what it demands
   edit_log: optional              # optional | required · refuse to run if it cannot record a write
   policies:
@@ -583,25 +597,66 @@ governance:                       # optional · what this deployment withholds, 
       objectType: Customer        # the objectType it governs
       mask: [ltv]                 # properties withheld from every read of that type
       rows: "object.deletedAt == null"   # and the rows it will show · §5, narrowed
+    - name: own-orders
+      objectType: Order
+      rows: "object.customerId == principal.sub"   # the caller, folded in per call
+    - name: gold-desk
+      objectType: Customer
+      when: "principal.groups contains 'gold-desk'"  # which callers this applies to · rows only
+      rows: "object.tier == 'gold'"
 ```
 
 ### 6.1 `governance`
 
-**No policy names a principal, and that is the design rather than a stage of it.** The obvious
-shape — *this caller sees these rows* — was rejected because `loom query` and `loom run` have no
-transport, so nothing can ever attest an identity to them, and a spawned stdio server carries no
-bearer token either. A grammar expressible only against an authenticated caller would make the
-*direct* half of §7's second invariant ungovernable by construction, and would leave governance
-existing only over HTTP — which is precisely the transport-dependent surface §7 says the tool set
-is not. So a policy is **deployment-scoped**: one `loom.yaml` filters one way, for every caller of
-it, and two audiences are served by two deployments. `mcp.actor` gains no second reader; it stays a
-string about a deployment that reaches the edit log and nothing else, so nothing here is shaped
-around a value that a per-call principal will replace.
+**A policy may name the caller, and exactly half of one may.** `rows:` can be conditioned on who is
+asking — by a `when:` guard, by a `principal.<claim>` inside the predicate, or both. `mask:` cannot,
+ever, and that split follows from the first rule below rather than from what is built: a mask
+*announces itself* in the tool description, the `filter` schema and `masked`, and §7 says the tool
+set and its argument namespaces are a function of the spec. A per-caller announcement means a tool
+set assembled per caller, or narrowed for everyone, or silent — so `mask:` beside `when:` is
+**refused**, and *HR sees `ssn` and nobody else does* is still served by two deployments.
 
-`when:` is the clause an attested caller turns on, and it is the **only** key still named and
-refused, because a config that is silently ignored reads, to whoever wrote it, exactly like one that
-was obeyed. `audit:` was the other one and is gone from the grammar rather than still sitting in
-it — see "`edit_log` is a posture, not a policy" below.
+**Every surface that cannot attest a caller refuses a config whose policies name one.** `loom query`,
+`loom run` and a spawned stdio server can never name anybody, and the alternative — apply only the
+unconditional policies — is disqualified by *policies subtract, never add*: skipping the guarded
+ones shows that caller **more**, and `loom query` becomes the way to read what the served surface
+withholds. So the file means one thing and two surfaces decline it, loudly, before reading anything.
+That refusal is not a check that names a surface: a decided policy set is what a read needs, and
+asking for one while naming nobody is what fails.
+
+A policy that names no caller is **deployment-scoped** exactly as it was: one `loom.yaml` filters one
+way for every caller of it. `mcp.actor` still gains no second reader; it stays a string about a
+deployment that reaches the edit log and nothing else, and an *attested* principal is what a policy
+reads — a different kind of thing, from a different source.
+
+`audit:` was reserved beside `when:` and is gone from the grammar rather than still sitting in it —
+see "`edit_log` is a posture, not a policy" below. With `when:` enforced, nothing is reserved here:
+a key that is neither enforced nor moved is simply unknown, and refused as one.
+
+**What `when:` and `principal.` may say.** One expression language (§5), with a third reference form
+whose rule is the same as the other two: *a reference is legal where its declaration is in scope.* A
+bare name is an action parameter; `object.x` is a property the ontology declares; `principal.x` is a
+claim **`mcp.auth.claims` declares**, in the deployment file, beside the issuer that mints it — so it
+is legal in a policy there and refused in an ontology, which is what keeps a spec deployment-blind.
+Claims are declared with types (`string`, `string[]`, `boolean`) for the reason every other
+reference form is checked against a declaration: an undeclared one makes a typo invisible, and this
+one would fail *closed* and silent. A guard also gets `contains`, which `rows:` refuses — a guard is
+answered once, in process, over a list only Loom holds, while a predicate must be answered twice and
+agree with itself.
+
+A guard composes as an **implication**: a policy whose guard is false withholds nothing. That is why
+it is not sugar for a longer `rows:`, where the same text would withhold everything instead.
+
+**A missing claim is not a false one**, and it fails in the withholding direction: an undecided guard
+**applies** the policy. That is the opposite disposition from the refusal above, under one rule that
+covers both — *decidable at pairing time with somebody to tell → refuse; decidable only per call,
+with only the caller to tell → withhold silently*, because telling a caller which policy did or did
+not apply to them is the existence oracle this section refuses everywhere else.
+
+**A principal never reaches the resolver.** What varies per call is a decided policy set, selected
+above it: a principal is constant for the duration of a call, so everything it conditions folds to a
+literal before the call begins — including a predicate naming the caller — and every enforcement
+site reads a set that is already decided.
 
 **Two rules decide the rest.**
 
@@ -624,8 +679,9 @@ which is why `writes` above stays a switch of its own rather than being subsumed
 declaration order cannot matter.
 
 **Four things a mask cannot withhold**, each refused where the spec and the deployment are paired
-(`build_resolver` and `build_runtime`, the same place §6's engine negotiation happens, so
-`loom query`, `loom run` and `loom serve` refuse identically):
+(`bind_reads` and `bind_writes`, the same place §6's engine negotiation happens, so `loom query`,
+`loom run` and `loom serve` refuse identically — and each checked as though every policy always
+applies, which costs nothing, because a mask may not carry `when:` at all):
 
 - a property or objectType the spec does not declare — a policy protecting a misspelling protects
   nothing and looks exactly like one that works;
@@ -641,7 +697,8 @@ declaration order cannot matter.
 oversight: each of them is a surface still trying to *use* a value it may not read. A predicate uses
 the value and shows nobody, so it may filter on a primary key, on a link's join property, or on a
 property an action reads. Only the first refusal survives — a predicate naming a property the spec
-does not declare is the same invisible typo a mask is.
+does not declare is the same invisible typo a mask is, and so is one naming a claim `mcp.auth.claims`
+does not declare.
 
 **Where it is enforced: the projection, on both planes.** A masked property is never *selected*, so
 it is not in the result set for any layer above to forget to drop, and `_loom_meta.edits` inherits
@@ -1187,11 +1244,16 @@ Named deliberately so they're conscious deferrals, not gaps:
   a port of its own; the action runtime never gains the verb, which is what keeps "an action can
   reach `_loom_meta.edits` and nothing else" true. Nothing is deferred about the record's shape: the
   columns are fixed (§9.2) because the table is only ever created.
-- **A per-caller identity over MCP** — **half answered** by `mcp.auth`, and the half that landed is
-  the half this entry said was missing. `run_<action>` still records `mcp.actor`, which names a
-  *deployment*; it now records an attested `principal` **beside** it, over the one transport that can
-  carry one. What remains open is not the identity but what may be *conditioned* on it: `when:` is
-  still refused, and the slice that turns it on is named in `ROADMAP.md` under M6.
+- ~~**A per-caller identity over MCP**~~ — **answered**, in two slices. `mcp.auth` gave a caller a
+  source: `run_<action>` still records `mcp.actor`, which names a *deployment*, and now records an
+  attested `principal` **beside** it over the one transport that can carry one. `when:` then gave a
+  policy something to condition on it, and §6.1 carries the grammar. What this entry did not
+  anticipate is the shape of the answer: **half a policy may name a caller.** `rows:` may be
+  conditioned and `mask:` may not, because a mask announces itself into the tool description and the
+  `filter` schema, and a per-caller announcement makes the tool set a function of the caller rather
+  than of the spec (§7). That refusal also **retired a prediction made in the registry**: the day an
+  attested principal arrived was supposed to be the day the tool set became something assembled per
+  caller, and it is instead the day that was closed off.
 
   What was learned in narrowing it is that there are **three** kinds of answer here and only one is
   worth having, which the earlier wording did not distinguish. An actor may be *declared* by an
@@ -1246,15 +1308,29 @@ Named deliberately so they're conscious deferrals, not gaps:
   handlers are still synchronous, so nothing overlaps. The alias problem belongs to whatever
   milestone makes a handler `async`, which is a different milestone with a different reason.
 
-  What is genuinely left for this edge, then, is only `when:`, and the decision that shapes it is
-  already made: **a principal never reaches the resolver.** A `when:` policy is resolved into a
-  decided `PolicySet` *above* it, because a principal is constant for the duration of a call, so
-  everything it conditions — including a predicate that names the caller — folds to a literal before
-  the call begins. That keeps §6.1's "the resolver receives no identity" true by construction rather
-  than by scope, and it leaves every enforcement site in `Resolver` and `_Run` untouched. The cost is
-  stated where it will be paid: `loom query`, `loom run` and a stdio server can never attest anybody,
-  so a config carrying `when:` will be **refused** for them rather than filtered differently — one
-  file meaning one thing, with two surfaces declining it, instead of one file meaning two things.
+  **A principal never reaches the resolver**, and that held exactly as written. A conditional policy
+  is resolved into a decided policy set *above* it, because a principal is constant for the duration
+  of a call, so everything it conditions — including a predicate that names the caller — folds to a
+  literal before the call begins. §6.1's "the resolver receives no identity" is true by construction
+  rather than by scope, and every enforcement site in `Resolver` and `_Run` was left untouched. The
+  cost landed where this entry said it would: `loom query`, `loom run` and a stdio server can never
+  attest anybody, so a config whose policies name a caller is **refused** for them rather than
+  filtered differently.
+
+  One thing that prediction got slightly wrong is worth marking, because it shaped where the refusal
+  lives. It reads as a check about surfaces, and a check about surfaces would have had to be spelled
+  as an argument to the function that pairs a spec with a deployment — reopening *`loom query`
+  refuses exactly what `loom serve` refuses*, and getting the case wrong anyway, since an attesting
+  *config* read by `loom query` still attests nobody. What refuses is one step lower and names no
+  surface: **a read needs a decided policy set, and asking for one while naming nobody is what
+  fails.** The pairing stayed surface-blind, and the invariant needed narrowing rather than
+  reopening — it is a claim about pairings, and what differs between the two commands is an ability,
+  not a check.
+
+  What that leaves open here is nothing. The remaining identity-shaped question — a claim declared
+  nowhere a spec can see — was answered by declaring claims in `loom.yaml` rather than by letting the
+  expression language reference something undeclared: `mcp.auth.claims`, beside the issuer that mints
+  them, in the same file as the policy that reads them.
 - ~~**Refusing to act when the log is unavailable**~~ — **answered** by §6.1's `edit_log`, and the
   prediction written here was wrong in two places worth correcting rather than quietly replacing.
   It said the clause was a *policy* and belonged with the other policies: it is a switch on a whole

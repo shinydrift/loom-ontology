@@ -19,7 +19,7 @@ from pathlib import Path
 import yaml
 
 from ._shape import check_keys, require, suggest
-from .auth import MAX_SKEW
+from .auth import BUILT_IN_CLAIMS, CLAIM_TYPES, MAX_SKEW, ClaimType
 from .errors import Diagnostics, SourceLoc
 from .governance import EDIT_LOG_OPTIONAL, Policy, parse_edit_log, parse_policies
 
@@ -41,7 +41,7 @@ _TOP_KEYS = {"version", "catalogs", "engine", "mcp", "governance"}
 _CATALOG_KEYS = {"type", "uri", "warehouse", "auth", "properties"}
 _ENGINE_KEYS = {"type", "options"}
 _MCP_KEYS = {"name", "transport", "writes", "actor", "host", "port", "path", "allowed_hosts", "auth"}
-_AUTH_KEYS = {"issuer", "audience", "jwks_uri", "clock_skew"}
+_AUTH_KEYS = {"issuer", "audience", "jwks_uri", "clock_skew", "claims"}
 _ADDRESS_KEYS = ("host", "port", "path", "allowed_hosts")
 """The keys that only mean something once the transport has an address. stdio has none, and a
 config that sets them under `transport: stdio` is refused rather than ignored — the rule
@@ -221,12 +221,18 @@ class McpAuth:
     to the thing this milestone refuses, and the second is what a key invites.
 
     And there is no `header` key, no `trusted_proxy`, and none is coming: reading a header and
-    trusting a claim is the client-supplied actor spec-v0 rejects by name."""
+    trusting a claim is the client-supplied actor spec-v0 rejects by name.
+
+    **`claims` is the one key here a policy reads**, and it is a declaration rather than a
+    requirement — see `_parse_claims` and `auth.ClaimType`. It is under `auth:` rather than under
+    `governance:` because a claim is a fact about the tokens this issuer mints, and the deployment
+    that changes issuers changes both together."""
 
     issuer: str
     audience: str
     jwks_uri: str
     clock_skew: int = 0
+    claims: Mapping[str, ClaimType] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -514,11 +520,62 @@ def _parse_auth(raw: object, loc: SourceLoc, diag: Diagnostics) -> McpAuth | Non
             "principals — use https, or a loopback address for local testing",
         )
 
+    claims = _parse_claims(raw.get("claims"), loc, diag)
+
     if not all(values.values()):
         return None
     return McpAuth(
-        issuer=values["issuer"], audience=values["audience"], jwks_uri=values["jwks_uri"], clock_skew=skew
+        issuer=values["issuer"],
+        audience=values["audience"],
+        jwks_uri=values["jwks_uri"],
+        clock_skew=skew,
+        claims=claims,
     )
+
+
+def _parse_claims(raw: object, loc: SourceLoc, diag: Diagnostics) -> Mapping[str, ClaimType]:
+    """`mcp.auth.claims` — the claims a policy of this deployment may name.
+
+    A declaration rather than a filter: it says nothing to the verifier and never makes a token
+    unbelievable. A caller whose token is missing a declared claim is attested exactly as before, and
+    what happens to a policy that names the missing claim is `predicate.guard_truth`'s business — it
+    fails closed. Requiring a declared claim on every token was considered and rejected: it converts
+    *withhold more from this caller* into *serve nobody*, and denies service to exactly the callers a
+    policy would simply have subtracted more from.
+
+    Empty is the whole of "this deployment's policies name no caller", and it is the default."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        diag.error("'mcp.auth.claims' must be a mapping of claim name to type", loc)
+        return {}
+    out: dict[str, ClaimType] = {}
+    for name, spelling in raw.items():
+        if not isinstance(name, str) or not name.strip():
+            diag.error(f"'mcp.auth.claims' has a claim name that is not a string: {name!r}", loc)
+            continue
+        name = name.strip()
+        if name in BUILT_IN_CLAIMS:
+            # Not merely redundant. A config redeclaring `sub` as something else would be describing
+            # a token this deployment's own verifier would have refused, and the honest reading of
+            # the two statements together is that one of them is wrong.
+            diag.error(
+                f"'mcp.auth.claims' redeclares '{name}', which every believable token carries",
+                loc,
+                f"'{name}' is always available to a policy as '{BUILT_IN_CLAIMS[name].spelling}' — "
+                "the verifier requires it, so it needs no declaration and cannot have another type",
+            )
+            continue
+        if not isinstance(spelling, str) or spelling.strip() not in CLAIM_TYPES:
+            allowed = ", ".join(sorted(CLAIM_TYPES))
+            diag.error(
+                f"'mcp.auth.claims.{name}' must be one of {allowed}, got {spelling!r}",
+                loc,
+                suggest(spelling, CLAIM_TYPES) if isinstance(spelling, str) else None,
+            )
+            continue
+        out[name] = CLAIM_TYPES[spelling.strip()]
+    return out
 
 
 def _key_set_is_protected(uri: str) -> bool:

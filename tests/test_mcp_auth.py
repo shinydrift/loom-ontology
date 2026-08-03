@@ -17,8 +17,13 @@ It is also the first thing in this codebase that differs between two calls of on
 earlier claim about a served process was that it holds *one* of everything — one `Resolver`, one
 `ActionRuntime`, one DuckDB connection under three global aliases — and that this is safe because
 calls do not overlap inside it. That is all still true and still asserted where it was. What is new
-is a value that is per *exchange* rather than per process, which is exactly the shape a policy will
-later be selected by, so proving it here is proving the seam the next slice stands on.
+is a value that is per *exchange* rather than per process.
+
+**The last section is what that value is for.** M6's second slice conditions a policy on the caller,
+and the tests under "a deployment whose policies name the caller" are the whole slice end to end: two
+tokens, one process, one tool set, different rows. They are here rather than in `test_governance.py`
+for this file's own reason — what needs a socket is asserted over one, and a claim signed by an
+issuer and checked by a verifier needs the socket to be worth anything.
 """
 
 from __future__ import annotations
@@ -403,3 +408,145 @@ def test_no_principal_is_current_without_a_transport():
     from loom.auth import current_principal
 
     assert current_principal() is None
+
+
+# ---- a deployment whose policies name the caller -------------------------------------
+#
+# M6's second slice, end to end. Everything above proves a caller can be *named*; this proves the
+# only thing that names one is worth doing — two callers of one process, one tool set, and
+# different rows, decided by claims a real issuer signed and a real verifier checked.
+
+
+GOVERNED = """
+governance:
+  policies:
+    - name: own-orders
+      objectType: Order
+      rows: "object.customerId == principal.sub"
+    - name: gold-desk
+      objectType: Customer
+      when: "principal.groups contains 'gold-desk'"
+      rows: "object.tier == 'gold'"
+"""
+
+
+@pytest.fixture(scope="module")
+def governed(tmp_path_factory, issuer):
+    """A second `loom serve`, with policies that name the caller and the claims they may name."""
+    import importlib.util
+
+    project = tmp_path_factory.mktemp("serve-governed") / "retail"
+    shutil.copytree(EXAMPLE, project, ignore=shutil.ignore_patterns(".warehouse"))
+    port = _free_port()
+    config = project / "loom.yaml"
+    config.write_text(
+        config.read_text().replace("  transport: stdio\n", f"  transport: http\n  port: {port}\n")
+        + "  auth:\n"
+        + f"    issuer: {ISSUER}\n"
+        + f"    audience: {AUDIENCE}\n"
+        + f"    jwks_uri: {issuer.jwks_uri}\n"
+        + "    claims:\n      groups: string[]\n"
+        + GOVERNED
+    )
+
+    spec = importlib.util.spec_from_file_location("governed_seed", project / "seed.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.seed(project)
+
+    stdout, stderr = project / "serve.out", project / "serve.err"
+    url = f"http://127.0.0.1:{port}/mcp"
+    with stdout.open("w") as out, stderr.open("w") as err:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "loom.cli", "serve", str(project / "ontology")], stdout=out, stderr=err
+        )
+        try:
+            _await_listening(process, url, stderr, issuer)
+            yield Served(url=url, project=project, stderr=stderr)
+        finally:
+            process.terminate()
+            process.wait(timeout=30)
+
+
+def _objects(result) -> list[dict]:
+    return json.loads(result.content[0].text)["objects"]
+
+
+def test_two_callers_of_one_deployment_are_filtered_by_who_they_are(governed, issuer):
+    """**The slice, whole.** One process, one tool set, two tokens, two answers.
+
+    `own-orders` folds the caller into a predicate: `object.customerId == principal.sub` is a
+    comparison against a *literal* by the time the query is compiled, which is what "a principal
+    never reaches the resolver" means in practice. The seeded orders are two for `c1` and three for
+    `c2`, so the counts are the assertion — same tool, same schema, different rows."""
+    for subject, expected in (("c1", 2), ("c2", 3), ("c9", 0)):
+        (orders,) = _run(governed.url, issuer.headers(subject, groups=["support"]), [("list_order", {})])
+        assert [row["customerId"] for row in _objects(orders)] == [subject] * expected
+
+
+def test_a_guard_decides_whether_a_policy_applies_to_this_caller(governed, issuer):
+    """`when:` is an **implication**: a caller the guard excludes has the policy withhold nothing
+    from them, which is exactly why it cannot be sugar for a longer `rows:` — the same text inside
+    the predicate would withhold everything instead.
+
+    The seeded customers are one gold, one silver, one bronze."""
+    inside = issuer.headers("c1", groups=["gold-desk", "support"])
+    outside = issuer.headers("c1", groups=["support"])
+    (restricted,) = _run(governed.url, inside, [("list_customer", {})])
+    (unrestricted,) = _run(governed.url, outside, [("list_customer", {})])
+    assert [row["tier"] for row in _objects(restricted)] == ["gold"]
+    assert sorted(row["tier"] for row in _objects(unrestricted)) == ["bronze", "gold", "silver"]
+
+
+def test_a_caller_whose_token_lacks_the_claim_gets_the_policy_applied(governed, issuer):
+    """**A missing claim is not a false one**, and it fails in the withholding direction.
+
+    There is nobody to report an undecided guard to — telling this caller that a policy did or did
+    not apply to them is §6.1's existence oracle, and the operator is not in the exchange. So the
+    policy applies, which subtracts more, which is the safe direction. Note it is the *opposite*
+    disposition from a surface that cannot attest at all: that one is decidable at pairing time with
+    an operator to tell, and there this codebase refuses."""
+    (result,) = _run(governed.url, issuer.headers("c1"), [("list_customer", {})])
+    assert [row["tier"] for row in _objects(result)] == ["gold"]
+
+
+def test_the_tool_set_is_the_same_for_every_caller(governed, issuer):
+    """§7's claim, under the one feature that could have broken it.
+
+    A `rows:` predicate announces nothing — a withheld row is simply absent — so conditioning it
+    costs the surface nothing. A *mask* announces itself in the description, the `filter` schema and
+    `masked`, which is why `mask:` beside `when:` is refused: the alternative is a tool set that is
+    a function of the caller."""
+
+    async def tools(headers):
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamable_http_client
+
+        async with httpx2.AsyncClient(headers=headers) as http_client:
+            async with streamable_http_client(governed.url, http_client=http_client) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    listed = await session.list_tools()
+                    return [(t.name, t.description, t.input_schema) for t in listed.tools]
+
+    one = asyncio.run(asyncio.wait_for(tools(issuer.headers("c1", groups=["gold-desk"])), TIMEOUT))
+    two = asyncio.run(asyncio.wait_for(tools(issuer.headers("c2", groups=["support"])), TIMEOUT))
+    assert one == two
+    assert not any("Withheld" in (description or "") for _, description, _ in one)
+
+
+def test_loom_query_refuses_the_config_this_server_is_running(governed):
+    """**Decision 2, at the surface that cannot attest anybody.**
+
+    The same `loom.yaml` the server above is serving, read by the command that has no transport.
+    Applying only the unconditional policies would give this caller *less* subtraction — policies
+    subtract and never add — so `loom query` would become the way to read what the served surface
+    withholds. It refuses instead, before reading anything, with an operator there to read why."""
+    result = subprocess.run(
+        [sys.executable, "-m", "loom.cli", "query", "Order", str(governed.project / "ontology")],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+    )
+    assert result.returncode == 1
+    assert "own-orders" in result.stderr and "nobody is attested here" in result.stderr

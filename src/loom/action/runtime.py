@@ -65,6 +65,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from ..auth import Principal
 from ..catalog.base import (
     Catalog,
     CatalogError,
@@ -74,7 +75,7 @@ from ..catalog.base import (
     row_writer_for,
 )
 from ..evaluate import EvalError, Scope, evaluate
-from ..governance import PolicySet
+from ..governance import PolicyProgram, PolicySet
 from ..model import Action, ObjectType, Ontology, coerce_value, properties_in_play
 from ..predicate import admits
 from .log import (
@@ -136,6 +137,19 @@ class ActionRuntime:
     policies: PolicySet = field(default_factory=PolicySet)
     """What this deployment withholds. Empty by default, so a runtime built without one governs
     nothing rather than failing to mention that it does not."""
+
+    def governed_by(self, policies: PolicySet) -> ActionRuntime:
+        """This runtime, writing for a caller these policies were decided for.
+
+        `Resolver.governed_by`'s twin, and it exists for the reason the two planes have needed twins
+        since M5: the write path enforces the same policies through its own projection, so a
+        conditional policy that reached one plane and not the other would leave `dryRun` reading out
+        of `before` exactly what the read plane withheld.
+
+        The `Catalog`s are shared. What varies per call is the decided set and nothing else."""
+        if policies is self.policies:
+            return self
+        return replace(self, policies=policies)
 
     def run(
         self,
@@ -512,6 +526,11 @@ class _Run:
         primary key `_read` refuses forever after and Loom can never repair. So on this one path a
         row predicate hides rows and not keys, and what leaks is confined to *something exists under
         the key you supplied* — no property of it, and a key the caller chose."""
+        if not self.rt.policies.decided:
+            raise ActionError(
+                "this runtime holds policies that were never decided for a caller — a run must use "
+                "the set selected for the principal of the call in flight (PolicyProgram.select)"
+            )
         expr = self.rt.policies.predicate_for(self.target.api_name)
         return expr is None or admits(expr, self._properties(row))
 
@@ -856,7 +875,45 @@ def build_runtime(ontology: Ontology, config, catalogs: Mapping[str, Any] | None
     **`governance.edit_log` is checked here and nowhere else**, which makes it the one governance
     key that binds a single plane. `build_resolver` has no business with it: the read plane writes
     no rows, so it produces no records, so there is nothing it could fail to record. The check is
-    `log.require_edit_log`, and what it can honestly promise is written up there rather than here."""
+    `log.require_edit_log`, and what it can honestly promise is written up there rather than here.
+
+    **It is `bind_writes(...).for_(None)`**, which is `build_resolver`'s correction seen from the
+    write plane: the pairing is surface-blind and every refusal in it fires for both surfaces, while
+    *this* function additionally asks for a decided policy set while naming nobody. `loom run` can
+    never attest anybody, so a program whose policies name a caller refuses here."""
+    return bind_writes(ontology, config, catalogs).for_(None)
+
+
+@dataclass(frozen=True)
+class WriteBinding:
+    """A spec paired with a deployment on the write plane, before any caller is known.
+
+    `resolver.ReadBinding`'s twin — see there for the seam. The two bind the same policies from the
+    same config against the same ontology, which is what stops a served surface and a dev command
+    from withholding different things."""
+
+    ontology: Ontology
+    catalogs: Mapping[str, Catalog]
+    program: PolicyProgram
+
+    def for_(self, principal: Principal | None) -> ActionRuntime:
+        """A runtime writing as this caller, or the refusal for a surface that has none."""
+        return ActionRuntime(
+            ontology=self.ontology, catalogs=self.catalogs, policies=self.program.select(principal)
+        )
+
+    def announcing(self) -> ActionRuntime:
+        """A runtime for building `run_` tool descriptions, which cannot run an action.
+
+        A `run_` description announces the target's mask, and a mask is the same for every caller —
+        so the tool set is assembled from this one and every call goes through `for_`."""
+        return ActionRuntime(
+            ontology=self.ontology, catalogs=self.catalogs, policies=self.program.announcements()
+        )
+
+
+def bind_writes(ontology: Ontology, config, catalogs: Mapping[str, Any] | None = None) -> WriteBinding:
+    """Pair this spec with this deployment on the write plane. Every static refusal lives here."""
     from ..catalog import open_catalogs
     from ..governance import EDIT_LOG_REQUIRED, bind_policies
     from .log import require_edit_log, require_principal_column
@@ -865,7 +922,8 @@ def build_runtime(ontology: Ontology, config, catalogs: Mapping[str, Any] | None
     # Policies first, deliberately: a policy that does not fit the spec is decided without touching
     # a catalog, and an operator with both problems should not have to fix a metastore to be told
     # about the typo in their mask.
-    policies = bind_policies(ontology, config.policies)
+    auth = config.mcp.auth
+    program = bind_policies(ontology, config.policies, auth.claims if auth else {})
     if config.edit_log == EDIT_LOG_REQUIRED:
         require_edit_log(ontology, open_cats)
     if config.mcp.attests:
@@ -876,4 +934,4 @@ def build_runtime(ontology: Ontology, config, catalogs: Mapping[str, Any] | None
         # `log.require_principal_column` for why the drop is silent and why the fix is not a port
         # verb.
         require_principal_column(ontology, open_cats)
-    return ActionRuntime(ontology=ontology, catalogs=open_cats, policies=policies)
+    return WriteBinding(ontology=ontology, catalogs=open_cats, program=program)

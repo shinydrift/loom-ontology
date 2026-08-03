@@ -21,6 +21,7 @@ import pyarrow as pa
 import pytest
 
 from loom import build
+from loom.auth import ClaimType, Principal, readable_claims
 from loom.expr import parse as parse_expr
 from loom.governance import Policy, PolicyError, bind_policies
 from loom.predicate import (
@@ -30,6 +31,8 @@ from loom.predicate import (
     UNDECIDED,
     admits,
     check,
+    check_guard,
+    fold,
     lower,
     truth,
 )
@@ -176,7 +179,7 @@ def test_a_property_a_link_joins_on_may_be_filtered_even_though_it_may_not_be_ma
     assert check(_expr("object.tier != 'bronze'"), obj, ont.object_types) == []
     bound = bind_policies(
         ont, [Policy(name="p", object_type="Customer", rows=_expr("object.customerId != 'c1'"))]
-    )
+    ).select(None)
     assert bound.filtered_by("Customer") == ("p",)
 
 
@@ -378,8 +381,18 @@ class ArrowCatalog:
         )
 
 
+def _rows_through_sql(ont, policies) -> set[str]:
+    """The rows a real DuckDB returns under an already-decided `PolicySet`."""
+    resolver = Resolver(
+        ontology=ont,
+        engine=DuckDBEngine(catalogs={"rest_main": ArrowCatalog(ROWS)}),
+        policies=policies,
+    )
+    return {row["customerId"] for row in resolver.list("Customer", limit=500)}
+
+
 def _through_sql(ont, text: str) -> set[str]:
-    policies = bind_policies(ont, [Policy(name="p", object_type="Customer", rows=_expr(text))])
+    policies = bind_policies(ont, [Policy(name="p", object_type="Customer", rows=_expr(text))]).select(None)
     resolver = Resolver(
         ontology=ont,
         engine=DuckDBEngine(catalogs={"rest_main": ArrowCatalog(ROWS)}),
@@ -433,7 +446,7 @@ def test_a_masked_property_can_still_be_filtered_on(customer):
     policies = bind_policies(
         ont,
         [Policy(name="p", object_type="Customer", mask=("ltv",), rows=_expr("object.ltv != null"))],
-    )
+    ).select(None)
     resolver = Resolver(
         ontology=ont,
         engine=DuckDBEngine(catalogs={"rest_main": ArrowCatalog(ROWS)}),
@@ -449,7 +462,7 @@ def test_the_predicate_filters_before_the_page(customer):
     would report `hasMore: false` on a full table, and `offset` would step over rows the caller was
     never shown. In the `WHERE` clause it is `ORDER BY`/`LIMIT`/`OFFSET` that see the governed set."""
     ont, obj = customer
-    policies = bind_policies(ont, [Policy(name="p", object_type="Customer", rows=_expr("object.ltv != null"))])
+    policies = bind_policies(ont, [Policy(name="p", object_type="Customer", rows=_expr("object.ltv != null"))]).select(None)
     resolver = Resolver(
         ontology=ont,
         engine=DuckDBEngine(catalogs={"rest_main": ArrowCatalog(ROWS)}),
@@ -476,3 +489,165 @@ def _plan_for(resolver, obj):
         ),
         columns=resolver._projection(obj, "t0"),
     )
+
+
+# ---- the caller, in a predicate and in a guard -----------------------------------
+
+
+CLAIMS = {"dept": ClaimType("string"), "groups": ClaimType("string", array=True)}
+
+
+def _guard(text: str, claims=None):
+    return check_guard(_expr(text), CLAIMS if claims is None else claims)
+
+
+def test_a_claim_is_declared_or_it_is_refused(customer):
+    """The check the declaration buys, and the reason `mcp.auth.claims` exists at all.
+
+    Every other reference form in this language is checked against a declaration. Without one, a
+    typo'd claim would fail *closed* — the guard undecided, the policy applied to everybody, the
+    deployment withholding more than it was asked to with nothing anywhere saying why."""
+    (problem,) = _guard("principal.dpet == 'hr'")
+    assert "not a declared claim" in problem and "did you mean 'dept'" in problem
+
+    # And a deployment that declared none at all gets a different sentence, because that is a
+    # different mistake: not a misspelling, but a policy naming a caller nobody can name.
+    (problem,) = _guard("principal.dept == 'hr'", claims={})
+    assert "does not declare" in problem and "transport: http" in problem
+
+
+def test_the_two_claims_every_believable_token_carries_need_no_declaration(customer):
+    """`sub` and `iss` are `require`d by the verifier, so a policy naming either reads something
+    every token this deployment believes already carries — and they are the only claims a guard can
+    name that can never be undecided."""
+    ont, obj = customer
+    assert _guard("principal.sub == 'alice'", claims={}) == []
+    assert check(_expr("object.customerId == principal.sub"), obj, ont.object_types, {}) == []
+
+
+def test_a_guard_may_not_name_a_row_and_a_predicate_may_not_be_only_a_caller(customer):
+    """The two grammars, each refusing the other's business.
+
+    A guard is answered once per call, before any row is read, so `object.` in one is a condition
+    with nothing to be a condition about. A predicate that names *only* the caller is the same
+    answer for every row, which is the refusal `rows:` already had — and now it names the key that
+    was wanted instead."""
+    ont, obj = customer
+    (problem,) = _guard("object.tier == 'gold'")
+    assert "names a row" in problem and "'rows:' is for" in problem
+
+    (problem,) = check(_expr("principal.sub == 'alice'"), obj, ont.object_types, CLAIMS)
+    assert "names no property" in problem and "'when:' is for" in problem
+
+
+def test_contains_is_a_guard_operator_and_not_a_lowering(customer):
+    """**The subset rule survives contact with a claim by being restated rather than bent.**
+
+    *Loom, not the engine, decides what every operator means* is a rule about expressions that must
+    be answered **twice** — once by SQL and once in process. A guard is answered once, in this
+    process, over a list only Loom holds, so the rule does not reach it and `contains` is legal
+    there. Inside `rows:` the same operator would have to lower a list into SQL: an IR node this
+    codebase does not have and a second evaluator to keep agreeing with it. Refused now, and
+    wideable later without changing the meaning of anything already written."""
+    ont, obj = customer
+    assert _guard("principal.groups contains 'auditors'") == []
+
+    (problem,) = check(_expr("principal.groups contains object.tier"), obj, ont.object_types, CLAIMS)
+    assert "'when:' guard operator" in problem and "cannot filter rows" in problem
+    assert "contains" in NOT_LOWERABLE and "contains" not in LOWERABLE
+
+
+def test_a_list_claim_is_compared_by_contains_and_by_nothing_else(customer):
+    """A list is comparable to nothing in this language: there is no property type it could equal,
+    and `==` between a list and a string is a question §5 has no answer for."""
+    ont, obj = customer
+    (problem,) = _guard("principal.groups == 'auditors'")
+    assert "compares against a list claim" in problem and "membership is 'contains'" in problem
+
+    (problem,) = _guard("principal.dept contains 'hr'")
+    assert "asks what a non-list contains" in problem
+
+    (problem,) = check(_expr("object.tier == principal.groups"), obj, ont.object_types, CLAIMS)
+    assert "compares against a list claim" in problem
+
+
+def test_a_claim_is_type_checked_against_the_property_it_is_compared_with(customer):
+    """The second thing the declaration buys: `comparable_to`, exactly as a property gets."""
+    ont, obj = customer
+    (problem,) = check(_expr("object.ltv == principal.dept"), obj, ont.object_types, CLAIMS)
+    assert "compares 'double' with 'string'" in problem
+
+
+def test_a_guard_that_names_no_claim_is_refused(customer):
+    """A guard that is always true is a policy with no guard; one that is always false is a policy
+    that never applies. Both read like a condition and are none — the same refusal a `rows:`
+    predicate naming no property already had."""
+    (problem,) = _guard("'a' == 'b'")
+    assert "names no claim of the caller" in problem
+
+
+def test_a_folded_predicate_is_one_the_existing_machinery_already_understands(customer):
+    """Decision 1's mechanism: a principal is constant for the duration of a call, so what reaches
+    either plane is a comparison against a literal. No node here is new."""
+    ont, obj = customer
+    folded = fold(_expr("object.customerId == principal.sub"), {"sub": "c2"})
+    assert lower(folded, obj, "t0") == Compare("==", ColumnRef("t0", "id"), Const("c2"))
+    assert admits(folded, {"customerId": "c2"}) and not admits(folded, {"customerId": "c1"})
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "object.customerId == principal.sub",
+        "object.name != principal.sub",
+        "!(object.customerId == principal.sub)",
+        "object.customerId == principal.sub || object.tier == 'gold'",
+        "object.customerId == principal.sub && object.ltv != null",
+    ],
+)
+def test_a_missing_claim_is_undecided_on_both_planes(customer, text):
+    """**The differential claim, extended to the one new way a leaf can fail to decide.**
+
+    A token carrying no `sub` leaves a leaf neither plane can answer, and the two must call it
+    undecided *by the rules they already had* — SQL's `NULL < NULL` and §5's refusal to order a
+    null — so Kleene propagation does the rest and an undecided leaf under `||` beside a true one is
+    still true. Substituting `null` instead would be wrong in the dangerous direction: `==` is
+    null-safe here, so `object.customerId == null` would **admit** every row with a null key."""
+    ont, obj = customer
+    # The real path: the policy binds (it names `sub`, which every believable token carries), and
+    # the fold happens at selection, for a caller whose claims this deployment could read nothing
+    # of. `check()` never sees the generated leaf — it is not something an author can write.
+    program = bind_policies(ont, [Policy(name="p", object_type="Customer", rows=_expr(text))], CLAIMS)
+    nameless = Principal(subject="alice", issuer="https://issuer.test", client_id="c", claims={})
+    decided = program.select(nameless)
+    ((_, folded),) = decided.filters["Customer"]
+    in_process = {
+        row["id"]
+        for row in ROWS
+        if admits(folded, {name: row[prop.column] for name, prop in obj.properties.items()})
+    }
+    assert _rows_through_sql(ont, decided) == in_process
+
+
+def test_a_claim_whose_value_is_not_its_declared_type_is_absent_rather_than_wrong():
+    """Anything a policy cannot decide about must be *missing* rather than wrong: absence is already
+    defined (undecided, and undecided withholds), while a wrong value would be decided against a
+    type nobody checked — and the two planes do not compare a string with a number the same way."""
+    principal = Principal(
+        subject="alice",
+        issuer="https://issuer.test",
+        client_id="c",
+        claims={
+            "sub": "alice",
+            "iss": "https://issuer.test",
+            "dept": 7,                       # declared string
+            "groups": ["ops", 3],            # declared string[]
+            "role": "admin",                 # never declared
+            "team": None,                    # a claim with no value decides nothing
+        },
+    )
+    assert readable_claims(principal, {**CLAIMS, "team": ClaimType("string")}) == {
+        "sub": "alice",
+        "iss": "https://issuer.test",
+    }
+    assert readable_claims(None, CLAIMS) == {}

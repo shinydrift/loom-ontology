@@ -128,10 +128,10 @@ serve, so `loom query` refuses exactly what `loom serve` refuses.
 per-call identity has to come first. It does not, and the reason decides the shape of everything
 else — `loom query` and `loom run` have no transport, so nothing can ever attest an identity to
 them, and a governance grammar written against an authenticated caller would leave the *direct* half
-of "a direct call and an agent call filter identically" ungovernable. So a policy names no
-principal: it is a fact about a **deployment**, you serve two audiences by running two deployments,
-and the clause an attested caller would turn on is reserved in the grammar and refused rather than
-approximated against the deployment-wide `mcp.actor`. Both halves of a policy are live:
+of "a direct call and an agent call filter identically" ungovernable. So a policy that names no
+principal is a fact about a **deployment**, and the clause an attested caller turns on was reserved
+in the grammar and refused rather than approximated against the deployment-wide `mcp.actor` — until
+M6 gave it a caller to name. Both halves of a policy are live:
 
 ```yaml
 governance:
@@ -159,6 +159,36 @@ two is asserted differentially against real DuckDB over a table full of nulls. A
 cannot decide about is never admitted: negation stays fail-closed, and there is no way to report an
 undecided row that is not an existence oracle over it.
 
+**M6 is a caller with a name**, in two halves. `mcp.auth` makes Loom a **resource server and never an
+authorization server**: it names an issuer, an audience and a key set, verifies `iss`, `aud`,
+`exp`/`nbf` and an asymmetric signature, and issues, stores and mints nothing. There is no
+trusted-proxy mode and none is coming — on any bind Loom can have, *this header came from the proxy*
+cannot be told from *this header came from a client*. What a checked caller buys is two things: the
+edit log records an issuer-qualified `principal` **beside** `mcp.actor` (one is true about a
+deployment, the other about a caller, and both are true at once), and a policy may finally name one:
+
+```yaml
+mcp:
+  auth: { issuer: ..., audience: ..., jwks_uri: ..., claims: { groups: "string[]" } }
+governance:
+  policies:
+    - { name: own-orders, objectType: Order, rows: "object.customerId == principal.sub" }
+    - { name: gold-desk, objectType: Customer, when: "principal.groups contains 'gold-desk'",
+        rows: "object.tier == 'gold'" }
+```
+
+**Half a policy may name a caller.** `rows:` may be conditioned; `mask:` may not, because a mask
+announces itself in the tool description and the `filter` schema, and a per-caller announcement makes
+the tool set a function of the caller rather than of the spec. Serving two audiences different
+*columns* is still two deployments. A claim is **declared** in `loom.yaml`, beside the issuer that
+mints it, so a policy naming a caller is checked exactly as one naming a property is — and
+`principal.` stays refused in an ontology, which is what keeps a spec deployment-blind. The caller
+never reaches the resolver: a principal is constant for the duration of a call, so a policy is
+decided *above* it and what reaches every enforcement site is a predicate naming nobody. A surface
+that cannot attest anybody — `loom query`, `loom run`, a spawned stdio server — **refuses** such a
+config rather than applying the rest of it, because policies subtract and never add, and skipping the
+conditional ones would make the dev command the way to read what the served surface withholds.
+
 | Component | State |
 |-----------|-------|
 | Canonical type system (`types.py`) | ✅ |
@@ -185,7 +215,9 @@ undecided row that is not an existence oracle over it.
 | Capability negotiation | ✅ refused at wiring, not narrowed |
 | Governance — column masking | ✅ `governance.policies` |
 | Governance — row predicates | ✅ `rows:`, compiled on one plane and evaluated on the other |
-| Governance — the edit log under a policy | ⏳ retention + "no log, no write" |
+| Governance — the edit log under a policy | ✅ `governance.edit_log: required` (retention refused) |
+| Attested identity over MCP | ✅ `mcp.auth` — a bearer token this deployment checked |
+| Governance — policies that name the caller | ✅ `when:` and `principal.<claim>`, rows only |
 
 `docs/spec-v0.md` is the full grammar — the framework's public contract.
 `docs/ROADMAP.md` tracks what's next, milestone by milestone.

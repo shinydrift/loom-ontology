@@ -13,41 +13,46 @@ the same set and why a policy that an action contradicts is refused before anyth
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-from loom import build
+from loom import build, governance
 from loom.action import (
+    APPLIED,
     OBJECT_EXISTS,
     OBJECT_NOT_FOUND,
     PREVIEWED,
     REFUSED,
+    ActionError,
     EditLog,
+    bind_writes,
     build_runtime,
 )
-from loom.config import LoomConfig, McpConfig
+from loom.auth import ClaimType, Principal
+from loom.config import LoomConfig, McpAuth, McpConfig
 from loom.errors import Diagnostics, SourceLoc
 from loom.expr import parse as parse_expr
 from loom.governance import (
     ENFORCED_KEYS,
     MOVED_KEYS,
     POLICY_KEYS,
-    RESERVED_KEYS,
     Policy,
     PolicyError,
     PolicySet,
     bind_policies,
     parse_policies,
 )
+from loom.mcp import registry
 from loom.mcp.registry import build_tools
 from loom.mcp.server import build_server
 from loom.predicate import admits
 from loom.query.engine import Capabilities, CompiledQuery
 from loom.query.ir import tables_of
-from loom.resolver import Resolver, ResolverError
+from loom.resolver import Resolver, ResolverError, build_resolver
 
 # The runtime's fakes, not a second pair of them — see `test_mcp_registry`'s note.
 from test_action import CUSTOMERS, FakeRowCatalog
@@ -78,12 +83,14 @@ def ontology():
 
 
 def _bound(ontology, *policies: Policy) -> PolicySet:
-    return bind_policies(ontology, policies)
+    return bind_policies(ontology, policies).select(None)
 
 
 def _resolver(ontology, rows=(), policies=()):
     return Resolver(
-        ontology=ontology, engine=RecordingEngine(rows), policies=bind_policies(ontology, policies)
+        ontology=ontology,
+        engine=RecordingEngine(rows),
+        policies=bind_policies(ontology, policies).select(None),
     )
 
 
@@ -99,35 +106,36 @@ HIDE_NAME = Policy(name="hide-name", object_type="Customer", mask=("name",))
 # ---- the grammar ----------------------------------------------------------------
 
 
-def test_every_policy_key_is_either_enforced_or_reserved():
-    """`negotiate.NEGOTIATED`'s device, applied to a grammar instead of a dataclass.
+def test_every_policy_key_a_config_may_carry_is_read_into_a_policy():
+    """`negotiate.NEGOTIATED`'s device, and this is what it turned into when the last reservation
+    was enforced.
 
-    A key that is neither is the third kind Loom has been bitten by once already — accepted,
-    unenforced, and silent about it, which is how `loom.managed` was written by `apply` and read by
-    nothing for two milestones. Adding one to `POLICY_KEYS` fails here until somebody says which it
-    is."""
-    assert ENFORCED_KEYS.isdisjoint(RESERVED_KEYS)
-    assert ENFORCED_KEYS | set(RESERVED_KEYS) == POLICY_KEYS
-
-
-def test_a_reserved_key_is_refused_with_the_reason_it_is_reserved():
-    """Refused, never ignored — the rule the whole `governance:` block used to be refused under."""
-    _, diag = _parse([{"name": "p", "objectType": "Customer", "mask": ["ltv"], "when": "x"}])
-    assert any("'when'" in e.message and "attest" in e.message for e in diag.errors)
+    The partition it replaces was `ENFORCED_KEYS | RESERVED_KEYS == POLICY_KEYS`, which caught the
+    third kind Loom has been bitten by — accepted, unenforced, and silent, which is how
+    `loom.managed` was written by `apply` and read by nothing for two milestones. With `when:`
+    enforced, `RESERVED_KEYS` is empty and that check has one live side, so it is replaced by the
+    stronger statement it was standing in for: **every key this grammar accepts is read into a
+    field of `Policy`**. A key added to `POLICY_KEYS` and never parsed fails here; a key nobody
+    declared is already refused by `check_keys`."""
+    fields = {f.name for f in dataclasses.fields(Policy)}
+    # `objectType` is the YAML spelling of `object_type` — Loom's own vocabulary rather than the
+    # obvious `on:`, which YAML 1.1 resolves to the boolean True.
+    assert {"objectType" if k == "object_type" else k for k in fields} == set(POLICY_KEYS)
+    assert POLICY_KEYS == ENFORCED_KEYS
 
 
 def test_a_key_that_will_never_land_left_the_grammar_rather_than_sitting_in_it():
-    """The fourth fate of a key, and the one the partition test above cannot see.
+    """The fate of a key that the partition test could not see, and it still cannot.
 
-    `ENFORCED_KEYS | RESERVED_KEYS == POLICY_KEYS` catches a key that is silently accepted. It
-    cannot catch *reserved forever*: a key sitting in `RESERVED_KEYS` that no slice will ever turn
-    on partitions the grammar perfectly and still lies to whoever reads `governance:` to see what it
-    will one day hold. `audit` was that key — neither half of what it named is a policy — so it is
-    gone from the grammar rather than parked in it, and what is left in `RESERVED_KEYS` means one
-    thing: a named future slice turns it on."""
+    A key sitting reserved that no slice will ever turn on partitions the grammar perfectly and
+    still lies to whoever reads `governance:` to see what it will one day hold. `audit` was that
+    key — neither half of what it named is a policy — so it is gone from the grammar rather than
+    parked in it. There is nothing parked in it any more: `when:` was the last reservation and it
+    is enforced, so the `Reserved` machinery went with it rather than staying as a dataclass
+    nothing constructs, which is the `loom.managed` shape one level up."""
     assert "audit" not in POLICY_KEYS
-    assert set(RESERVED_KEYS) == {"when"}
     assert set(MOVED_KEYS).isdisjoint(POLICY_KEYS)
+    assert not hasattr(governance, "RESERVED_KEYS") and not hasattr(governance, "Reserved")
 
 
 def test_a_moved_key_says_where_it_went_rather_than_that_it_is_unknown():
@@ -146,14 +154,32 @@ def test_a_moved_key_says_where_it_went_rather_than_that_it_is_unknown():
     assert "no Loom command deletes" in (problem.hint or "")
 
 
-def test_a_principal_conditioned_policy_says_what_is_missing_and_what_to_do_instead():
-    """`when:` is the clause an attested caller turns on, and until then the honest answer is not
-    "ignored" and not "supported": it is *this deployment cannot tell callers apart*, plus the
-    posture that works today — one deployment per audience."""
-    _, diag = _parse([{"name": "p", "objectType": "Customer", "mask": ["ltv"], "when": "principal.id == 'x'"}])
-    (problem,) = [e for e in diag.errors if "'when'" in e.message]
-    assert "attest" in problem.message
-    assert "one deployment per audience" in (problem.hint or "")
+def test_a_conditional_mask_is_refused_because_a_mask_announces_itself():
+    """**The refusal M6's second slice is built around.**
+
+    A mask is in the tool description, in the `filter` schema and in `masked` on every result, and
+    §7 says the tool set and its argument namespaces are a function of the spec. Conditioning one on
+    the caller has three spellings and all three are refused elsewhere in this codebase: a tool set
+    assembled per caller (the surface becomes a function of the caller), the worst case announced to
+    everyone (narrowing the surface to fit, which §6 will not do even for an engine), or an
+    announcement that stops announcing. Rows carry no announcement at all, which is exactly why they
+    may be conditioned at no cost to the surface — and why "HR sees ssn, nobody else does" keeps M5's
+    answer: two deployments."""
+    _, diag = _parse(
+        [{"name": "p", "objectType": "Customer", "mask": ["ltv"], "when": "principal.dept == 'hr'"}]
+    )
+    (problem,) = [e for e in diag.errors if "'when:'" in e.message]
+    assert "cannot vary per caller" in problem.message
+    assert "function of the caller" in (problem.hint or "")
+    assert "two deployments" in (problem.hint or "")
+
+
+def test_a_guard_with_nothing_to_guard_is_refused():
+    """A guard says *which callers* a policy applies to, never *what* it withholds. Without a
+    `rows:` predicate there is no policy for it to guard, and a config that reads like a filter and
+    filters nothing is the shape this module exists against."""
+    _, diag = _parse([{"name": "p", "objectType": "Customer", "when": "principal.dept == 'hr'"}])
+    assert any("withholds nothing" in e.message for e in diag.errors)
 
 
 def test_a_policy_that_withholds_nothing_is_refused():
@@ -748,3 +774,241 @@ def test_a_direct_call_and_an_agent_call_withhold_the_same_rows(ontology):
     # policy is a run. The refusal travels in the result, exactly as a refusal by a validation rule
     # does — which is also what stops the transport from telling the two apart.
     assert OBJECT_NOT_FOUND in text and not is_error
+
+
+# ---- a policy that names the caller ----------------------------------------------
+#
+# M6's second slice. Everything above holds a deployment-scoped policy down; this section is the
+# one thing that varies per caller, and the three questions it had to answer: what a `when:` may
+# say, where the refusal for a surface that cannot attest lives, and what a *missing* claim means
+# as opposed to a false one.
+
+
+def _principal(subject: str = "alice", **claims) -> Principal:
+    return Principal(
+        subject=subject,
+        issuer="https://issuer.test",
+        client_id="client",
+        claims={"sub": subject, "iss": "https://issuer.test", **claims},
+    )
+
+
+CLAIMS = {"dept": ClaimType("string"), "groups": ClaimType("string", array=True)}
+
+GOLD_DESK = Policy(
+    name="gold-desk",
+    object_type="Customer",
+    rows=parse_expr("object.tier == 'gold'"),
+    when=parse_expr("principal.groups contains 'gold-desk'"),
+)
+OWN_ROWS = Policy(
+    name="own-rows",
+    object_type="Customer",
+    rows=parse_expr("object.customerId == principal.sub"),
+)
+
+
+def test_a_program_with_no_conditional_policy_returns_the_same_set_for_every_caller(ontology):
+    """The assertion that makes the seam cheap, and it is the one M6's decision 1 asked for.
+
+    A deployment that predates this milestone is *provably* unchanged rather than argued to be
+    equivalent: same object, so the resolver holding it is the same resolver, so there is nothing
+    per-call about a program that names nobody."""
+    program = bind_policies(ontology, [HIDE_LTV], CLAIMS)
+    assert not program.conditional
+    assert program.select(None) is program.select(_principal()) is program.select(None)
+
+
+def test_the_masks_are_the_same_object_for_every_caller(ontology):
+    """The claim that a conditional mask is refused, made where it would break if it stopped being
+    true. `select` may change what rows a caller sees and may never change what the deployment
+    *announces* — because the announcement is in the tool description, the filter schema and the
+    `masked` field, all of which are built once."""
+    program = bind_policies(ontology, [HIDE_LTV, GOLD_DESK], CLAIMS)
+    assert program.conditional
+    inside = program.select(_principal(groups=["gold-desk"]))
+    outside = program.select(_principal(groups=["support"]))
+    assert inside.masks is outside.masks is program.announcements().masks
+    assert inside.masked("Customer") == outside.masked("Customer") == ("ltv",)
+
+
+def test_a_surface_that_cannot_attest_refuses_a_policy_that_names_a_caller(ontology):
+    """**Decision 2, and it lives in one function rather than in a check three call sites derive.**
+
+    The tempting alternative — treat an unattested caller as principal-less and apply only the
+    unconditional policies — is disqualified by this module's own invariant. Policies subtract and
+    never add, so skipping the guarded ones gives that caller *less* subtraction, and `loom query`
+    becomes the way to read what the served surface withholds.
+
+    It names no surface, which is what makes it right for the case a surface check would get wrong:
+    `loom query` against an attesting config still attests nobody, and `McpConfig.attests` is true
+    there."""
+    program = bind_policies(ontology, [GOLD_DESK], CLAIMS)
+    with pytest.raises(PolicyError) as e:
+        program.select(None)
+    assert "gold-desk" in str(e.value) and "nobody is attested here" in str(e.value)
+    # And the same for a predicate that names the caller without a guard: what makes a policy
+    # conditional is that it cannot be decided without one, not which key it was written in.
+    with pytest.raises(PolicyError):
+        bind_policies(ontology, [OWN_ROWS], CLAIMS).select(None)
+
+
+def test_loom_query_refuses_a_conditional_config_rather_than_reading_unfiltered(ontology):
+    """The same refusal reached the way `loom query` reaches it — through `build_resolver`, which is
+    `bind_reads(...).for_(None)`.
+
+    `build_resolver`'s invariant survives with one sentence narrowed: it refuses exactly the
+    *pairings* `loom serve` refuses, and what differs is not a check but an ability. Nothing here
+    took a `surface=` argument."""
+    config = LoomConfig(
+        mcp=McpConfig(auth=McpAuth(issuer="i", audience="a", jwks_uri="https://k", claims=CLAIMS)),
+        policies=(GOLD_DESK,),
+    )
+    with pytest.raises(PolicyError) as e:
+        build_resolver(ontology, config, {"rest_main": FakeRowCatalog(rows=CUSTOMERS)})
+    assert "cannot decide which policies apply" in str(e.value)
+
+
+def test_a_guard_decides_whether_a_policy_applies_at_all(ontology):
+    """`when:` composes as an **implication**: a policy whose guard is false withholds nothing.
+
+    That is what stops it being sugar for a longer `rows:` — the same text moved inside the
+    predicate would withhold *everything* when the guard is false, which is the opposite
+    disposition, and the reason the two are different grammars rather than one."""
+    program = bind_policies(ontology, [GOLD_DESK], CLAIMS)
+    assert program.select(_principal(groups=["gold-desk"])).filtered_by("Customer") == ("gold-desk",)
+    assert program.select(_principal(groups=["support"])).filtered_by("Customer") == ()
+
+
+def test_a_missing_claim_applies_the_policy_rather_than_skipping_it(ontology):
+    """**A missing claim is not a false one**, and the direction it fails in is the withholding one.
+
+    The rule this shares with decision 2's refusal, read the other way: *decidable at pairing time
+    with somebody to tell → refuse; decidable only per call, with only the caller to tell → withhold
+    silently*. Telling this caller that a policy did or did not apply to them is the existence
+    oracle §6.1 refuses, and there is nobody else in the exchange to tell.
+
+    The dangerous alternative is treating absence as `null`: `principal.groups != null` would then
+    be **false** for a caller carrying no groups, the guard would not apply, and a missing claim
+    would have *widened* what that caller sees."""
+    program = bind_policies(ontology, [GOLD_DESK], CLAIMS)
+    assert program.select(_principal()).filtered_by("Customer") == ("gold-desk",)
+    # A claim whose value contradicts its declared type is absent for the same reason: anything a
+    # policy cannot decide about must be missing rather than wrong.
+    assert program.select(_principal(groups="gold-desk")).filtered_by("Customer") == ("gold-desk",)
+
+
+def test_the_caller_is_folded_into_the_predicate_and_stops_there(ontology):
+    """Decision 1, paid for rather than asserted: what reaches the resolver is a predicate naming
+    nobody, because a principal is constant for the duration of a call."""
+    program = bind_policies(ontology, [OWN_ROWS], CLAIMS)
+    ((name, expr),) = program.select(_principal("c2")).filters["Customer"]
+    assert name == "own-rows"
+    assert admits(expr, {"customerId": "c2"}) and not admits(expr, {"customerId": "c1"})
+    # The raw text is what the author wrote, not a rendering with somebody's subject in it: a
+    # message about this policy should name what is in the file.
+    assert expr.raw == "object.customerId == principal.sub"
+
+
+def test_two_callers_of_one_tool_set_are_filtered_differently(ontology, monkeypatch):
+    """The whole slice, through a real dispatch, without a transport.
+
+    One tool set, one process, one `Resolver` built at startup — and two callers whose reads differ,
+    because what varies is a decided `PolicySet` selected above the resolver and never an identity
+    threaded into it. The tool itself is identical for both: same name, same schema, same
+    description, which is §7's claim and the reason a *mask* may not be conditioned.
+
+    The transport is what `test_mcp_auth.py` adds — and it adds the rows, against a real engine.
+    What is proved here is that the handler asks *per call* rather than closing over an answer from
+    build time, and that the tool it asks through is the same tool for everybody."""
+    program = bind_policies(ontology, [OWN_ROWS], CLAIMS)
+    engine = RecordingEngine()
+    announcing = Resolver(ontology=ontology, engine=engine, policies=program.announcements())
+    tools = {t.name: t for t in build_tools(announcing, program=program)}
+
+    predicates = {}
+    for subject in ("c1", "c2"):
+        monkeypatch.setattr(registry, "current_principal", lambda s=subject: _principal(s))
+        tools["list_customer"].handler({})
+        predicates[subject] = engine.plans[-1].source.table.predicate
+    # Two callers, two different compiled filters, out of one tool whose schema and description
+    # never moved: the surface is a function of the spec, and only the rows are a function of the
+    # caller.
+    assert predicates["c1"] != predicates["c2"]
+    assert predicates["c1"].right.value == "c1" and predicates["c2"].right.value == "c2"
+    assert "Withheld" not in tools["list_customer"].description
+
+
+def test_a_read_with_policies_nobody_selected_is_refused(ontology):
+    """The announcement set builds tool schemas and a banner and cannot read a row.
+
+    Its predicates may still name a principal, so a read performed with it would be a read nobody
+    selected — and the failure would be *silent*, one conditional policy short. Every read goes
+    through `_table`, which is what makes the check total rather than a habit."""
+    resolver = Resolver(
+        ontology=ontology,
+        engine=RecordingEngine(),
+        policies=bind_policies(ontology, [GOLD_DESK], CLAIMS).announcements(),
+    )
+    with pytest.raises(ResolverError) as e:
+        resolver.list("Customer")
+    assert "never decided for a caller" in str(e.value)
+
+
+def test_the_write_plane_is_governed_per_caller_too(ontology):
+    """M5's claim — both planes withhold the same rows — under a policy that varies.
+
+    A conditional policy enforced on the read plane alone would be one `dryRun` away from reading
+    out of `before` exactly what it withheld from a read, so `_Run._admitted` gets the same decided
+    set from the same `select`. `c1` may act on itself and `c2` may not, out of one runtime."""
+    program = bind_policies(ontology, [OWN_ROWS], CLAIMS)
+    catalog = FakeRowCatalog(rows=CUSTOMERS)
+    writes = bind_writes(ontology, LoomConfig(policies=(OWN_ROWS,)), {"rest_main": catalog})
+
+    mine = writes.for_(_principal("c1")).run("upgradeTier", {"customer": "c1", "newTier": "silver"})
+    theirs = writes.for_(_principal("c2")).run("upgradeTier", {"customer": "c1", "newTier": "silver"})
+    assert mine.status == APPLIED
+    # The same words a concurrent delete produces: a caller who could tell "withheld" from "gone"
+    # would have the existence oracle the read path refuses to be.
+    assert theirs.failures[0].code == OBJECT_NOT_FOUND
+    assert program.select(_principal("c2")).filtered_by("Customer") == ("own-rows",)
+
+
+def test_a_run_with_policies_nobody_selected_is_refused(ontology):
+    """`Resolver._table`'s assertion, on the plane that writes.
+
+    The announcing runtime exists to describe a `run_` tool — its description announces the target's
+    mask — and it must not be able to run one: its predicates may still name a principal, so a run
+    performed with it would be a run nobody selected, refused by one conditional policy short."""
+    writes = bind_writes(ontology, LoomConfig(policies=(OWN_ROWS,)), {"rest_main": FakeRowCatalog(rows=CUSTOMERS)})
+    with pytest.raises(ActionError) as e:
+        writes.announcing().run("upgradeTier", {"customer": "c1", "newTier": "gold"})
+    assert "never decided for a caller" in str(e.value)
+
+
+def test_a_stdio_server_refuses_a_config_whose_policies_name_a_caller(ontology):
+    """A spawned server carries no bearer token, so it can never attest anybody — and finding that
+    out per call would be a server that started and then failed every read.
+
+    It is not "direct commands vs MCP": the predicate is *can this surface attest*, which is why
+    `loom serve` over stdio lands on the same side as `loom query`."""
+    config = LoomConfig(policies=(OWN_ROWS,))
+    with pytest.raises(PolicyError) as e:
+        build_server(ontology, config, {"rest_main": FakeRowCatalog(rows=CUSTOMERS)})
+    assert "nobody is attested here" in str(e.value)
+
+
+def test_the_banner_says_which_policies_vary_by_caller(ontology):
+    """The line an operator reads at startup. Masks are deployment-wide by construction and say so;
+    a policy whose rows vary per caller is named, because the rest of the sentence says it does not
+    — and because `loom query` against that same file will refuse rather than read."""
+    from loom.cli import _governance_mode
+
+    program = bind_policies(ontology, [HIDE_LTV, GOLD_DESK], CLAIMS)
+    resolver = Resolver(ontology=ontology, engine=RecordingEngine(), policies=program.announcements())
+    banner = " ".join(_governance_mode(resolver))
+    assert "withhold Customer: ltv" in banner and "filter the rows of Customer (by gold-desk)" in banner
+    assert "masks are deployment-wide" in banner and "gold-desk filter rows per attested caller" in banner
+
+    plain = Resolver(ontology=ontology, engine=RecordingEngine(), policies=_bound(ontology, HIDE_LTV))
+    assert "deployment-wide — every caller" in " ".join(_governance_mode(plain))

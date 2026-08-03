@@ -248,10 +248,13 @@ def test_unenforceable_policy_keys_refuse_to_start(tmp_path: Path):
     enforcement landed — it moved down to the key. A clause Loom cannot honour reads, to whoever
     wrote it, exactly like one it obeyed.
 
-    Three of the four fates a key can have are in this one config. `rows` was reserved and is now
-    **enforced**, which is what a reservation is for: the config that named it was refused, so
-    nobody was running one when the meaning arrived. `when` is still reserved, and says so. `audit`
-    **left** — see `governance.MOVED_KEYS` — because neither half of what it named is a policy."""
+    Both fates a reserved key can have are in this one config, and both have now happened. `rows`
+    and `when` were reserved and are **enforced**, which is what a reservation is for: the config
+    that named one was refused, so nobody was running one when the meaning arrived. `audit`
+    **left** — see `governance.MOVED_KEYS` — because neither half of what it named is a policy.
+
+    `RESERVED_KEYS` is gone with the last of its entries, so what a key that is neither enforced
+    nor moved gets now is `check_keys`' own refusal, naming it."""
     _, diag = _load(
         tmp_path,
         """
@@ -263,11 +266,11 @@ def test_unenforceable_policy_keys_refuse_to_start(tmp_path: Path):
               mask: [notes]
               rows: "object.region == 'EU'"
               audit: { retain: 30d }
-              when: "principal.id == 'analyst'"
+              retain: 30d
         """,
     )
     assert any("'audit'" in e.message and "no longer a policy key" in e.message for e in diag.errors)
-    assert any("'when'" in e.message and "attest" in e.message for e in diag.errors)
+    assert any("'retain'" in e.message for e in diag.errors)
     assert not any("'rows'" in e.message for e in diag.errors)
 
 
@@ -508,3 +511,49 @@ def test_attests_is_false_for_stdio_whatever_auth_says(tmp_path: Path):
     assert not McpConfig(transport="stdio", auth=auth).attests
     assert McpConfig(transport="http", auth=auth).attests
     assert not McpConfig(transport="http").attests
+
+
+def test_claims_are_declared_with_a_closed_type_vocabulary(tmp_path: Path):
+    """**The declaration a policy's `principal.<claim>` is checked against.**
+
+    In `loom.yaml` beside the issuer that mints them, never in an ontology: a spec describes what
+    exists, and who is asking is a fact about a deployment. That placement is also what keeps the
+    expression language's rule intact — *a reference is legal where its declaration is in scope*.
+
+    A declaration and never a requirement: nothing here makes a token unbelievable. A caller whose
+    token lacks a declared claim is attested exactly as before, and the policy naming it fails
+    closed — requiring it would convert *withhold more from this caller* into *serve nobody*."""
+    config, diag = _auth(
+        tmp_path,
+        "  auth:\n    issuer: https://issuer.test\n    audience: loom\n"
+        "    jwks_uri: https://issuer.test/jwks.json\n"
+        "    claims:\n      dept: string\n      groups: string[]\n      verified: boolean\n",
+    )
+    assert not diag.errors
+    assert {name: t.spelling for name, t in config.mcp.auth.claims.items()} == {
+        "dept": "string", "groups": "string[]", "verified": "boolean"
+    }
+
+
+def test_a_claim_type_outside_the_vocabulary_is_refused(tmp_path: Path):
+    """There is no number in it: a JSON number's Loom type is ambiguous (`int`? `double`?) and
+    nothing motivating needs one. The set may only ever grow, which accepts configs refused today
+    and can change the meaning of none."""
+    _, diag = _auth(
+        tmp_path,
+        "  auth:\n    issuer: https://issuer.test\n    audience: loom\n"
+        "    jwks_uri: https://issuer.test/jwks.json\n    claims:\n      age: integer\n",
+    )
+    assert "'mcp.auth.claims.age' must be one of" in str(diag)
+
+
+def test_the_claims_every_token_carries_cannot_be_redeclared(tmp_path: Path):
+    """`sub` and `iss` are `require`d by the verifier. A config giving one another type describes a
+    token this deployment would have refused, and the honest reading of the two statements together
+    is that one of them is wrong."""
+    _, diag = _auth(
+        tmp_path,
+        "  auth:\n    issuer: https://issuer.test\n    audience: loom\n"
+        "    jwks_uri: https://issuer.test/jwks.json\n    claims:\n      sub: boolean\n",
+    )
+    assert "redeclares 'sub'" in str(diag)

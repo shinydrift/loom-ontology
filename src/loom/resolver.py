@@ -13,17 +13,25 @@ withheld property is never selected and a withheld row is not in the table the q
 neither is in a result set for anything above to forget to drop. Nothing above this line has to
 know a policy exists — and for rows, nothing above it is *told*: a mask announces itself because
 the schema is public, and a row predicate does not because the rows are the data. See
-`governance.py` for what a policy may say and why none of them names a caller, and `predicate.py`
-for what a `rows:` expression means on the two planes that have to agree about it.
+`governance.py` for what a policy may say, and `predicate.py` for what a `rows:` expression means on
+the two planes that have to agree about it.
+
+**A policy may name a caller and this layer still receives no identity** (M6). What a resolver holds
+is a `PolicySet` that is already *decided* — every guard answered, every `principal.` reference
+folded to a literal — chosen one rung above by `PolicyProgram.select`, because a principal is
+constant for the duration of a call. So none of the enforcement below changed when policies learned
+to vary: they read a decided set exactly as they always did, and `governed_by` is how a caller's set
+gets in.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
-from .governance import PolicySet
+from .auth import Principal
+from .governance import PolicyProgram, PolicySet
 from .model import LinkType, ObjectType, Ontology, Property, coerce_value
 from .predicate import lower
 from .query.engine import Engine
@@ -70,6 +78,23 @@ class Resolver:
     policies: PolicySet = field(default_factory=PolicySet)
     """What this deployment withholds. Empty by default — a resolver built without one governs
     nothing, which is what every construction of one that predates M5 meant and still means."""
+
+    def governed_by(self, policies: PolicySet) -> Resolver:
+        """This resolver, reading for a caller these policies were decided for.
+
+        **Per-call scope, not per-call construction**, and the difference is the whole of why the
+        milestone that attests a principal does not have to fix the `t0`/`t1`/`m0` aliases. Nothing
+        here opens a catalog or an engine: the ontology and the engine are *shared*, and what is new
+        per call is a three-field value holding an already-decided set. A `Resolver` per call would
+        multiply the racers rather than remove them.
+
+        Returns `self` when the set is the one already held — which is not an optimisation but the
+        assertion that a deployment with no conditional policy is provably unchanged: `select`
+        returns the same object for every caller, so this returns the same resolver for every
+        caller, so there is nothing per-call about a program that names nobody."""
+        if policies is self.policies:
+            return self
+        return replace(self, policies=policies)
 
     # ---- reads -----------------------------------------------------------------
 
@@ -221,7 +246,18 @@ class Resolver:
         ends of a traverse are governed by this line rather than by two rules somebody has to
         remember, and `get`, `search` and `list` are governed by it without asking. See
         `ir.TableRef` for why the predicate rides on the table reference rather than on the three
-        source nodes."""
+        source nodes.
+
+        **The one assertion a per-caller `PolicySet` needs.** An undecided set is the announcement
+        `PolicyProgram.announcements()` builds for the tool descriptions and the startup banner; its
+        predicates may still name a principal, so reading with it would be a read nobody selected —
+        and the failure would be *silent*, one conditional policy short. Every read goes through this
+        method, which is what makes the check total rather than a habit."""
+        if not self.policies.decided:
+            raise ResolverError(
+                "this resolver holds policies that were never decided for a caller — a read must "
+                "use the set selected for the principal of the call in flight (PolicyProgram.select)"
+            )
         expr = self.policies.predicate_for(obj.api_name)
         return TableRef(
             catalog=obj.backing_catalog,
@@ -339,7 +375,55 @@ def build_resolver(ontology: Ontology, config, catalogs: Mapping[str, Any] | Non
     same policies and withhold the same properties, because there is one place that turns a config
     and a spec into something that can read. Binding here rather than in `loom validate` is the same
     boundary seen from the other side: a spec that is valid stays valid whatever a deployment
-    withholds of it, and `loom validate` does not require a `loom.yaml` to exist at all."""
+    withholds of it, and `loom validate` does not require a `loom.yaml` to exist at all.
+
+    **One sentence above needed correcting when policies learned to name a caller, and it is
+    narrower rather than wrong.** *`loom query` refuses exactly what `loom serve` refuses* is a claim
+    about the **pairing** — a spec against a deployment — and every refusal in `bind_reads` is still
+    surface-blind and fires identically for both. What differs is not a check but an *ability*: this
+    function additionally asks for a policy set while naming nobody, which is a true statement about
+    the surface calling it and not a property of the pairing. A conditional program refuses here for
+    that reason (`PolicyProgram.select`), and it is one function rather than a second check beside
+    the first — nothing was reopened with a `surface=` argument, which would also have got this case
+    wrong: `config.mcp.attests` is true for an attesting config that `loom query` still cannot attest
+    anybody with."""
+    return bind_reads(ontology, config, catalogs).for_(None)
+
+
+@dataclass(frozen=True)
+class ReadBinding:
+    """A spec paired with a deployment on the read plane, before any caller is known.
+
+    What `build_resolver` was, split at the one seam a per-caller policy needs: everything expensive
+    and everything static happens once, here, and `for_` is a value-level step that can happen per
+    call. `build_server` holds one of these for the process; `loom query` calls `for_(None)` and
+    never keeps it."""
+
+    ontology: Ontology
+    engine: Engine
+    program: PolicyProgram
+
+    def for_(self, principal: Principal | None) -> Resolver:
+        """A resolver reading as this caller, or the refusal for a surface that has none."""
+        return Resolver(
+            ontology=self.ontology, engine=self.engine, policies=self.program.select(principal)
+        )
+
+    def announcing(self) -> Resolver:
+        """A resolver for building tool schemas and a banner, which cannot read a row.
+
+        The tool set is a function of the spec and the deployment's *masks*, and masks are the same
+        for every caller by construction — so it is assembled once, from here, rather than per
+        caller. What this resolver cannot do is answer a read: see `Resolver._table`."""
+        return Resolver(
+            ontology=self.ontology, engine=self.engine, policies=self.program.announcements()
+        )
+
+
+def bind_reads(
+    ontology: Ontology, config, catalogs: Mapping[str, Any] | None = None
+) -> ReadBinding:
+    """Pair this spec with this deployment on the read plane. Every static refusal lives here."""
     from .catalog import open_catalogs
     from .governance import bind_policies
     from .negotiate import check_capabilities
@@ -348,6 +432,9 @@ def build_resolver(ontology: Ontology, config, catalogs: Mapping[str, Any] | Non
     open_cats = catalogs if catalogs is not None else open_catalogs(config)
     engine = open_engine(config.engine, open_cats)
     check_capabilities(ontology, engine.capabilities())
-    return Resolver(
-        ontology=ontology, engine=engine, policies=bind_policies(ontology, config.policies)
+    auth = config.mcp.auth
+    return ReadBinding(
+        ontology=ontology,
+        engine=engine,
+        program=bind_policies(ontology, config.policies, auth.claims if auth else {}),
     )
