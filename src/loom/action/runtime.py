@@ -143,12 +143,20 @@ class ActionRuntime:
         parameters: Mapping[str, Any],
         *,
         actor: str | None = None,
+        principal: str | None = None,
         dry_run: bool = False,
     ) -> ActionResult:
         """One action, up to `MAX_ATTEMPTS` times, recorded once, and the last word either way.
 
         `actor` is per call rather than per runtime because `loom serve` is long-lived and a caller
         is not. It is not defaulted here — see the module docstring and `log.UNKNOWN_ACTOR`.
+
+        `principal` is the attested caller, and it arrives the same way for the same reason — except
+        that it is *only ever* per call, because unlike `actor` there is no deployment-wide value it
+        could fall back to. It has no `UNKNOWN_ACTOR` equivalent either: `None` is the answer on
+        every surface that cannot attest anybody, and a placeholder string would make "nobody could
+        be named here" look like a name. Nothing in this runtime branches on it — it is carried to
+        the edit log and nowhere else, which is the whole of what M6's first slice does with it.
 
         A conflict is retried **here** rather than handed straight back, because the check it comes
         from is deliberately coarse: it asserts the whole table's snapshot, so every unrelated
@@ -195,7 +203,7 @@ class ActionRuntime:
             # A preview writes nothing and holds nothing, so there is no edit to record and no id to
             # cite. `loom run` previews before every real run; logging them would double the table.
             return result
-        return self._record(run, result, target, edit_id, who)
+        return self._record(run, result, target, edit_id, who, principal)
 
     def preview(self, action_name: str, parameters: Mapping[str, Any]) -> ActionResult:
         """Everything but the write. The write path's `loom plan`, and nearly free, because a
@@ -203,7 +211,13 @@ class ActionRuntime:
         return self.run(action_name, parameters, dry_run=True)
 
     def _record(
-        self, run: _Run, result: ActionResult, target: ObjectType, edit_id: str, actor: str
+        self,
+        run: _Run,
+        result: ActionResult,
+        target: ObjectType,
+        edit_id: str,
+        actor: str,
+        principal: str | None = None,
     ) -> ActionResult:
         """One row in `_loom_meta.edits`, after the fact.
 
@@ -251,6 +265,7 @@ class ActionRuntime:
             edit_id=edit_id,
             recorded_at=now(),
             actor=actor,
+            principal=principal,
             action=result.action,
             object_type=result.object_type,
             operation=result.operation,
@@ -844,7 +859,7 @@ def build_runtime(ontology: Ontology, config, catalogs: Mapping[str, Any] | None
     `log.require_edit_log`, and what it can honestly promise is written up there rather than here."""
     from ..catalog import open_catalogs
     from ..governance import EDIT_LOG_REQUIRED, bind_policies
-    from .log import require_edit_log
+    from .log import require_edit_log, require_principal_column
 
     open_cats = catalogs if catalogs is not None else open_catalogs(config)
     # Policies first, deliberately: a policy that does not fit the spec is decided without touching
@@ -853,4 +868,12 @@ def build_runtime(ontology: Ontology, config, catalogs: Mapping[str, Any] | None
     policies = bind_policies(ontology, config.policies)
     if config.edit_log == EDIT_LOG_REQUIRED:
         require_edit_log(ontology, open_cats)
+    if config.mcp.attests:
+        # Beside `edit_log` rather than inside it, because it answers a different question. That
+        # posture asks *can this deployment record at all*; this asks *can it record the one thing
+        # `mcp.auth` just started producing*. A deployment can honestly be `edit_log: optional` and
+        # still refuse to attest a caller it would then silently drop — see
+        # `log.require_principal_column` for why the drop is silent and why the fix is not a port
+        # verb.
+        require_principal_column(ontology, open_cats)
     return ActionRuntime(ontology=ontology, catalogs=open_cats, policies=policies)

@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
+from ..auth import current_principal
 from ..model import Action, ObjectType
 from ..resolver import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Resolver
 
@@ -426,9 +427,14 @@ def _run_tool(runtime: ActionRuntime, action: Action, actor: str | None) -> Tool
     before the write, which is what this is. Without it, `previewed` would be a status no MCP caller
     could ever see and an agent's only way to learn what an action does would be to do it.
 
-    **The `actor` is bound here, once, from `mcp.actor`.** The runtime takes it per call and never
-    invents one; this closure is the "what its transport authenticated" the runtime's docstring
-    points at, and over stdio the honest value is usually `None` — see `McpConfig.actor`.
+    **The `actor` is bound here, once, from `mcp.actor`. The `principal` is not, and cannot be.**
+    The runtime takes both per call and invents neither. `actor` is a string an operator declared
+    about a deployment, so binding it into this closure loses nothing. A principal is a fact about
+    *this exchange*: it is read inside the handler, on every call, from the context the transport
+    populated. That is the first thing in this module that differs between two calls of one process,
+    and it is deliberately the only one — the tool set, the schemas and the descriptions are still a
+    function of the spec, exactly as §7 says, because what varies is a value passed through a tool
+    rather than anything about the tool.
     """
     target = runtime.ontology.object_types[action.target_object_type]
     pk = target.pk_property
@@ -478,10 +484,17 @@ def _run_tool(runtime: ActionRuntime, action: Action, actor: str | None) -> Tool
         schema["required"] = [PARAMETERS_ARG]
 
     def handler(args: dict) -> Any:
+        # The `actor` is closed over and the `principal` is read *now*, and the asymmetry is the
+        # whole of what M6's first slice changed here. One is true about the deployment that built
+        # this closure; the other is true about the exchange in flight, so it cannot be bound at
+        # build time and must not be cached across calls. `current_principal()` is `None` on every
+        # surface that cannot attest, which is every surface this closure served before today.
+        caller = current_principal()
         result = runtime.run(
             action.api_name,
             args.get(PARAMETERS_ARG) or {},
             actor=actor,
+            principal=None if caller is None else caller.label,
             dry_run=bool(args.get(DRY_RUN_ARG, False)),
         )
         # Serialized, not composed. `ActionResult` is the shape the runtime settled on for exactly

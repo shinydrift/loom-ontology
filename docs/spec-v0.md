@@ -1187,9 +1187,11 @@ Named deliberately so they're conscious deferrals, not gaps:
   a port of its own; the action runtime never gains the verb, which is what keeps "an action can
   reach `_loom_meta.edits` and nothing else" true. Nothing is deferred about the record's shape: the
   columns are fixed (§9.2) because the table is only ever created.
-- **A per-caller identity over MCP** — still open, and the HTTP transport narrowed it rather than
-  closing it. `run_<action>` records `mcp.actor`, which names a *deployment*; neither transport Loom
-  speaks authenticates anybody, so there is no caller to name instead.
+- **A per-caller identity over MCP** — **half answered** by `mcp.auth`, and the half that landed is
+  the half this entry said was missing. `run_<action>` still records `mcp.actor`, which names a
+  *deployment*; it now records an attested `principal` **beside** it, over the one transport that can
+  carry one. What remains open is not the identity but what may be *conditioned* on it: `when:` is
+  still refused, and the slice that turns it on is named in `ROADMAP.md` under M6.
 
   What was learned in narrowing it is that there are **three** kinds of answer here and only one is
   worth having, which the earlier wording did not distinguish. An actor may be *declared* by an
@@ -1201,11 +1203,28 @@ Named deliberately so they're conscious deferrals, not gaps:
   authorization server. Anything short of that — reading a header, trusting a claim — is the
   client-supplied actor rejected above, wearing a hat.
 
-  What is still missing is therefore specific: the validation, and the config to describe an
-  authorization server. Nothing else has to move. `ActionRuntime.run` already takes the argument per
-  call, the serve boundary already fills it in, and §6 already refuses the case where the gap would
-  do damage — writes on a bind reachable by strangers. A loopback HTTP server may write today
-  because its callers are the same set stdio's were; a public one may not, until this closes.
+  What was missing was therefore specific — the validation, and the config to describe an
+  authorization server — and that is exactly what shipped: `mcp.auth` names an issuer, an audience
+  and a key set, and `auth.TokenVerifier` checks `iss`, `aud`, `exp`/`nbf` and the signature against
+  it. Two things this entry got right are worth marking as *held*: nothing else had to move
+  (`ActionRuntime.run` already took the argument per call), and **the last sentence has now come
+  true rather than been revised** — a public bind may write, and only once `mcp.auth` is declared.
+  That refusal narrowed rather than moved: the bind still decides whether the question is asked;
+  attestation is the first answer to it other than no.
+
+  Two things this entry did **not** anticipate, both found by building it:
+
+  - **A resource server does not have to be an authorization server, and the middle between them
+    does not exist.** "Validate tokens yourself" and "refuse to be an auth server" read as opposed
+    options and are the same decision: Loom verifies a signature against a public key and issues,
+    stores and mints nothing. The cheaper-looking alternative — a proxy in front that validates and
+    injects a header — requires Loom to distinguish *this header came from the proxy* from *this
+    header came from a client*, which on any bind it can have it cannot. So there is no
+    trusted-proxy mode and none is coming, and `ALGORITHMS` is asymmetric-only, because a symmetric
+    algorithm verifies with the key that signs and would make Loom able to mint what it checks.
+  - **`aud` is the check that carries this, and it is the one that looks skippable.** Without it a
+    token minted for any other service by the same issuer is accepted: right issuer, right
+    signature, unexpired, and never addressed here.
 
   Governance (§6.1) turned out **not** to be the other half of this, and the correction is worth
   keeping because it was written the other way round here first. The prediction was that policies
@@ -1217,12 +1236,25 @@ Named deliberately so they're conscious deferrals, not gaps:
   everything §6.1 can express — and `when:` is reserved for exactly the policies that this edge
   unblocks, refused until then rather than approximated against `mcp.actor`.
 
-  What that leaves for this edge to carry is narrower than it looks: the validation, the config for
-  an authorization server, and — because a principal would then vary per call — the two things that
-  are one-per-process today. `build_server` builds one `Resolver` and one `ActionRuntime`, and
-  `DuckDBEngine` holds one connection registering every scan under the global aliases `t0`/`t1`/`m0`
-  (which is also what serializes a served process, §7). Both are the same milestone's work, and
-  neither was M5's.
+  **The prediction about what a principal would cost was wrong in the same direction, and larger.**
+  This entry said that because a principal varies per call, the two one-per-process things would have
+  to move with it: `build_server`'s single `Resolver` and `ActionRuntime`, and `DuckDBEngine`'s one
+  connection registering every scan under the global aliases `t0`/`t1`/`m0`. Attestation landed and
+  **neither moved.** Two forces were being treated as one. What would force per-caller objects is a
+  policy that varies *by* caller; what forces the alias fix is two calls *in flight at once*. A
+  per-call principal is neither — it is a value threaded through objects that stay shared, and the
+  handlers are still synchronous, so nothing overlaps. The alias problem belongs to whatever
+  milestone makes a handler `async`, which is a different milestone with a different reason.
+
+  What is genuinely left for this edge, then, is only `when:`, and the decision that shapes it is
+  already made: **a principal never reaches the resolver.** A `when:` policy is resolved into a
+  decided `PolicySet` *above* it, because a principal is constant for the duration of a call, so
+  everything it conditions — including a predicate that names the caller — folds to a literal before
+  the call begins. That keeps §6.1's "the resolver receives no identity" true by construction rather
+  than by scope, and it leaves every enforcement site in `Resolver` and `_Run` untouched. The cost is
+  stated where it will be paid: `loom query`, `loom run` and a stdio server can never attest anybody,
+  so a config carrying `when:` will be **refused** for them rather than filtered differently — one
+  file meaning one thing, with two surfaces declining it, instead of one file meaning two things.
 - ~~**Refusing to act when the log is unavailable**~~ — **answered** by §6.1's `edit_log`, and the
   prediction written here was wrong in two places worth correcting rather than quietly replacing.
   It said the clause was a *policy* and belonged with the other policies: it is a switch on a whole

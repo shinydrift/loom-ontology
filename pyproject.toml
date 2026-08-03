@@ -23,7 +23,12 @@ duckdb = ["duckdb>=1.0", "pytz"]
 # are hard dependencies of `mcp` itself, so serving over HTTP asks nothing more of a deployment than
 # serving over stdio already did.
 mcp = ["mcp>=2.0"]
-all = ["loom-ontology[iceberg,duckdb,mcp]"]
+# Attestation. Declared explicitly even though `mcp` happens to pull PyJWT in today: a transitive
+# dependency is one an upstream may drop in a patch release, and this is the one that decides
+# whether a caller can be named. `[crypto]` is not optional either — without it PyJWT can verify
+# only symmetric signatures, which is exactly the algorithm class `auth.ALGORITHMS` refuses.
+auth = ["pyjwt[crypto]>=2.9"]
+all = ["loom-ontology[iceberg,duckdb,mcp,auth]"]
 
 [project.scripts]
 loom = "loom.cli:main"

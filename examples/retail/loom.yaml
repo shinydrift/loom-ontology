@@ -37,6 +37,28 @@ mcp:
   # host: 127.0.0.1
   # port: 8000
   # path: /mcp
+  #
+  # `auth` is what turns an anonymous socket into callers with names. Loom is a *resource server*
+  # here and never an authorization server: it issues nothing and stores no credential, it verifies
+  # a bearer token against the key set your issuer publishes — issuer, audience, expiry and
+  # signature — and records the caller in `_loom_meta.edits` beside `actor`. Both, because `actor`
+  # is true about this deployment and the principal is true about whoever called it.
+  #
+  # `audience` is the check that looks skippable and is not: without it, a token your issuer minted
+  # for some *other* service is accepted here — right issuer, right signature, unexpired, and never
+  # addressed to Loom.
+  #
+  # There is deliberately no way to trust a header from a proxy in front. Loom cannot tell a header
+  # the proxy set from one a client sent, so accepting one would be the client-supplied caller this
+  # whole mechanism exists to refuse. Only asymmetric algorithms are accepted, for the matching
+  # reason: a shared secret would let this deployment mint the tokens it checks.
+  #
+  # With this set, `writes: true` is permitted on a non-loopback bind — the one thing a public bind
+  # could not do before, because every write can now be recorded under the caller who asked for it.
+  # auth:
+  #   issuer: https://issuer.example.com
+  #   audience: loom-retail
+  #   jwks_uri: https://issuer.example.com/.well-known/jwks.json
 
 # What this deployment withholds. Uncomment and `loom query`, `loom run` and every generated tool
 # stop returning `ltv` — enforced in the resolver's projection, so the column is not in the SQL

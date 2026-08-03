@@ -19,6 +19,7 @@ from pathlib import Path
 import yaml
 
 from ._shape import check_keys, require, suggest
+from .auth import MAX_SKEW
 from .errors import Diagnostics, SourceLoc
 from .governance import EDIT_LOG_OPTIONAL, Policy, parse_edit_log, parse_policies
 
@@ -39,7 +40,8 @@ DEFAULT_HTTP_HOST = "127.0.0.1"
 _TOP_KEYS = {"version", "catalogs", "engine", "mcp", "governance"}
 _CATALOG_KEYS = {"type", "uri", "warehouse", "auth", "properties"}
 _ENGINE_KEYS = {"type", "options"}
-_MCP_KEYS = {"name", "transport", "writes", "actor", "host", "port", "path", "allowed_hosts"}
+_MCP_KEYS = {"name", "transport", "writes", "actor", "host", "port", "path", "allowed_hosts", "auth"}
+_AUTH_KEYS = {"issuer", "audience", "jwks_uri", "clock_skew"}
 _ADDRESS_KEYS = ("host", "port", "path", "allowed_hosts")
 """The keys that only mean something once the transport has an address. stdio has none, and a
 config that sets them under `transport: stdio` is refused rather than ignored — the rule
@@ -153,10 +155,27 @@ class McpConfig:
     port: int = DEFAULT_HTTP_PORT
     path: str = DEFAULT_HTTP_PATH
     allowed_hosts: tuple[str, ...] = ()
+    auth: McpAuth | None = None
+    """The authorization server this deployment believes, or None — meaning it attests nobody.
+
+    None is not a weaker `auth:`; it is the whole of what every deployment before this one was, and
+    it stays the default. What it costs is stated where the cost is enforced: without it, a
+    non-loopback bind may not write, because `actor` names a deployment and nobody checked who
+    called."""
 
     @property
     def is_loopback(self) -> bool:
         return is_loopback(self.host)
+
+    @property
+    def attests(self) -> bool:
+        """Whether a caller of this surface can ever be named.
+
+        The one predicate the rest of the codebase should ask, rather than re-deriving it from
+        `transport` and `auth` in three places that can drift. False for stdio whatever `auth` says —
+        a spawned server carries no bearer token, so there is no exchange to carry one on — which is
+        why this is a property of the *surface* rather than of the config's auth block."""
+        return self.auth is not None and self.transport == "http"
 
     def address(self) -> str:
         """The URL the banner prints. Cleartext by construction — see the class docstring."""
@@ -173,6 +192,41 @@ class McpConfig:
         if self.allowed_hosts:
             return self.allowed_hosts
         return tuple(f"{name}:{self.port}" for name in ("127.0.0.1", "localhost", "[::1]"))
+
+
+@dataclass(frozen=True)
+class McpAuth:
+    """The authorization server this deployment believes, and the three things it must name.
+
+    All three are required and none is derived, which is the same posture `mcp.actor` takes for a
+    different reason. `issuer` and `audience` are what a token is checked *against*, and a default
+    for either would be Loom choosing who vouches for a caller and what the token was addressed to —
+    the two questions only a deployment can answer.
+
+    **`jwks_uri` is configured rather than discovered**, and that is a decision with a cost worth
+    stating. OIDC publishes it at `{issuer}/.well-known/openid-configuration`, so Loom could fetch
+    it. Doing so makes `loom serve` start by following a redirectable document to find a URL it will
+    then fetch keys from, which is two network dependencies at startup in place of one line an
+    operator pastes once. Discovery is also the only part of this that could silently *move* where
+    keys come from, which is the last thing that should be dynamic.
+
+    **`clock_skew` defaults to zero**, so a deployment that needs leeway says how much. The bound is
+    `auth.MAX_SKEW` and it is small on purpose: this is for drift between two machines, not for
+    extending an expiry, and a config asking for an hour is asking the wrong system for a longer
+    session.
+
+    **There is no `algorithms` key.** The accepted set is closed and asymmetric-only (`auth.ALGORITHMS`)
+    — see that module for why a symmetric algorithm would make Loom able to mint the tokens it
+    checks. A key here could only ever narrow a list that is already the safe one, or widen it back
+    to the thing this milestone refuses, and the second is what a key invites.
+
+    And there is no `header` key, no `trusted_proxy`, and none is coming: reading a header and
+    trusting a claim is the client-supplied actor spec-v0 rejects by name."""
+
+    issuer: str
+    audience: str
+    jwks_uri: str
+    clock_skew: int = 0
 
 
 @dataclass(frozen=True)
@@ -377,6 +431,7 @@ def _parse_mcp(raw: object, loc: SourceLoc, diag: Diagnostics) -> McpConfig:
         port=port,
         path=path,
         allowed_hosts=allowed_hosts,
+        auth=_parse_auth(raw.get("auth"), loc, diag),
     )
     if declared:
         _check_transport_posture(config, raw, loc, diag)
@@ -420,6 +475,62 @@ def _parse_address(raw: dict, loc: SourceLoc, diag: Diagnostics) -> tuple[str, i
     return host, port, path, allowed_hosts
 
 
+def _parse_auth(raw: object, loc: SourceLoc, diag: Diagnostics) -> McpAuth | None:
+    """`mcp.auth`, shape-checked without opening a socket.
+
+    Nothing here reaches the issuer. Whether the key set is fetchable is a fact about a network at
+    the moment somebody asks, and `build_verifier` refuses on it at startup; whether the config
+    *names* an issuer, an audience and a key set is a fact about the file, and this is where facts
+    about the file are found. The same two-phase split `_parse_governance` describes."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        diag.error("'mcp.auth' must be a mapping", loc)
+        return None
+    check_keys(raw, _AUTH_KEYS, loc, diag, "mcp.auth")
+
+    values: dict[str, str] = {}
+    for key in ("issuer", "audience", "jwks_uri"):
+        value = require(raw, key, loc, diag, "mcp.auth")
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            diag.error(f"'mcp.auth.{key}' must be a non-empty string, got {value!r}", loc)
+            value = None
+        values[key] = value.strip() if isinstance(value, str) else ""
+
+    skew = raw.get("clock_skew", 0)
+    if isinstance(skew, bool) or not isinstance(skew, int) or not 0 <= skew <= MAX_SKEW:
+        diag.error(f"'mcp.auth.clock_skew' must be an integer from 0 to {MAX_SKEW} seconds, got {skew!r}", loc)
+        skew = 0
+
+    if values["jwks_uri"] and not _key_set_is_protected(values["jwks_uri"]):
+        # Fetching verifying keys over cleartext hands the whole scheme to anyone on the path: swap
+        # the key set and you mint principals. Loopback is the one exception, and it is the same
+        # exception `host` already makes for the same reason — what cannot leave the machine cannot
+        # be intercepted off it.
+        diag.error(
+            f"'mcp.auth.jwks_uri' is {values['jwks_uri']!r}, which is not https",
+            loc,
+            "keys fetched over cleartext can be replaced in transit, and a replaced key set mints "
+            "principals — use https, or a loopback address for local testing",
+        )
+
+    if not all(values.values()):
+        return None
+    return McpAuth(
+        issuer=values["issuer"], audience=values["audience"], jwks_uri=values["jwks_uri"], clock_skew=skew
+    )
+
+
+def _key_set_is_protected(uri: str) -> bool:
+    """Whether a key set can be fetched without something on the path being able to replace it."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(uri)
+    if parts.scheme == "https":
+        return True
+    return parts.scheme == "http" and is_loopback((parts.hostname or "").strip())
+
+
 def _check_transport_posture(config: McpConfig, raw: dict, loc: SourceLoc, diag: Diagnostics) -> None:
     """The three questions that need more than one key to answer.
 
@@ -428,6 +539,17 @@ def _check_transport_posture(config: McpConfig, raw: dict, loc: SourceLoc, diag:
     is worth nothing here: nobody reads the third line of a banner on a server that came up."""
     address_keys = [k for k in _ADDRESS_KEYS if k in raw]
     if config.transport == "stdio":
+        if config.auth is not None:
+            # The same rule the address keys get, applied to the key that would be most damaging to
+            # ignore: a stdio deployment carrying `auth:` would read, to whoever wrote it, exactly
+            # like one whose callers are authenticated. None of them is — a spawned server is handed
+            # a pipe, and there is no exchange for a token to ride on.
+            diag.error(
+                "'mcp.auth' is set but transport is 'stdio', which carries no bearer token",
+                loc,
+                "a spawned server's caller cannot be attested at all — set 'transport: http' to "
+                "authenticate callers, or drop 'auth:' and accept that this deployment names none",
+            )
         if address_keys:
             # `_check_governance`'s rule, applied to a second set of keys: silently ignoring
             # something a config declared is a worse failure than refusing to boot. And a stdio
@@ -451,14 +573,21 @@ def _check_transport_posture(config: McpConfig, raw: dict, loc: SourceLoc, diag:
             "a non-loopback bind cannot derive the Host headers to accept — declare them, e.g. "
             f"allowed_hosts: [loom.internal:{config.port}]",
         )
-    if config.writes:
+    if config.writes and not config.attests:
+        # **This refusal narrowed rather than moved, and it is what M6's first slice bought.** M4
+        # drew the limit on the bind because the bind was the only thing it could see: `actor` names
+        # a deployment, so a public write surface recorded every caller under one name nobody
+        # checked, and the only available answer was not to serve one. spec-v0's open edge said this
+        # in as many words — "a public one may not, until this closes". `auth:` is what closes it.
+        # The bind is still the thing that decides *whether the question is asked*; what changed is
+        # that there is now an answer other than no.
         diag.error(
-            f"'mcp.writes' is true on a non-loopback bind ({config.host!r}) — refusing to serve a "
-            "write surface to whoever can reach the port",
+            f"'mcp.writes' is true on a non-loopback bind ({config.host!r}) with no 'mcp.auth' — "
+            "refusing to serve a write surface to whoever can reach the port",
             loc,
-            "bind 127.0.0.1 and put authentication in front, or set 'writes: false'. `mcp.actor` "
-            "names a deployment, not a caller, so every write here would be recorded under one "
-            "name nobody checked",
+            "declare 'mcp.auth' so every caller is attested and recorded by name, bind 127.0.0.1, "
+            "or set 'writes: false'. `mcp.actor` names a deployment, not a caller, so without "
+            "authentication every write here would be recorded under one name nobody checked",
         )
 
 

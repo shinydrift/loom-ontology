@@ -350,3 +350,73 @@ def test_apply_and_rollback_leave_the_log_alone(seeded, runtime):
 
     # And the planner has nothing to say about it, before or after.
     assert main(["plan", str(ontology)]) == 0
+
+
+# ---- the principal column, and the silent drop that makes it a refusal ---------------
+
+
+def test_a_log_table_without_the_principal_column_drops_it_without_complaint(seeded):
+    """The failure `require_principal_column` exists to make impossible, demonstrated.
+
+    `append_edit` builds its Arrow batch against the *table's own* schema, and
+    `pa.Table.from_pylist` ignores keys that schema does not have. So an append carrying a principal
+    into a log table created before this slice succeeds, reports nothing, and discards it — leaving a
+    record that says the run had no caller, which is indistinguishable from a run that genuinely had
+    none. This is the assertion that fails if that ever stops being true, at which point the refusal
+    below can go."""
+    import pyarrow as pa
+
+    from loom.action.log import EDIT_COLUMNS
+
+    older = [c for c in EDIT_COLUMNS if c.name != "principal"]
+    schema = pa.schema([(c.name, pa.string()) for c in older])
+    batch = pa.Table.from_pylist([{"edit_id": "e1", "principal": "https://i.test#alice"}], schema=schema)
+    assert "principal" not in batch.column_names
+    assert batch.to_pylist()[0]["edit_id"] == "e1"
+
+
+def test_a_deployment_that_attests_refuses_a_log_it_would_drop_the_caller_from(seeded):
+    """Refused at startup rather than discovered in the audit trail six months later.
+
+    The remedy is deliberately not a port verb: `EditLogWriter` takes no table name and creates
+    exactly one table, and widening it to alter one would spend the guarantee that keeps DDL out of
+    the action runtime's reach. So a deployment says what it cannot do and stops."""
+    from loom.action.log import EDIT_COLUMNS, require_principal_column
+    from loom.catalog import open_catalogs
+    from loom.catalog.base import EDIT_LOG_TABLE, Column, edit_log_writer_for
+    from loom.governance import PolicyError
+
+    _, ontology, config = seeded
+    catalogs = open_catalogs(config)
+    # A log table as it would have been created before this slice: every column but `principal`.
+    older = tuple(c for c in EDIT_COLUMNS if c.name != "principal")
+    catalogs["local"].ensure_namespace(EDIT_LOG_TABLE)
+    catalogs["local"].create_table(EDIT_LOG_TABLE, older, properties={})
+    assert isinstance(older[0], Column)
+    assert edit_log_writer_for(catalogs["local"]) is not None
+
+    with pytest.raises(PolicyError) as e:
+        require_principal_column(ontology, catalogs)
+    assert "predates attested identity" in str(e.value)
+    assert "no 'principal' column" in str(e.value)
+
+
+def test_a_log_table_created_now_carries_the_principal(seeded, runtime):
+    """The other half: nothing to reconcile when the first append creates the table."""
+    from loom.action.log import require_principal_column
+    from loom.catalog import open_catalogs
+
+    _, ontology, config = seeded
+    runtime.run("upgradeTier", {"customer": "c1", "newTier": "gold"}, actor="tester", principal="https://i.test#alice")
+    catalogs = open_catalogs(config)
+    require_principal_column(ontology, catalogs)  # does not raise
+    row = edits(seeded)[0]
+    assert row["principal"] == "https://i.test#alice"
+    assert row["actor"] == "tester"
+
+
+def test_a_run_with_nobody_attested_records_no_principal(seeded, runtime):
+    """`None`, not a placeholder. There is no `UNKNOWN_ACTOR` equivalent, because "nobody could be
+    named here" is a fact about the surface rather than a name — and `loom run` is that surface."""
+    runtime.run("upgradeTier", {"customer": "c1", "newTier": "gold"}, actor="tester")
+    assert edits(seeded)[0]["principal"] is None
