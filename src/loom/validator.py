@@ -68,11 +68,14 @@ def _validate_object(obj: ObjectType, diag: Diagnostics) -> None:
         {p.column: (p.renamed_from, f"property '{p.name}'") for p in props.values()}, diag, loc
     )
 
+    # `searchable` names what `search_<type>` will filter on. It was string-or-enum while a filter
+    # could only say equality and substring; typed filters give every scalar operators worth
+    # declaring, so the restriction is lifted rather than worked around. This widens what an author
+    # *may declare* and no existing spec's surface — a property still has to be listed here to be
+    # filterable, which is why `DailySalesPerformance` had to say so to get its date range.
     for s in obj.searchable:
         if s not in props:
             diag.error(f"searchable entry '{s}' is not a declared property", loc)
-        elif props[s].type.kind not in ("string", "enum"):
-            diag.error(f"searchable property '{s}' must be string or enum, got '{props[s].type.kind}'", loc)
 
 
 # ---- linkType ------------------------------------------------------------------

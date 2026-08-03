@@ -189,6 +189,25 @@ that cannot attest anybody — `loom query`, `loom run`, a spawned stdio server 
 config rather than applying the rest of it, because policies subtract and never add, and skipping the
 conditional ones would make the dev command the way to read what the served surface withholds.
 
+**M7 is the query an agent actually wants.** A `search_` filter was equality and `searchable`
+substring, so a date range — the whole point of a precomputed daily table — could not be asked for
+at all. Now each property advertises the operators its *type* deserves, ANDed, in either spelling:
+
+```jsonc
+{"filter": {"salesDate": {"gte": "2026-01-01", "lt": "2026-02-01"}, "tier": "gold"}}
+```
+
+The bare spelling keeps exactly what it meant, because rewriting it as equality would return fewer
+rows to every filter already written, with nothing raising. `searchable` still decides *which*
+properties are filterable — making every property queryable would widen a surface no spec asked to
+widen — and gives up only its invisible second job, since substring is now an operator you can see.
+A caller's comparison is the same IR node a policy's is, so `eq` on a null column cannot mean one
+thing for a caller and another for a deployment; what keeps a governance predicate un-advisory was
+never the node but the field it hangs on, and one function now decides what may become a pushdown
+hint. Two refusals: a bare `{"ltv": null}` filter, because JSON cannot tell a field an agent left
+blank from one it meant as null and the old answer was a plausible non-empty result set; and a
+capability flag for ranges, because no adapter could ever fail it.
+
 | Component | State |
 |-----------|-------|
 | Canonical type system (`types.py`) | ✅ |
@@ -218,6 +237,7 @@ conditional ones would make the dev command the way to read what the served surf
 | Governance — the edit log under a policy | ✅ `governance.edit_log: required` (retention refused) |
 | Attested identity over MCP | ✅ `mcp.auth` — a bearer token this deployment checked |
 | Governance — policies that name the caller | ✅ `when:` and `principal.<claim>`, rows only |
+| Fully typed object filters | ✅ `filter: {salesDate: {gte: …, lt: …}}`, scalars, ANDed |
 
 `docs/spec-v0.md` is the full grammar — the framework's public contract.
 `docs/ROADMAP.md` tracks what's next, milestone by milestone.
@@ -228,7 +248,7 @@ conditional ones would make the dev command the way to read what the served surf
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 460 tests
+pytest                              # 716 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 3 action(s)
 ```
 

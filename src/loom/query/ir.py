@@ -12,6 +12,7 @@ below it speak only physical columns.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 
@@ -50,41 +51,32 @@ class Column:
     output: str
 
 
-# ---- the filter surface --------------------------------------------------------
+# ---- a comparison, wherever it came from ---------------------------------------
 #
-# Two are enough for v0: equality (the only one a catalog can push down) and case-insensitive
-# substring match (what `searchable` means in practice).
+# One node set for the six comparisons, read by both grammars above this layer — a caller's
+# `filter` argument (`filters.py`) and a deployment's `rows:` predicate (`predicate.py`).
 #
-# This set used to predict that "ranges arrive with the filter grammar". They arrived with
-# governance instead, as `Compare` below, and the two are deliberately *not* one node set. These
-# two are what a **caller's** `filter` argument compiles to: `Eq` is pushdownable as a
-# `ScanRequest` hint, and `Contains` exists because `searchable` on a string property means
-# substring. That is a property of the filter surface and not of the expression language — the
-# same `name == 'x'` written in a policy is equality and never `ILIKE`.
-
-
-@dataclass(frozen=True)
-class Eq:
-    alias: str
-    column: str
-    value: object
-
-
-@dataclass(frozen=True)
-class Contains:
-    alias: str
-    column: str
-    value: str
-
-
-Comparison = Eq | Contains
-
-
-# ---- the governance predicate --------------------------------------------------
+# **This block used to be two, and the correction is worth stating rather than quietly making.**
+# v0 predicted "ranges arrive with the filter grammar"; M5 shipped ranges in `Compare` for
+# governance and corrected the prediction to "the two are deliberately *not* one node set". Ranges
+# then arrived a **second** time, in a caller's hands, which is where that correction turned out to
+# have over-generalised from the one node it was true of. What the two grammars actually are:
 #
-# What a policy's `rows:` expression lowers to. Built only by `predicate.lower()`, never from
-# anything a caller sent, and never handed to `ScanRequest.predicates` — that channel is documented
-# as a pushdown *hint* an adapter may ignore, and a governance filter must not be advisory anywhere.
+#   - the filter grammar has `Contains` (ILIKE) and no negation and no composition;
+#   - the policy grammar has `&& || !` and no ILIKE;
+#   - they overlap **exactly on the six comparisons**, where they already agreed node for node —
+#     v0's `Eq(col, None)` compiled to `IS NULL`, which is what `Compare('==', col, null)` compiles
+#     to, and for a bound non-null parameter `=` and `IS NOT DISTINCT FROM` select the same rows.
+#
+# So the merge is the overlap, and the difference stays: `Contains` is filter-only, `And`/`Or`/`Not`
+# are policy-only. What made a governance predicate un-advisory was never the node *type* — it is
+# the **field**: a predicate hangs on `TableRef.predicate`, which an adapter compiles into `WHERE`,
+# and only `Search.filters` yields `ScanRequest` hints. `pushdown_hints()` below is the one place
+# that decides what may become one, and it cannot be handed a `TableRef`.
+#
+# One thing does not transfer with the merge: the *lowerable subset* rule. A policy's expression is
+# answered twice (SQL and in process) and must mean the same thing both times; a caller's filter is
+# answered once, which is why `Contains` may exist at all in a grammar that refuses `contains`.
 
 
 @dataclass(frozen=True)
@@ -95,8 +87,9 @@ class ColumnRef:
 
 @dataclass(frozen=True)
 class Const:
-    """A literal the policy author wrote. Distinct from `ColumnRef` so an adapter binds it as a
-    parameter rather than interpolating it, and so `null` is recognisable at lowering time."""
+    """A literal — the policy author's, or the caller's, already coerced to the property's type.
+    Distinct from `ColumnRef` so an adapter binds it as a parameter rather than interpolating it,
+    and so `null` is recognisable at lowering time."""
 
     value: object
 
@@ -115,11 +108,76 @@ class Compare:
     in-process evaluator over a table full of them.
 
     The four ordering operators are *not* lifted: §5 refuses to order a null and SQL yields
-    unknown, and `predicate.admits` is written to agree with that."""
+    unknown, and `predicate.admits` is written to agree with that. A caller's filter inherits both
+    answers and needs no second rule — see `filters.py` on why the two grammars cannot disagree
+    about a null while one of them has no negation."""
 
     op: str
     left: Operand
     right: Operand
+
+
+# ---- the filter surface --------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Contains:
+    """Case-insensitive substring — the one thing a caller can say that a policy cannot.
+
+    Filter-only, and it stays that way for the reason `predicate.NOT_LOWERABLE` gives: inside
+    `rows:` it would need a second evaluator agreeing with it forever, and here it needs none,
+    because nothing evaluates a caller's filter off the read path."""
+
+    alias: str
+    column: str
+    value: str
+
+
+Comparison = Compare | Contains
+
+
+@dataclass(frozen=True)
+class Eq:
+    """A traverse's anchor: one column, one value, always the source row's primary key.
+
+    **Not a filter node.** It was one in v0 and stopped being one when the comparisons merged, and
+    it survives because an anchor is structurally narrower than a comparison — exactly one column
+    against exactly one non-null key — which is what `_compile_traverse` reads it as. `Compare`
+    could spell it and would also spell `Const == Const`, which is not a join anchor."""
+
+    alias: str
+    column: str
+    value: object
+
+
+def pushdown_hints(filters: Sequence[Comparison]) -> tuple[tuple[str, object], ...]:
+    """The `(column, value)` equality hints a caller's filters imply, for `ScanRequest.predicates`.
+
+    **The one place that decides what may be advisory**, and it takes filters rather than a plan or
+    a table so that a governance predicate cannot reach it: that channel is a pushdown hint an
+    adapter may ignore and the compiled `WHERE` re-applies, which is right for a caller's filter and
+    wrong for a policy. `ir.TableRef` says a predicate is never handed to it; this is what makes
+    that structural instead of remembered.
+
+    Equality only, because the channel is a `(column, value)` pair by shape — a range has no
+    spelling in it. That costs an Iceberg scan some pruning it could do and costs correctness
+    nothing, since every filter is in the `WHERE` clause regardless. A null is included: the
+    catalog's `_row_filter` maps it to `IsNull`, which is what `Compare('==', col, null)` means."""
+    return tuple(
+        (f.left.column, f.right.value)
+        for f in filters
+        if isinstance(f, Compare)
+        and f.op == "=="
+        and isinstance(f.left, ColumnRef)
+        and isinstance(f.right, Const)
+    )
+
+
+# ---- the governance predicate --------------------------------------------------
+#
+# What a policy's `rows:` expression lowers to: `Compare` above, plus the composition a caller has
+# no spelling for. Built only by `predicate.lower()`, never from anything a caller sent, and never
+# handed to `ScanRequest.predicates` — see `pushdown_hints`.
 
 
 @dataclass(frozen=True)
@@ -173,6 +231,10 @@ class GetByKey:
 
 @dataclass(frozen=True)
 class Search:
+    """A filtered set of objects. `filters` is a **conjunction** — that flat tuple is why AND costs
+    the filter grammar no node, and why `or` is a shape this IR does not have yet rather than a
+    spelling `filters.py` declined to offer."""
+
     table: TableRef
     filters: tuple[Comparison, ...] = ()
     # Physical columns on the projected table. Not cosmetic: LIMIT/OFFSET without a total order

@@ -98,6 +98,29 @@ def test_a_searchable_string_demands_like_and_a_searchable_enum_does_not(ontolog
     assert "Customer.tier" not in req.demanded_by
 
 
+def test_a_searchable_non_string_demands_nothing_new(ontology):
+    """Typed filters let `searchable` name any type, and range comparisons are a floor rather than
+    a capability — so declaring a date searchable adds no requirement, and there is no flag for it
+    to add. `case_insensitive_like` is still demanded by exactly the properties `contains` reaches."""
+    from loom.filters import CONTAINS, operators
+
+    dated = dataclasses.replace(
+        ontology,
+        object_types={
+            name: dataclasses.replace(obj, searchable=(*obj.searchable, "placedAt"))
+            if name == "Order"
+            else obj
+            for name, obj in ontology.object_types.items()
+        },
+    )
+    before = _by_capability(requirements(ontology))
+    after = _by_capability(requirements(dated))
+    assert set(before) == set(after)
+    assert after["case_insensitive_like"].demanded_by == before["case_insensitive_like"].demanded_by
+    placed_at = dated.object_types["Order"].properties["placedAt"]
+    assert CONTAINS not in operators(placed_at, searchable=True)
+
+
 def test_an_ontology_with_nothing_searchable_demands_no_like(ontology):
     plain = dataclasses.replace(
         ontology,

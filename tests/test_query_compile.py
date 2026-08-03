@@ -4,7 +4,20 @@ import pytest
 
 from loom.query.engine import EngineError
 from loom.query.engines.duckdb import DuckDBEngine
-from loom.query.ir import Column, Contains, Eq, GetByKey, Project, Search, TableRef, ThroughRef, Traverse
+from loom.query.ir import (
+    Column,
+    ColumnRef,
+    Compare,
+    Const,
+    Contains,
+    Eq,
+    GetByKey,
+    Project,
+    Search,
+    TableRef,
+    ThroughRef,
+    Traverse,
+)
 
 CUST = TableRef(catalog="main", table="crm.customers", alias="t0")
 ORDERS = TableRef(catalog="main", table="sales.orders", alias="t1")
@@ -64,15 +77,58 @@ def test_search_orders_by_key_so_pages_are_stable(engine):
     assert 'ORDER BY "t0"."id"' in engine.compile(plan).sql
 
 
+def _eq(column, value):
+    return Compare("==", ColumnRef("t0", column), Const(value))
+
+
 def test_equality_filter_is_both_sql_and_pushdown(engine):
+    """`IS NOT DISTINCT FROM`, not `=`, since a caller's `eq` is the node a policy's is.
+
+    For a bound non-null parameter the two select the same rows; the spelling is what makes
+    `{"eq": null}` and `object.x == null` one answer instead of two."""
     plan = Project(
-        source=Search(table=CUST, filters=(Eq("t0", "tier", "gold"),), order_by=("id",), limit=5),
+        source=Search(table=CUST, filters=(_eq("tier", "gold"),), order_by=("id",), limit=5),
         columns=COLUMNS,
     )
     q = engine.compile(plan)
-    assert '"t0"."tier" = ?' in q.sql
+    assert '"t0"."tier" IS NOT DISTINCT FROM ?' in q.sql
     assert q.params == ("gold", 5)
     assert q.scans[0].predicates == (("tier", "gold"),)
+
+
+def test_range_filters_and_between_compile_to_a_conjunction(engine):
+    """The acceptance shape: two comparisons on one column, ANDed, neither pushed down."""
+    plan = Project(
+        source=Search(
+            table=CUST,
+            filters=(
+                Compare(">=", ColumnRef("t0", "lifetime_value"), Const(100.0)),
+                Compare("<", ColumnRef("t0", "lifetime_value"), Const(500.0)),
+            ),
+            order_by=("id",),
+            limit=5,
+        ),
+        columns=COLUMNS,
+    )
+    q = engine.compile(plan)
+    assert '"t0"."lifetime_value" >= ? AND "t0"."lifetime_value" < ?' in q.sql
+    assert q.params == (100.0, 500.0, 5)
+    # The pushdown channel is a (column, value) pair by shape, so a range has no spelling in it.
+    assert q.scans[0].predicates == ()
+
+
+def test_a_filtered_column_is_scanned_even_when_it_is_not_projected(engine):
+    """A range on a column outside the projection still has to be read to be filtered on."""
+    plan = Project(
+        source=Search(
+            table=CUST,
+            filters=(Compare(">", ColumnRef("t0", "lifetime_value"), Const(1.0)),),
+            order_by=("id",),
+            limit=5,
+        ),
+        columns=(Column("t0", "id", "customerId"),),
+    )
+    assert "lifetime_value" in engine.compile(plan).scans[0].columns
 
 
 def test_contains_filter_uses_ilike_and_is_not_pushed_down(engine):
@@ -102,7 +158,7 @@ def test_like_metacharacters_in_user_input_are_escaped(engine, value, expected):
 def test_null_equality_becomes_is_null(engine):
     """`= NULL` never matches, so an explicit null filter has to compile differently."""
     plan = Project(
-        source=Search(table=CUST, filters=(Eq("t0", "lifetime_value", None),), order_by=("id",), limit=5),
+        source=Search(table=CUST, filters=(_eq("lifetime_value", None),), order_by=("id",), limit=5),
         columns=COLUMNS,
     )
     q = engine.compile(plan)

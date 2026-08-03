@@ -31,11 +31,13 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .auth import Principal
+from .filters import FilterError
+from .filters import lower as lower_filter
 from .governance import PolicyProgram, PolicySet
 from .model import LinkType, ObjectType, Ontology, Property, coerce_value
 from .predicate import lower
 from .query.engine import Engine
-from .query.ir import Column, Comparison, Contains, Eq, GetByKey, Project, Search, TableRef, ThroughRef, Traverse
+from .query.ir import Column, Comparison, Eq, GetByKey, Project, Search, TableRef, ThroughRef, Traverse
 
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 500
@@ -137,11 +139,11 @@ class Resolver:
     ) -> list[dict]:
         """Filter objects by property values.
 
-        A `searchable` string property matches on case-insensitive substring — that's what makes
-        it worth declaring searchable. Every other property, including a searchable enum (whose
-        values are a closed set, so substring matching would only introduce ambiguity), matches
-        exactly.
-        """
+        Two spellings, ANDed together and with each other: a bare value — a case-insensitive
+        substring for a `searchable` string property, exact for everything else, which is what it
+        has always meant — or an object of comparison operators, `{"salesDate": {"gte": ...,
+        "lt": ...}}`. `filters.py` is the whole of what one may say, including why a bare `null` is
+        refused there rather than answered here."""
         obj = self._object(object_type)
         table = self._table(obj, _TARGET)
         plan = Project(
@@ -291,6 +293,13 @@ class Resolver:
         )
 
     def _filters(self, obj: ObjectType, filters: Mapping[str, Any]) -> tuple[Comparison, ...]:
+        """A caller's `filter` argument as comparison nodes — governance first, grammar second.
+
+        The split is the layering: *which properties may be filtered at all* is this deployment's
+        question and belongs to a policy, while *what may be said about one* is the grammar's and
+        lives in `filters.py`, where the surface reads the same answer to build its schema. A
+        governed property is refused before its value is even parsed, so no refusal can be a
+        function of what a caller guessed the value might be."""
         out: list[Comparison] = []
         for name, value in filters.items():
             prop = obj.properties.get(name)
@@ -301,23 +310,21 @@ class Resolver:
             if policy is not None:
                 # A refusal rather than an empty result, and the difference is the whole point: a
                 # filter on a withheld property is an oracle for its value — a substring filter
-                # binary-searches it in a handful of calls, and an exact one confirms a guess. The
-                # refusal gives away only what the mask already announced.
+                # binary-searches it in a handful of calls, and an exact one confirms a guess. A
+                # range narrows it faster than either, which is the same refusal earning its keep
+                # against a grammar it was written before. The refusal gives away only what the
+                # mask already announced.
                 raise ResolverError(
                     f"'{obj.api_name}.{name}' is withheld by governance policy '{policy}', so it "
                     "cannot be filtered on either — a filter on a property you cannot read answers "
                     "the question the mask refused"
                 )
-            if prop.type.kind == "string" and name in obj.searchable and value is not None:
-                out.append(Contains(alias=_TARGET, column=prop.column, value=str(value)))
-            else:
-                out.append(
-                    Eq(
-                        alias=_TARGET,
-                        column=prop.column,
-                        value=self._coerce(prop, value, f"filter '{name}'"),
-                    )
+            try:
+                out.extend(
+                    lower_filter(obj, prop, value, _TARGET, self.ontology.object_types)
                 )
+            except FilterError as e:
+                raise ResolverError(str(e)) from e
         return tuple(out)
 
     def _coerce(self, prop: Property, value: Any, ctx: str) -> Any:
