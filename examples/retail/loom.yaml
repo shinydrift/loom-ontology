@@ -50,8 +50,27 @@ mcp:
 #
 # Try masking `tier` instead and the server refuses to start: `upgradeTier` writes it, and a
 # deployment cannot both withhold a property and change it. See docs/spec-v0.md §6.1.
+#
+# `rows:` is the other half — the same expression language a validation rule is written in, but
+# over the row rather than over a call. A filtered row is simply *absent*: `get_` answers
+# `found: false` in the same words it uses for a key that never existed, because the rows are the
+# data and "you may not see this one" would be an oracle over it. It is compiled into the query on
+# the read path and evaluated in process on the write path, so an agent cannot act on a row it
+# cannot see.
+#
+# `edit_log:` is a posture rather than a policy, which is why it sits beside `policies:` and not in
+# it: it names no objectType, because a *catalog* either can hold `_loom_meta.edits` or cannot. Set
+# it to `required` and a deployment that cannot record what it writes refuses to start — the log
+# table is created up front, so a permissions problem is a startup error instead of a `log_failed`
+# discovered after the row landed. It deliberately promises nothing about an individual run: there
+# is no transaction spanning a row's table and the log, so an append that fails *after* the commit
+# still reports `log_failed`, and the run's `edit_id` is in the Iceberg snapshot summary either way.
 # governance:
+#   edit_log: required
 #   policies:
 #     - name: hide-ltv
 #       objectType: Customer
 #       mask: [ltv]
+#     - name: current-customers-only
+#       objectType: Customer
+#       rows: "object.tier != 'closed'"

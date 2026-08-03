@@ -285,6 +285,9 @@ class Interloper:
     def append_edit(self, columns, row):
         self.inner.append_edit(columns, row)
 
+    def ensure_log(self, columns):
+        self.inner.ensure_log(columns)
+
 
 def _contended(seeded, strike_on):
     from loom.catalog import open_catalogs

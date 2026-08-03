@@ -69,6 +69,35 @@ wrote down when it borrowed this milestone's principle a milestone early: that f
 place a spec and a deployment are paired, so `loom query` refuses exactly what `loom serve` refuses.
 Not in `loom validate`, which validates an ontology and does not require a `loom.yaml` at all — a
 spec that is valid stays valid whatever a deployment withholds of it.
+
+**What a policy is not, and where `audit:` went.** That key was reserved in this grammar for two
+slices, and it has *left* rather than landed, because neither half of what it named is a policy in
+the sense the rest of this module means.
+
+*No log, no write* subtracts an ability, which is the right shape — but it names no object type.
+Unloggability is a fact about a **catalog**: the log is one table per catalog, reached through a
+port a catalog either implements or does not, so a per-type spelling would let a config say
+"Customer edits must be logged, Order edits need not" about a single fact concerning a single
+catalog. It is also a switch an operator reads, which is precisely the argument that kept
+`mcp.writes` out of this list — folding a switch into a policy list turns a line somebody reads into
+a set they have to evaluate. So it landed beside `policies:` as `governance.edit_log`, and it is the
+first governance clause that binds **one plane only**: `build_runtime` and not `build_resolver`,
+because it subtracts from the write surface and the read plane produces no records. `log.require_edit_log`
+carries what it can and cannot promise.
+
+*Retention* fails the subtraction test outright. It withholds nothing from any caller; it deletes
+from the lake, on a table no policy can name, by an actor Loom does not have — nothing here runs on
+a schedule. It is also the one thing that would cost the edit log the property its write-then-log
+ordering was chosen for: expire a record and a reader holding a stamped snapshot with no matching
+row can no longer tell an expired edit from a lost one. So there is no key for it and no key coming;
+it is a command Loom has not built (spec-v0 "Open edges"), and a config key that is only a default
+for a command nobody runs is exactly the `loom.managed` shape this codebase has already paid for.
+
+A key that will never land must **leave** this grammar rather than sit in it. `ENFORCED_KEYS` and
+`RESERVED_KEYS` partition `POLICY_KEYS` under a test, and *reserved forever* is a third kind that
+test cannot see — as invisible as the accepted-and-ignored kind it was written to catch. So
+`RESERVED_KEYS` now means one thing only, a named future slice turns this on, and `when:` is the
+whole of it.
 """
 
 from __future__ import annotations
@@ -99,12 +128,22 @@ class Reserved:
     hint: str
 
 
+MOVED_KEYS: Mapping[str, str] = {
+    "audit": "'no log, no write' is a switch on a whole deployment rather than a policy — it names "
+    "no objectType, because a catalog either can hold an edit log or cannot. Set "
+    "'governance.edit_log: required' beside 'policies:'. A retention window is not there and is "
+    "not coming: removing a record would leave a reader unable to tell an expired edit from a lost "
+    "one, so no Loom command deletes from '_loom_meta.edits'",
+}
+"""Keys this grammar used to name, and where they went instead.
+
+Strictly unnecessary by this codebase's own rule — a config that was refused is a config nobody
+deployed, so nothing written against `audit:` has to change. It is here because the key was
+*advertised*: §6.1 named it for two slices, and the refusal it produced told operators it was
+coming. The honest end of a reservation names its destination, rather than falling through to
+`unexpected key 'audit'` with nothing behind it."""
+
 RESERVED_KEYS: Mapping[str, Reserved] = {
-    "audit": Reserved(
-        why="'no log, no write' is not enforced yet",
-        hint="drop it until the slice that makes an unloggable run refuse; today a run whose record "
-        "cannot be written still happens and reports 'log_failed'",
-    ),
     "when": Reserved(
         why="a principal-conditioned policy needs a caller this deployment can attest, and neither "
         "transport Loom speaks authenticates anybody",
@@ -119,10 +158,22 @@ Together with `ENFORCED_KEYS` this covers `POLICY_KEYS` exactly, under a test �
 arriving as a third: silently accepted. That third kind is how `loom.managed` got written by `apply`
 and read by nothing for two milestones.
 
-`rows` was here and is now enforced, which is what the reservation was for: nothing written against
-the refusal has to change, because a config that was refused is a config nobody deployed."""
+A reservation has exactly two honest ends, and both have now happened. `rows` was here and is
+**enforced**, which is what the reservation was for: nothing written against the refusal had to
+change, because a config that was refused is a config nobody deployed. `audit` was here and
+**left** — see `MOVED_KEYS` and this module's docstring — because a key that will never land is a
+third kind of its own, and the partition test below cannot see it. What is left in here therefore
+means one thing: a named future slice turns it on."""
 
 POLICY_KEYS = ENFORCED_KEYS | set(RESERVED_KEYS)
+
+EDIT_LOG_OPTIONAL = "optional"
+EDIT_LOG_REQUIRED = "required"
+EDIT_LOG_POSTURES = (EDIT_LOG_OPTIONAL, EDIT_LOG_REQUIRED)
+"""What `governance.edit_log` may say, and `optional` is what it says when nobody says anything.
+
+A sibling of `policies:` rather than an entry in it, for `mcp.writes`' reason — see this module's
+docstring. Enforced by `action.log.require_edit_log`, from `build_runtime`."""
 
 
 class PolicyError(RuntimeError):
@@ -273,6 +324,38 @@ class PolicySet:
         return Expr(root=root, raw=" && ".join(f"({expr.raw})" for _, expr in entries))
 
 
+def parse_edit_log(raw: object, loc: SourceLoc, diag: Diagnostics) -> str:
+    """`governance.edit_log`, which is a posture about a deployment and not a promise about a run.
+
+    **The name is the decision.** What this key was called while it was reserved is "no log, no
+    write", and that sentence cannot be delivered by anything built on Iceberg: there is no
+    transaction spanning a row's table and `_loom_meta.edits`, so no ordering of the two makes
+    *every applied run is logged* true. `edit_log: required` says instead the one thing that is
+    true — **a deployment that cannot log does not run** — and says it about a deployment rather
+    than about a run. A boolean spelled `no_log_no_write: true` would have read as the per-run
+    guarantee, which is the failure this whole block refuses everywhere else: a config that promises
+    more than it enforces reads, to whoever wrote it, exactly like one that was obeyed.
+
+    `edit_log` and not `audit` is Loom's own vocabulary for the thing being demanded — `EditLogWriter`,
+    `EditLog`, `_loom_meta.edits` — the same reason a policy's subject is `objectType:` rather than
+    the obvious `on:`.
+
+    **Default `optional`**, for the reason `mcp.writes` is off by default: an upgrade and a catalog
+    that implements no edit-log port are two things that happen for unrelated reasons, and a
+    deployment that never asked for this posture is not asking to stop working."""
+    if raw is None:
+        return EDIT_LOG_OPTIONAL
+    if not isinstance(raw, str) or raw.strip() not in EDIT_LOG_POSTURES:
+        allowed = ", ".join(EDIT_LOG_POSTURES)
+        diag.error(
+            f"'governance.edit_log' must be one of {allowed}, got {raw!r}",
+            loc,
+            suggest(raw, EDIT_LOG_POSTURES) if isinstance(raw, str) else None,
+        )
+        return EDIT_LOG_OPTIONAL
+    return raw.strip()
+
+
 def parse_policies(raw: object, loc: SourceLoc, diag: Diagnostics) -> tuple[Policy, ...]:
     """`governance.policies` as written, shape-checked but not yet resolved against an ontology.
 
@@ -293,7 +376,10 @@ def parse_policies(raw: object, loc: SourceLoc, diag: Diagnostics) -> tuple[Poli
         if not isinstance(entry, dict):
             diag.error(f"{ctx} must be a mapping", loc)
             continue
-        check_keys(entry, set(POLICY_KEYS), loc, diag, ctx)
+        # `MOVED_KEYS` is passed to `check_keys` so a key that left this grammar is reported once,
+        # by the branch below that knows where it went, rather than twice — once as unknown and
+        # once as moved.
+        check_keys(entry, set(POLICY_KEYS) | set(MOVED_KEYS), loc, diag, ctx)
 
         name = entry.get("name")
         if not isinstance(name, str) or not name.strip():
@@ -309,6 +395,9 @@ def parse_policies(raw: object, loc: SourceLoc, diag: Diagnostics) -> tuple[Poli
         for key, reserved in RESERVED_KEYS.items():
             if key in entry:
                 diag.error(f"{ctx} sets '{key}', but {reserved.why}", loc, reserved.hint)
+        for key, moved in MOVED_KEYS.items():
+            if key in entry:
+                diag.error(f"{ctx} sets '{key}', which is no longer a policy key", loc, moved)
 
         object_type = entry.get("objectType")
         if not isinstance(object_type, str) or not object_type.strip():

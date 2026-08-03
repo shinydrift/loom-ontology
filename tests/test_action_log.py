@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ from loom.action import (
     UNKNOWN_ACTOR,
     ActionRuntime,
     EditLog,
+    build_runtime,
 )
 from loom.action.log import commit_properties
 from loom.catalog.base import (
@@ -40,7 +42,9 @@ from loom.catalog.base import (
     edit_log_writer_for,
     writer_for,
 )
+from loom.governance import PolicyError
 from loom.ontology import build
+from loom.resolver import build_resolver
 from test_action import FakeRowCatalog, Interloper
 
 VALID = Path(__file__).parent / "fixtures" / "valid"
@@ -94,8 +98,8 @@ def test_the_edit_log_port_cannot_name_a_table(catalog):
     `append_edit` takes columns and one row. There is no table parameter, so an action holding this
     port has nothing to point at `crm.customers` with, and no way to append a *batch* anywhere. That
     is why the log did not reuse `CatalogWriter.append_rows`, which takes both."""
-    params = list(inspect.signature(EditLogWriter.append_edit).parameters)
-    assert params == ["self", "columns", "row"]
+    assert list(inspect.signature(EditLogWriter.append_edit).parameters) == ["self", "columns", "row"]
+    assert list(inspect.signature(EditLogWriter.ensure_log).parameters) == ["self", "columns"]
     assert not hasattr(EditLogWriter, "create_table")
     assert not hasattr(EditLogWriter, "append_rows")
     # And the row port still cannot be used for it: every verb there demands an expectation the log
@@ -104,12 +108,47 @@ def test_the_edit_log_port_cannot_name_a_table(catalog):
         assert "expect_snapshot_id" in inspect.signature(getattr(RowWriter, verb)).parameters
 
 
+def test_the_second_verb_widened_the_port_by_nothing(catalog):
+    """`ensure_log` is `append_edit` with the row taken out, and that is the whole of the argument
+    for adding it to a port whose one-verb shape is load-bearing.
+
+    Same single table, same absent table argument, same DDL that `append_edit` could already reach
+    on its first call. What it buys is the only exact answer to *can this deployment record what it
+    writes* — a probe answers about an instant, and `table_exists` cannot even ask, since `False` is
+    the ordinary state of a catalog whose first append has not happened."""
+    verbs = [n for n in vars(EditLogWriter) if not n.startswith("_") and callable(getattr(EditLogWriter, n))]
+    assert sorted(verbs) == ["append_edit", "ensure_log"]
+    for verb in verbs:
+        assert "table" not in inspect.signature(getattr(EditLogWriter, verb)).parameters
+
+    # And it really is create-without-append: the log exists and holds nothing.
+    EditLog(catalog=catalog, writer=edit_log_writer_for(catalog)).ensure()
+    assert catalog.table_exists(EDIT_LOG_TABLE)
+    assert catalog.edits == []
+
+
+def test_nothing_on_the_edit_log_port_removes_a_record():
+    """The invariant a retention window would have spent, asserted where the port is shaped.
+
+    `_record` writes *after* the commit, and the single thing that buys is that a lost record is
+    findable: the row write stamped `loom.edit_id` into its own Iceberg snapshot, so a stamp with no
+    matching row means one thing. Expire records and it means two — lost, or expired — and the
+    reader holding the stamp cannot tell which. So erasure, which this table genuinely owes, can
+    only ever be a redaction that keeps the row, by a command holding a port that is not this one."""
+    for verb in ("delete_edit", "delete_row", "expire", "redact", "overwrite", "delete_rows"):
+        assert not hasattr(EditLogWriter, verb)
+    assert not hasattr(EditLog, "delete")
+    assert not hasattr(EditLog, "expire")
+
+
 def test_a_catalog_with_no_edit_log_port_still_writes_the_row(ontology):
     """The log is not a precondition of the write, and the failure is typed rather than raised.
 
-    "No log, no write" is a real audit posture, but it is a *policy*, and Loom has a milestone for
-    policies. Wiring it in here would make it something no deployment could turn off — and would
-    mean an action refusing because of a table the spec has never heard of."""
+    That was once argued as "no log, no write is a policy, and Loom has a milestone for policies".
+    The milestone happened, the policy exists — `governance.edit_log: required`, checked at
+    startup — and this behaviour is what the *other* posture means, which is the default. Wiring it
+    in here would still be wrong for the original reason: it would be something no deployment could
+    turn off, and an action refusing because of a table the spec has never heard of."""
 
     class NoLogCatalog(FakeRowCatalog):
         append_edit = None  # not an EditLogWriter: the attribute is not callable
@@ -137,6 +176,110 @@ def test_a_failed_append_does_not_turn_an_applied_run_into_a_failed_one(ontology
     # The id is still on the result, because the *commit* carries it: it is how someone finds this
     # write in the table's history now that the log has not got it.
     assert result.edit_id and failure.detail["editId"] == result.edit_id
+
+
+# ---- the posture: governance.edit_log ------------------------------------------
+
+
+def _config(edit_log="optional"):
+    from loom.config import LoomConfig
+
+    return LoomConfig(edit_log=edit_log)
+
+
+def test_a_required_edit_log_refuses_a_deployment_whose_catalog_has_no_port(ontology):
+    """The structural half, and the only half that is *permanent*.
+
+    A catalog implementing no `EditLogWriter` does not fail a write once — it writes every row and
+    reports `log_failed` afterwards for as long as the deployment lives. That is a fact about the
+    pairing of a spec and a deployment, so it is refused where every other such fact is refused, and
+    the message names the catalog, the actions that write to it, and the posture that permits it."""
+
+    class NoLogCatalog(FakeRowCatalog):
+        append_edit = None
+
+    with pytest.raises(PolicyError) as e:
+        build_runtime(ontology, _config("required"), {"rest_main": NoLogCatalog()})
+
+    message = str(e.value)
+    assert "governance.edit_log is 'required'" in message
+    assert "catalog 'rest_main'" in message and "'upgradeTier'" in message
+    assert "'governance.edit_log: optional'" in message
+
+
+def test_a_required_edit_log_refuses_a_catalog_that_cannot_create_one(ontology):
+    """The physical half, which is provable only by doing it.
+
+    So the check *creates* the table rather than probing for one. `table_exists` asks the wrong
+    question — `False` is the ordinary state of a catalog whose first append has not happened — and
+    creating a table records nothing that might not have happened, which is what keeps this clear of
+    the log-then-write ordering `_record` rejected. An empty log is a permission, not an intention."""
+    with pytest.raises(PolicyError) as e:
+        build_runtime(ontology, _config("required"), {"rest_main": FakeRowCatalog(log_create_fails=True)})
+    assert "cannot be created" in str(e.value)
+
+
+def test_a_required_edit_log_exists_before_the_first_run_rather_than_after_it(ontology):
+    """What the posture buys, stated as the thing an operator can check: by the time `build_runtime`
+    returns, the log is there. Under the default it appears on the first append and not before."""
+    eager = FakeRowCatalog()
+    build_runtime(ontology, _config("required"), {"rest_main": eager})
+    assert eager.table_exists(EDIT_LOG_TABLE) and eager.edits == []
+
+    lazy = FakeRowCatalog()
+    build_runtime(ontology, _config(), {"rest_main": lazy})
+    assert not lazy.table_exists(EDIT_LOG_TABLE)
+
+
+def test_a_required_edit_log_changes_nothing_after_the_write(ontology):
+    """The boundary the posture cannot cross, and it is not a limitation — it is `_record`'s
+    argument, which no config weakens.
+
+    A log that could be created and then refuses a record is exactly the window `require_edit_log`
+    says it does not close. By the time the append runs the row has committed, so `failed` would
+    tell a caller to retry a delete that already happened. It stays `applied` + `log_failed` under
+    either posture, and what is recoverable stays recoverable: the commit carries the `edit_id`, so
+    the missing record is a gap somebody can find."""
+    catalog = FakeRowCatalog(log_fails=True)
+    runtime = build_runtime(ontology, _config("required"), {"rest_main": catalog})
+    result = runtime.run("upgradeTier", {"customer": "c1", "newTier": "silver"})
+
+    assert result.status == APPLIED and result.ok
+    assert [f.code for f in result.failures] == [LOG_FAILED]
+    assert catalog.row("crm.customers", "id", "c1")["tier"] == "silver"
+    assert result.edit_id
+
+
+def test_a_spec_that_declares_no_action_has_nothing_for_the_posture_to_be_about(ontology):
+    """An empty subject rather than a lenient answer. A spec with no actions writes nothing, so
+    there is no run this posture could refuse and no catalog it could demand a log of — including a
+    catalog that could not provide one."""
+
+    class NoLogCatalog(FakeRowCatalog):
+        append_edit = None
+
+    readonly = replace(ontology, actions={})
+    assert build_runtime(readonly, _config("required"), {"rest_main": NoLogCatalog()}).catalogs
+
+
+def test_a_catalog_the_config_never_declared_is_one_fault_and_is_reported_once(ontology):
+    """An unwritable deployment rather than an unloggable one, so this check stays quiet about it.
+
+    Every run of those actions already fails with `catalog_for`'s message, which names the missing
+    catalog and says where to declare it. Refusing here as well would report one fault as two, and
+    the second report would be the less useful one — "cannot record what it writes" is a strange way
+    to say "there is no catalog to write to"."""
+    assert build_runtime(ontology, _config("required"), {}).catalogs == {}
+
+
+def test_the_read_plane_is_not_asked_about_a_log_it_cannot_write(ontology):
+    """The one governance key that binds a single plane, asserted as an absence.
+
+    `build_resolver` binds masks and row filters because a read is what they withhold from. It has
+    no business with `edit_log`: the read plane writes no rows, so it produces no records, so there
+    is nothing it could fail to record. A resolver refusing to build over an unloggable catalog
+    would make `loom query` unusable to protect an audit trail it never touches."""
+    assert "edit_log" not in inspect.getsource(build_resolver)
 
 
 # ---- what is recorded, and what is not -----------------------------------------

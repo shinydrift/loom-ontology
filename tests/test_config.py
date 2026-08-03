@@ -245,11 +245,13 @@ def test_governance_policies_are_parsed(tmp_path: Path):
 
 def test_unenforceable_policy_keys_refuse_to_start(tmp_path: Path):
     """Silently ignoring an access policy is worse than not booting, and that did not change when
-    enforcement landed — it moved down to the key. An audit clause Loom cannot honour reads, to
-    whoever wrote it, exactly like one it obeyed.
+    enforcement landed — it moved down to the key. A clause Loom cannot honour reads, to whoever
+    wrote it, exactly like one it obeyed.
 
-    `rows` used to be one of these and is now enforced, which is what a reservation is for: the
-    config that named it was refused, so nobody was running one when the meaning arrived."""
+    Three of the four fates a key can have are in this one config. `rows` was reserved and is now
+    **enforced**, which is what a reservation is for: the config that named it was refused, so
+    nobody was running one when the meaning arrived. `when` is still reserved, and says so. `audit`
+    **left** — see `governance.MOVED_KEYS` — because neither half of what it named is a policy."""
     _, diag = _load(
         tmp_path,
         """
@@ -264,9 +266,61 @@ def test_unenforceable_policy_keys_refuse_to_start(tmp_path: Path):
               when: "principal.id == 'analyst'"
         """,
     )
-    assert any("'audit'" in e.message and "not enforced yet" in e.message for e in diag.errors)
+    assert any("'audit'" in e.message and "no longer a policy key" in e.message for e in diag.errors)
     assert any("'when'" in e.message and "attest" in e.message for e in diag.errors)
     assert not any("'rows'" in e.message for e in diag.errors)
+
+
+def test_the_edit_log_posture_is_optional_unless_a_deployment_says_otherwise(tmp_path: Path):
+    """`mcp.writes`' default, for `mcp.writes`' reason.
+
+    An upgrade and a catalog that implements no edit-log port are two things that happen for
+    unrelated reasons, and a deployment that never asked for this posture is not asking to stop
+    working."""
+    config, diag = _load(tmp_path, "catalogs: { c: { type: iceberg-rest, uri: x } }")
+    assert diag.errors == [] and config.edit_log == "optional"
+
+    config, diag = _load(
+        tmp_path,
+        """
+        catalogs: { c: { type: iceberg-rest, uri: x } }
+        governance:
+          edit_log: required
+        """,
+    )
+    assert diag.errors == [] and config.edit_log == "required"
+
+
+def test_an_edit_log_posture_loom_cannot_read_is_refused_rather_than_defaulted(tmp_path: Path):
+    """The same rule the block itself follows: a config that is silently ignored reads, to whoever
+    wrote it, exactly like one that was obeyed — and this is the key where being ignored means
+    writing unrecorded rows into somebody's lake.
+
+    A boolean is refused with the rest, and that is the naming decision showing through: this key
+    is a posture about a deployment, not a switch that could be true. `edit_log: true` would have to
+    mean "required", and a config that has to be interpreted is one this grammar declines to
+    interpret."""
+    _, diag = _load(
+        tmp_path,
+        """
+        catalogs: { c: { type: iceberg-rest, uri: x } }
+        governance:
+          edit_log: requried
+        """,
+    )
+    (problem,) = [e for e in diag.errors if "edit_log" in e.message]
+    assert "optional, required" in problem.message
+    assert "did you mean 'required'?" in (problem.hint or "")
+
+    _, diag = _load(
+        tmp_path,
+        """
+        catalogs: { c: { type: iceberg-rest, uri: x } }
+        governance:
+          edit_log: true
+        """,
+    )
+    assert any("edit_log" in e.message for e in diag.errors)
 
 
 def test_a_malformed_mask_is_reported_rather_than_crashing(tmp_path: Path):

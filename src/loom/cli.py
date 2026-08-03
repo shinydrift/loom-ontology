@@ -345,21 +345,40 @@ def cmd_serve(args) -> int:
 
 
 def _write_mode(config, ontology) -> list[str]:
-    """The two sentences the banner needs about writes, and the actor they will be recorded under."""
+    """The sentences the banner needs about writes, the actor they will be recorded under, and
+    whether this deployment would rather refuse than write unrecorded.
+
+    The edit-log line is printed whatever `mcp.writes` says, because `governance.edit_log` binds the
+    runtime and not the surface — `loom run` against this config meets it too. It is worded as the
+    startup fact it is: by the time this banner prints, every catalog an action writes to has been
+    proved able to hold a log."""
+    from .governance import EDIT_LOG_REQUIRED
+
     actions = len(ontology.actions)
     if not config.mcp.writes:
         if not actions:
             return ["read-only · the spec declares no action"]
-        return [
+        lines = [
             f"read-only · mcp.writes is false, so {actions} declared action(s) are not exposed",
             "  (`loom run` still reaches them — the runtime is not what is switched off, the surface is)",
         ]
-    who = (
-        f"recorded as actor '{config.mcp.actor}'"
-        if config.mcp.actor
-        else "recorded as actor 'unknown' — set mcp.actor to say who this deployment writes as"
-    )
-    return [f"writes enabled · {actions} action(s) exposed, every run {who}"]
+    else:
+        who = (
+            f"recorded as actor '{config.mcp.actor}'"
+            if config.mcp.actor
+            else "recorded as actor 'unknown' — set mcp.actor to say who this deployment writes as"
+        )
+        lines = [f"writes enabled · {actions} action(s) exposed, every run {who}"]
+    if actions and config.edit_log == EDIT_LOG_REQUIRED:
+        lines.append(
+            "edit log required · every catalog an action writes to holds one, or this server does "
+            "not start"
+        )
+        lines.append(
+            "  (checked before a write, never promised after one — an append that fails once the "
+            "row has committed still reports 'log_failed')"
+        )
+    return lines
 
 
 def _governance_mode(resolver) -> list[str]:

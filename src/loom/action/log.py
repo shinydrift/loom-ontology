@@ -4,7 +4,7 @@
 data, and this is that: an append-only Iceberg table per catalog, sitting in the namespace Loom
 already owns, holding one row per run.
 
-Five decisions shape it, and each had an obvious-looking alternative:
+Six decisions shape it, and each had an obvious-looking alternative:
 
 - **It is written through a port of its own.** Not `RowWriter.insert_row` (which requires a snapshot
   expectation nobody holds, and would let a busy log table refuse the write it exists to describe),
@@ -30,6 +30,15 @@ Five decisions shape it, and each had an obvious-looking alternative:
   today can never reach a log table that already exists — the same trap `_loom_meta.applied` names.
   So the schema below is deliberately generous, everything but two columns is optional, and anything
   still unsettled goes inside a JSON column rather than waiting for a column that can never arrive.
+
+- **The rows are forever too, and that is a sixth decision rather than an omission.** Nothing here
+  or on the port removes a record. `_record` writes after the commit so that a lost record is a
+  *findable* gap — the row write stamped `loom.edit_id` into its own Iceberg snapshot, so a stamp
+  with no matching row means one thing — and an expiry that deleted rows would make an expired edit
+  and a lost edit the same sight. So the erasure this table genuinely owes (§9.2: declared
+  properties outlive the row they describe) can only ever be a **redaction in place** — the row
+  kept, its payload emptied — by a command Loom has not built, holding a port that is not the
+  runtime's. `require_edit_log` below is the half of that question this milestone did answer.
 """
 
 from __future__ import annotations
@@ -41,11 +50,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from ..catalog.base import EDIT_LOG_TABLE, Column
+from ..catalog.base import EDIT_LOG_TABLE, CatalogError, Column, edit_log_writer_for
 from ..migrate.meta import loom_version
 
 if TYPE_CHECKING:
     from ..catalog.base import Catalog, EditLogWriter
+    from ..model import Ontology
 
 UNKNOWN_ACTOR = "unknown"
 """Recorded when no caller supplied an actor.
@@ -203,6 +213,16 @@ class EditLog:
         rows = self.catalog.scan(EDIT_LOG_TABLE).to_pylist()
         return tuple(sorted(rows, key=lambda r: (r.get("recorded_at") or datetime.min, r.get("edit_id") or "")))
 
+    def ensure(self) -> None:
+        """Make sure this catalog can hold a log, by making one. Idempotent.
+
+        Called before any run rather than during one — see `require_edit_log`, which is the only
+        caller and carries the argument for why a deployment proves this at startup instead of
+        probing it per write."""
+        if self.writer is None:  # pragma: no cover - the caller resolves a writer first
+            raise RuntimeError("EditLog has no writer — nothing can be created")
+        self.writer.ensure_log(EDIT_COLUMNS)
+
     def record(self, entry: EditRecord) -> None:
         """Append one record, creating the log table if this catalog has never held one.
 
@@ -212,6 +232,81 @@ class EditLog:
         if self.writer is None:  # pragma: no cover - the runtime resolves a writer before calling
             raise RuntimeError("EditLog has no writer — nothing can be recorded")
         self.writer.append_edit(EDIT_COLUMNS, entry.row())
+
+
+def require_edit_log(ontology: Ontology, catalogs: Mapping[str, Catalog]) -> None:
+    """`governance.edit_log: required` — refuse a deployment that cannot record what it writes.
+
+    **What this can promise, and what nothing can.** Iceberg has no transaction spanning a row's
+    table and `_loom_meta.edits`, so *every applied run is logged* is not available at any price and
+    this check does not claim it. What it claims is exact and is about a deployment rather than a
+    run: **one that cannot log does not start.** Unloggability comes in two kinds, and both are
+    knowable *before* any row is written, which is what makes this a startup question rather than a
+    per-run one:
+
+    - **Structural**, and permanent — the catalog implements no `EditLogWriter`, so every run
+      against it writes its row and reports `log_failed` afterwards for as long as the deployment
+      lives. A fact about the pairing of a spec and a deployment, checked where every other such
+      fact is checked.
+    - **Physical**, and provable only by doing it — the `_loom_meta` namespace cannot be created, or
+      the table cannot be. So this *creates the table* rather than probing for it. Creating one
+      records nothing that might not have happened, so it does not reopen the ordering `_record`
+      chose: an empty log is a permission, not an intention.
+
+    **The per-run probe was refused, and not only because it narrows the window rather than closing
+    it.** The deeper objection is that it is nearly blind. The log lives in the *same catalog* as
+    the row it describes, so a catalog nobody can reach already fails the row write itself, with
+    nothing written and nothing to record. The failures worth catching are specific to the log
+    table, and the only probe that sees those is an append — which is log-then-write, a table of
+    intentions that may never have happened. So the whole of this posture is spent at startup, and
+    no round trip is added to the path of every action.
+
+    **Nothing after the write changes, under either posture.** `_record` still runs after the commit,
+    and an append that fails there still comes back as `log_failed` beside an unchanged status,
+    because *the row committed, so `failed` would tell a caller to retry a delete that already
+    happened* is not an argument a policy weakens. What survives that window is what always survived
+    it: the row write stamped `loom.edit_id` into its own Iceberg commit, so a lost record is a
+    stamped snapshot with no matching row — a gap a reader can find. Which is also why no Loom
+    command deletes from this table: an expired record and a lost one would be the same sight.
+
+    Raises `PolicyError`, and collects every catalog rather than the first, for `check_capabilities`'
+    reason: an operator reconciling a posture with a deployment should learn the whole of what
+    disagrees in one reading."""
+    from ..governance import PolicyError
+
+    # Which catalogs this deployment could ever write to, and what would do the writing. A spec that
+    # declares no action leaves this empty and the posture refuses nothing — not a lenient answer,
+    # an empty subject.
+    demanded: dict[str, list[str]] = {}
+    for action in ontology.actions.values():
+        target = ontology.object_types.get(action.target_object_type)
+        if target is None:  # pragma: no cover - validator-enforced
+            continue
+        demanded.setdefault(target.backing_catalog, []).append(action.api_name)
+
+    problems: list[str] = []
+    for name in sorted(demanded):
+        catalog = catalogs.get(name)
+        if catalog is None:
+            # A catalog the config never declared already fails every run of those actions, with
+            # `ActionRuntime.catalog_for`'s message. That is an unwritable deployment rather than an
+            # unloggable one, and restating it here would report one fault as two.
+            continue
+        by = ", ".join(f"'{a}'" for a in sorted(demanded[name]))
+        try:
+            EditLog(catalog=catalog, writer=edit_log_writer_for(catalog)).ensure()
+        except CatalogError as e:
+            problems.append(f"catalog '{name}' (written by action(s) {by}) — {e}")
+
+    if not problems:
+        return
+    lines = ["governance.edit_log is 'required' and this deployment cannot record what it writes:"]
+    lines += [f"  - {p}" for p in problems]
+    lines.append("Every catalog an action writes to has to be able to hold its own")
+    lines.append(f"'{EDIT_LOG_TABLE}'. Point those catalogs at a backend Loom can append to, or set")
+    lines.append("'governance.edit_log: optional' — under which a run whose record cannot be")
+    lines.append("written still happens and reports 'log_failed' afterwards.")
+    raise PolicyError("\n".join(lines))
 
 
 def render_key(key: Any) -> str:

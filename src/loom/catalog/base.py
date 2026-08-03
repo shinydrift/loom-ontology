@@ -329,9 +329,21 @@ class EditLogWriter(Protocol):
     - `append_rows` here. It takes a table name and a batch, which is exactly the pair the runtime
       must not hold: with it, an action can append rows into any table the spec names.
 
-    Hence one verb, singular, with **no `table` argument at all**. There is nothing to point at the
-    wrong table with. `columns` comes from the caller because the log's schema is a policy decision
-    and belongs above the port; the location does not, and stays here as `EDIT_LOG_TABLE`.
+    Hence **no `table` argument at all**, on any verb. There is nothing to point at the wrong table
+    with. `columns` comes from the caller because the log's schema is a policy decision and belongs
+    above the port; the location does not, and stays here as `EDIT_LOG_TABLE`.
+
+    **The second verb widens nothing, which is why there is one.** `ensure_log` is `append_edit`
+    with the row taken out: same single table, same absent table argument, same DDL that was already
+    reachable. It buys `governance.edit_log: required` the only exact answer to *can this deployment
+    record what it writes* — see `action.log.require_edit_log` — and it adds no reach a caller of
+    this port did not already have. `test_action_log.py` asserts the pair rather than trusting it.
+
+    **And there is no third verb, permanently.** Nothing here removes a record. An expired edit and
+    a lost one would be the same sight to a reader holding a stamped snapshot with no matching row,
+    and that distinction is the entire reason `ActionRuntime._record` writes after the commit rather
+    than before it. A retention window is therefore a command Loom has not built, holding a port
+    that is not this one, and never a verb an action can reach.
 
     **What it costs.** The port creates its table on first append, so an action can cause a `CREATE
     TABLE` — DDL from the write path, which the three-ports rule was written to prevent. The cost is
@@ -351,6 +363,20 @@ class EditLogWriter(Protocol):
         nothing and is overwriting nothing. `columns` is the table's full schema in order, supplied
         on every call and consulted only on the first — the port stays stateless and never has to
         know what a Loom edit record contains."""
+        ...
+
+    def ensure_log(self, columns: Sequence[Column]) -> None:
+        """Create `EDIT_LOG_TABLE` with `columns` if it is not there, and append nothing.
+
+        Idempotent, and the half of `append_edit` that can be done in advance. It exists because
+        *can this catalog hold an edit log* has no honest answer short of making one: `table_exists`
+        asks the wrong question, since `False` is the ordinary state of a catalog whose first append
+        has not happened, and a probe answers about an instant rather than a permission.
+
+        Creating a table records **nothing that might not have happened**, which is what keeps this
+        clear of the log-then-write ordering `ActionRuntime._record` rejected. An empty log is not a
+        table of intentions; it is a permission, checked once, somewhere a deployment can still
+        refuse to start."""
         ...
 
 

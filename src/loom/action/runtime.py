@@ -231,10 +231,20 @@ class ActionRuntime:
 
         **A failed append does not fail the action.** By the time this runs the row has committed;
         returning `failed` would tell a caller to retry a delete that already happened. It comes back
-        as a non-retryable `log_failed` beside an otherwise unchanged status — and the same for a
-        catalog that implements no `EditLogWriter`, because making the log a precondition of the
-        write is a policy ("no log, no write") that belongs in M5 with the other policies, not wired
-        in here where nobody can turn it off."""
+        as a non-retryable `log_failed` beside an otherwise unchanged status.
+
+        **And that stays true under `governance.edit_log: required`**, which is where "no log, no
+        write" landed. A deployment can now demand that it be *able* to record — checked at startup
+        by `log.require_edit_log`, before any row is written — but nothing a config says can move
+        this branch, because the argument against `failed` here is about a row that has already
+        committed and no posture changes that. So the policy is spent entirely before the write, and
+        the only promise it makes is one about a deployment rather than about a run.
+
+        **Nothing removes what this appends, either.** The ordering above buys exactly one thing —
+        a lost record is a stamped snapshot with no matching row, and therefore findable — and a
+        retention window that deleted rows would spend it, by making an expired record and a lost
+        one indistinguishable to the reader holding that stamp. That is why the edit-log port has no
+        delete verb and is not getting one; see `catalog.base.EditLogWriter`."""
         if not run.addressed:
             return result
         entry = EditRecord(
@@ -826,12 +836,21 @@ def build_runtime(ontology: Ontology, config, catalogs: Mapping[str, Any] | None
     not to be. Both call this now.
 
     The pairing is checked even though nothing on this path reads a policy at bind time: a mask that
-    an action contradicts is a refusal, and the write plane is where that contradiction lives."""
-    from ..catalog import open_catalogs
-    from ..governance import bind_policies
+    an action contradicts is a refusal, and the write plane is where that contradiction lives.
 
-    return ActionRuntime(
-        ontology=ontology,
-        catalogs=catalogs if catalogs is not None else open_catalogs(config),
-        policies=bind_policies(ontology, config.policies),
-    )
+    **`governance.edit_log` is checked here and nowhere else**, which makes it the one governance
+    key that binds a single plane. `build_resolver` has no business with it: the read plane writes
+    no rows, so it produces no records, so there is nothing it could fail to record. The check is
+    `log.require_edit_log`, and what it can honestly promise is written up there rather than here."""
+    from ..catalog import open_catalogs
+    from ..governance import EDIT_LOG_REQUIRED, bind_policies
+    from .log import require_edit_log
+
+    open_cats = catalogs if catalogs is not None else open_catalogs(config)
+    # Policies first, deliberately: a policy that does not fit the spec is decided without touching
+    # a catalog, and an operator with both problems should not have to fix a metastore to be told
+    # about the typo in their mask.
+    policies = bind_policies(ontology, config.policies)
+    if config.edit_log == EDIT_LOG_REQUIRED:
+        require_edit_log(ontology, open_cats)
+    return ActionRuntime(ontology=ontology, catalogs=open_cats, policies=policies)
