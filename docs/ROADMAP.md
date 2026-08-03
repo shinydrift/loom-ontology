@@ -1034,6 +1034,173 @@ turns out no policy can say):
 
 ---
 
+## 🔵 In progress — M6: A per-caller identity over MCP
+
+*Goal: a caller this deployment checked, and a policy that can name one.*
+
+M5 closed with `when:` as the only key left in `RESERVED_KEYS`, and with a sentence on both sides of
+the same contradiction: the resolver receives no identity "deliberately and now permanently for
+everything §6.1 can express", while `when:` is by construction outside that set. Four questions had
+to be settled before any of it could be built, and two of them ended in refusals.
+
+**1. Does a principal reach the resolver? No — a decided `PolicySet` does.**
+
+M5 promised two things and only one is load bearing. *The resolver receives no identity* is the
+claim; *the `PolicySet` is the same for every call* was a **consequence**, and `PolicySet.masks`
+already named the condition under which it lapses ("the thing that stops being true when a principal
+arrives per call"). So the consequence gives way and the claim survives.
+
+`bind_policies` splits by *time*, not by responsibility. Bind time keeps every static spec × config
+refusal — all four mask refusals, the predicate subset, undeclared properties, the primary-key rule —
+in `build_resolver`, unchanged, firing whether or not a caller ever arrives. Per call adds only
+*selection*: which already-bound policies apply. Every enforcement site (`Resolver._projection`,
+`Resolver._table`, `_Run._project`, `_Run._admitted`) is untouched, because what reaches them is
+still a set that is already decided.
+
+What makes this sound rather than a technicality: **a principal is constant for the duration of a
+call**, so everything it conditions folds before the call begins — including the hardest case, a row
+predicate naming the caller (`object.ownerId == principal.subject`), which substitutes to a literal
+at selection time. There is no policy shape that needs an identity *at* the enforcement site. The
+alternative — threading a principal down into the resolver — would add a second axis to "enforced one
+rung below every surface that asks" and buy nothing.
+
+The assertion that makes it cheap: a program with no conditional policies returns the **same
+`PolicySet` object** for every caller, so M5's deployment-scoped path is provably unchanged rather
+than argued to be equivalent.
+
+**2. A surface that cannot attest refuses a `when:` config. (Refusal.)**
+
+The tempting alternative — treat an unattested caller as principal-less and apply only the
+unconditional policies — is disqualified by M5's own invariant rather than by taste. **Policies
+subtract, never add.** Every `when:` policy is *"under condition C, withhold X"*, so skipping the
+conditional ones gives the unattested caller **less subtraction — it sees more**. `loom query`
+becomes precisely the way to read what the governed MCP surface withholds: the back door the whole
+read path was built not to be.
+
+Fail-closed (an undecidable `when:` applies) was considered and rejected. It mirrors §6.1's "a row is
+admitted only on true", but that rule exists because *per row there is no channel and per call the
+report is itself an oracle*. Neither bind holds here: `loom query` knows, before reading anything,
+that it can never attest anybody. That is not undecided — it is **decidably unattestable, at bind,
+with a channel to report it**, and where this codebase can decide at pairing time and has somewhere
+to print, its posture is refuse.
+
+Two things this sharpens. It is **not** "direct commands vs MCP": a spawned stdio server carries no
+bearer token either, so the predicate is *can this surface attest* — which is why it landed as
+`McpConfig.attests` rather than as a condition three call sites re-derive. And it is the **first
+surface-conditioned refusal** in the codebase; `writes` on a non-loopback bind is config-level, so
+that precedent is weaker than it looks. The defence is the distinction `governance.py` has now drawn
+three times: this makes the file mean **one** thing and makes two surfaces refuse it *loudly*. A
+refusal is loud; a filter is silent. "One meaning, two refusals" is not "two meanings" — nothing
+reads differently anywhere; some things do not read at all.
+
+**3. Loom validates tokens itself, as a resource server that is never an authorization server.
+(Refusal.)**
+
+The middle was looked for and does not exist. A proxy that validates and injects a header requires
+Loom to distinguish *from the proxy* from *from a client*, and on any bind it can have it cannot — a
+loopback port is reachable by everything on the machine, which `McpConfig` already says it cannot
+bound. Making the header trustworthy needs mTLS or a shared secret, which is Loom validating a
+credential after all, with worse cryptography than the one it was avoiding. So the middle collapses
+into *read a header and trust a claim* — the client-supplied actor spec-v0 rejects by name — or into
+this. **There is no trusted-proxy mode and none is coming.**
+
+"Validate" and "refuse to be an auth server" turn out to be the same decision, not opposed ones, and
+the line that makes them so is MCP's own profile: Loom issues nothing, stores no credential, has no
+user store, no login, no refresh, no consent, and no way to mint anything. Its second half is
+`ALGORITHMS`: **asymmetric only**, because a symmetric algorithm verifies with the key that signs,
+and a deployment holding one would be an authorization server in the only sense that matters.
+
+**4. Per-call scope, not per-call construction — and the alias problem is not this milestone's.**
+
+Per-call construction fails on its own merits: a `Resolver` per call means catalogs and an engine per
+call, and it does not fix the `t0`/`t1`/`m0` race — it multiplies the racers.
+
+More importantly, **a prediction made twice was wrong and is corrected where it was written**
+(`build_server`, `build_mcp_server`, and spec-v0's open edge). Those said the milestone attesting a
+principal would have to make the per-process objects per-caller *and* fix the DuckDB aliases "anyway".
+It did not. Two forces were being treated as one: what forces per-caller objects is a policy that
+varies *by* caller; what forces the alias fix is two calls *in flight at once*. A per-call principal
+is neither. Handlers are still synchronous, nothing overlaps, and the alias problem belongs to
+whatever milestone makes a handler `async`. That correction is worth roughly half the milestone.
+
+---
+
+### First slice — attestation, with a source and a reader (this PR)
+
+Sliced this way for a reason worth recording, because it is **not** the seam-first plan this
+milestone was scoped with. A seam-only slice — `PolicyProgram`, per-call selection, `when:` still
+refused — would introduce a `Principal` type nothing produces and a selection with one possible
+argument: structure whose second case does not exist, which is this codebase's own
+*no field written and never read*, one level up. The seam's only consumer is `when:`, and `when:`
+cannot ship before a principal has a source. So the source ships first; the seam ships with the
+clause that needs it. Decisions 1 and 4 are *settled* here and *built* next, which is the order the
+milestone asked for — settle before the token work, not after.
+
+- **`mcp.auth`** — `issuer`, `audience`, `jwks_uri`, `clock_skew`. All required, none derived.
+  Discovery is deliberately absent: it makes startup follow a redirectable document to find a URL it
+  will then fetch keys from, and it is the only part of this that could silently *move* where keys
+  come from.
+- **`auth.TokenVerifier`** — `iss`, `aud`, `exp`/`nbf` within a bounded skew, signature, closed
+  algorithm allow-list, JWKS refetch on an unknown `kid` rate-limited to once a minute. The rate
+  limit is the whole defence there: the `kid` is caller-supplied, so without it a caller holding no
+  valid token could drive one issuer fetch per call. **`aud` is the load-bearing check** — without
+  it, a token minted for any other service by the same issuer is accepted here.
+- **The MCP SDK supplies the plumbing and none of the judgement.** `BearerAuthBackend`,
+  `AuthContextMiddleware` and `RequireAuthMiddleware` were already there; what no SDK can decide is
+  whether a token is *believable*, which is the whole of `auth.py`. A token is **required** where
+  `auth:` is declared — accepting unauthenticated callers beside authenticated ones would give one
+  deployment two classes of caller, and the un-tokened class would run the same writes recorded as
+  nobody.
+- **`principal` in `_loom_meta.edits`, beside `actor` and never instead of it.** `actor` is true
+  about a deployment and `principal` about a caller; both are true at once, and a log holding only
+  the first cannot tell two callers of one deployment apart. Issuer-qualified (`{iss}#{sub}`),
+  because a `sub` is unique only per issuer and a bare one silently merges two people the day a
+  second issuer is trusted.
+- **A public bind may write, once its callers are attested.** spec-v0 promised exactly this ("a
+  public one may not, *until this closes*"). The M4 refusal narrowed rather than moved: the bind
+  still decides whether the question is asked.
+
+Three things found by building it, each of which changed the code:
+
+- **A pre-existing log table would have swallowed the principal in silence.** `append_edit` builds
+  its Arrow batch against the *table's own* schema and `pa.Table.from_pylist` drops keys that schema
+  lacks, so a log created before this slice accepts every append, reports success, and discards the
+  caller — leaving a record indistinguishable from a run that genuinely had none. That is the trap
+  this module already named as *the columns are forever*. The fix is a **refusal**
+  (`require_principal_column`, in `build_runtime`, only when the deployment attests), not a widened
+  port: giving `EditLogWriter` a verb that alters a table would spend the guarantee that keeps DDL
+  out of the action runtime's reach. A test pins the silent drop, so the refusal can go the day it
+  stops being true.
+- **`RequireAuthMiddleware` does not guard on `scope["type"]`.** Mounted app-wide it answers the ASGI
+  *lifespan* scope with a `401`, the session manager's task group never starts, and every request
+  fails with *Task group is not initialized* — a startup failure that surfaces as a `500` on the
+  first tool call. Starlette's own `AuthenticationMiddleware` guards against exactly this. So the
+  stack wraps the **route's endpoint** rather than the app.
+- **The contextvar reaches a synchronous handler, and that is now asserted rather than assumed.**
+  Contextvars propagate to tasks created *from* the setting context and not to tasks that already
+  exist, so "the handler sees the right principal" is a claim about how the SDK dispatches. Two
+  overlapping clients with different subjects, each finding its own name in its own edit record, is
+  the test that fails if it stops holding. It is also the first value in this codebase that differs
+  between two calls of one process — the shape a policy will later be selected by.
+
+`mcp.actor` keeps both properties M5 asserted: **declared, never inferred** (an attested subject is
+neither — it is the third kind spec-v0 named), and it still reaches the edit log. What it no longer
+does is reach it *alone*.
+
+### Next slice — `when:`, and the seam it needs
+
+- `bind_policies` → a program; per-call selection into the `PolicySet` the resolver already takes;
+  the same-object assertion for programs with no conditional policies.
+- The `when:` grammar over the principal's claims, and the fold that turns a principal-valued
+  predicate into a literal.
+- The refusal from decision 2, at the pairing point, for every surface that cannot attest.
+- `when:` moves `RESERVED_KEYS` → `ENFORCED_KEYS`, which **empties** `RESERVED_KEYS` and leaves
+  `Reserved` a dataclass nothing constructs. That is the `loom.managed` shape this codebase has
+  already paid for once, so the slice either deletes the machinery or writes down why it stays. The
+  partition test holds either way; `MOVED_KEYS`/`audit` is unaffected.
+
+---
+
 ## Backlog — spec edges (from spec-v0 §"Open edges")
 
 Consciously deferred in v0; each is a self-contained follow-up:

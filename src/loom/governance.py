@@ -18,12 +18,31 @@ not have.
 
 So what M5 enforces is **deployment-scoped**: one `loom.yaml` filters one way, for every caller of
 it, and you serve two audiences by running two deployments. `mcp.actor` gains no second reader — it
-remains a string an operator declared about a deployment, reaching the edit log and nothing else —
-so nothing here is shaped around a value that an attested per-call principal is going to replace.
-When that lands, it arrives as a new *source* for a principal, and `when:` below is the clause it
-turns on. Until then `when:` is refused rather than accepted-and-ignored, which is
-`_check_governance`'s own posture one level down: a config that is silently ignored reads, to
-whoever wrote it, exactly like one that was obeyed.
+remains a string an operator declared about a deployment, reaching the edit log and nothing else.
+
+**A principal now has a source, and `when:` is still refused — the two are less connected than this
+docstring first assumed.** M6's first slice landed `mcp.auth`: a bearer token verified against an
+issuer's key set, over the one transport that can carry one, recorded in the edit log beside
+`mcp.actor`. What that changed here is *nothing yet*, and the reason is the paragraph above rather
+than a missing slice: `loom query`, `loom run` and a stdio server still cannot attest anybody, so a
+`when:` policy would filter one surface and be skipped on three. That is why the slice that turns it
+on also **refuses** to build any surface that cannot attest against a config carrying it — one file
+meaning one thing, with two surfaces declining it, rather than one file meaning two things depending
+on who reads it. The invariant that forces the refusal is this module's own: *policies subtract,
+never add*, so skipping a conditional policy would leave the unattested caller seeing **more**, and
+`loom query` would be the way around the filter.
+
+Until that slice, `when:` is refused rather than accepted-and-ignored, which is `_check_governance`'s
+own posture one level down: a config that is silently ignored reads, to whoever wrote it, exactly
+like one that was obeyed.
+
+**When it lands, a principal still will not reach the resolver, and that is now permanent rather
+than pending.** What varies per call is a decided `PolicySet`, selected *above* the resolver — which
+works because a principal is constant for the duration of a call, so everything it conditions folds
+before the call begins, including a predicate that names the caller. Every enforcement site below
+stays as it is, reading a set that is already decided. The M5 sentence that gives way is the one on
+`PolicySet.masks` — *resolved once at bind* becomes *resolved once per caller* — and it gives way
+exactly where it predicted it would.
 
 **Two rules decide almost everything else.**
 
@@ -145,10 +164,13 @@ coming. The honest end of a reservation names its destination, rather than falli
 
 RESERVED_KEYS: Mapping[str, Reserved] = {
     "when": Reserved(
-        why="a principal-conditioned policy needs a caller this deployment can attest, and neither "
-        "transport Loom speaks authenticates anybody",
+        why="a principal-conditioned policy needs a caller every surface of this deployment can "
+        "attest, and only an HTTP transport with 'mcp.auth' can — 'loom query', 'loom run' and a "
+        "stdio server can never attest anybody, so a policy conditioned on a caller would filter "
+        "one surface and be skipped on three",
         hint="policies are deployment-scoped: run one deployment per audience, with the policies "
-        "that audience gets, until an authenticated transport lands",
+        "that audience gets. 'mcp.auth' now attests a caller and records it in the edit log; what "
+        "is not built yet is conditioning a policy on one",
     ),
 }
 """Every other key, with the reason it is refused.
@@ -213,6 +235,14 @@ class PolicySet:
     withheld it. Resolved once at bind rather than per read, because the answer cannot change
     between two calls of a process — which is a consequence of policies being deployment-scoped, and
     the thing that stops being true when a principal arrives per call.
+
+    That condition is now half met and the sentence is still true, which is worth stating because it
+    is the seam the next slice cuts on. `mcp.auth` attests a principal per call, but no policy is
+    conditioned on one, so the resolution still cannot change between two calls. When `when:` lands,
+    what changes is *when* this is resolved and never *where* it is read: a `PolicySet` stays a
+    decided, frozen set that the resolver holds, and the selection moves one rung above it. A
+    program with no conditional policies will return the same object for every caller, so this class
+    keeps meaning exactly what it means today for every config that exists.
 
     `filters` is the same statement for rows: object type -> the policies that filter it, in
     declared order, each with the expression it filters by. Kept as a list rather than pre-combined

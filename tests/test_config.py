@@ -404,3 +404,107 @@ def test_unreadable_and_malformed_files_report_rather_than_raise(tmp_path: Path)
     cfg2, diag2 = _load(tmp_path, "- just\n- a\n- list\n", name="other.yaml")
     assert cfg2 is None
     assert any("must be a mapping" in e.message for e in diag2.errors)
+
+
+# ---- mcp.auth ------------------------------------------------------------------------
+
+AUTH_BASE = """
+version: 0
+catalogs:
+  main: {type: iceberg-rest, uri: https://catalog.internal/api}
+engine: {type: duckdb}
+mcp:
+  transport: http
+%s
+"""
+
+
+def _auth(tmp_path: Path, body: str):
+    return _load(tmp_path, AUTH_BASE % body)
+
+
+def test_auth_needs_an_issuer_an_audience_and_a_key_set(tmp_path: Path):
+    """All three required, none derived. Each names a thing only a deployment can answer."""
+    _, diag = _auth(tmp_path, "  auth:\n    issuer: https://issuer.test\n")
+    text = str(diag)
+    assert "missing required key 'audience'" in text
+    assert "missing required key 'jwks_uri'" in text
+
+
+def test_auth_refuses_a_key_set_fetched_over_cleartext(tmp_path: Path):
+    """Swap the key set in transit and you mint principals, so the fetch has to be protected."""
+    _, diag = _auth(
+        tmp_path,
+        "  auth:\n    issuer: https://issuer.test\n    audience: loom\n"
+        "    jwks_uri: http://issuer.test/jwks.json\n",
+    )
+    assert "not https" in str(diag)
+
+
+def test_auth_allows_a_loopback_key_set_over_http(tmp_path: Path):
+    """The one exception, and the same one `host` already makes: what cannot leave the machine
+    cannot be intercepted off it. It is what makes a local test of the real path possible."""
+    config, diag = _auth(
+        tmp_path,
+        "  auth:\n    issuer: https://issuer.test\n    audience: loom\n"
+        "    jwks_uri: http://127.0.0.1:9999/jwks.json\n",
+    )
+    assert not diag.errors
+    assert config.mcp.auth.jwks_uri == "http://127.0.0.1:9999/jwks.json"
+
+
+def test_auth_bounds_the_clock_skew(tmp_path: Path):
+    """Skew is for drift between two machines. A deployment wanting an hour is asking the wrong
+    system for a longer session."""
+    _, diag = _auth(
+        tmp_path,
+        "  auth:\n    issuer: https://issuer.test\n    audience: loom\n"
+        "    jwks_uri: https://issuer.test/jwks.json\n    clock_skew: 3600\n",
+    )
+    assert "clock_skew" in str(diag)
+
+
+def test_auth_on_stdio_is_refused_rather_than_ignored(tmp_path: Path):
+    """A spawned server carries no bearer token, so `auth:` there could only ever be ignored — and a
+    config that is silently ignored reads, to whoever wrote it, exactly like one that was obeyed."""
+    _, diag = _load(
+        tmp_path,
+        "version: 0\ncatalogs:\n  main: {type: iceberg-rest, uri: https://c.internal/api}\n"
+        "engine: {type: duckdb}\nmcp:\n  transport: stdio\n  auth:\n"
+        "    issuer: https://issuer.test\n    audience: loom\n    jwks_uri: https://issuer.test/jwks.json\n",
+    )
+    assert "carries no bearer token" in str(diag)
+
+
+def test_writes_on_a_public_bind_stay_refused_without_auth(tmp_path: Path):
+    """M4's refusal, unchanged where nothing attests a caller."""
+    _, diag = _auth(tmp_path, "  host: 0.0.0.0\n  allowed_hosts: [loom.internal:8000]\n  writes: true\n")
+    assert "refusing to serve a write surface" in str(diag)
+
+
+def test_writes_on_a_public_bind_are_permitted_once_callers_are_attested(tmp_path: Path):
+    """The refusal M6 narrowed, and the thing this milestone was for.
+
+    spec-v0's open edge said it in as many words — "a loopback HTTP server may write today because
+    its callers are the same set stdio's were; a public one may not, until this closes". `auth:` is
+    what closes it: every caller is checked and recorded by name, so `actor` naming a deployment is
+    no longer the only thing the log would hold."""
+    config, diag = _auth(
+        tmp_path,
+        "  host: 0.0.0.0\n  allowed_hosts: [loom.internal:8000]\n  writes: true\n"
+        "  auth:\n    issuer: https://issuer.test\n    audience: loom\n"
+        "    jwks_uri: https://issuer.test/jwks.json\n",
+    )
+    assert not diag.errors
+    assert config.mcp.writes and config.mcp.attests
+
+
+def test_attests_is_false_for_stdio_whatever_auth_says(tmp_path: Path):
+    """The predicate is about the *surface*, not about the auth block — which is why it is one
+    property rather than a condition three call sites re-derive."""
+    from loom.config import McpAuth, McpConfig
+
+    auth = McpAuth(issuer="https://issuer.test", audience="loom", jwks_uri="https://issuer.test/jwks.json")
+    assert not McpConfig(transport="stdio", auth=auth).attests
+    assert McpConfig(transport="http", auth=auth).attests
+    assert not McpConfig(transport="http").attests

@@ -73,6 +73,14 @@ EDIT_COLUMNS: tuple[Column, ...] = (
     Column("edit_id", "string", required=True),
     Column("recorded_at", "timestamptz", required=True),
     Column("actor", "string", required=False),
+    # Beside `actor`, never instead of it. `actor` is true about a *deployment* and `principal` is
+    # true about a *caller*, and both are true at once — a run arriving through a bot's credentials
+    # at a deployment declared `agent:support-bot` has an honest answer to "which deployment" and an
+    # honest answer to "who", and they are different answers. Collapsing them would make the log
+    # unable to distinguish two callers of one deployment, which is the whole thing this milestone
+    # added. Issuer-qualified (`auth.Principal.label`), because a `sub` is unique only per issuer and
+    # a bare one silently merges two people the day a second issuer is trusted.
+    Column("principal", "string", required=False),
     Column("action", "string", required=False),
     Column("object_type", "string", required=False),
     Column("operation", "string", required=False),
@@ -147,6 +155,12 @@ class EditRecord:
     is here because a refused modify has no `after`, and without it the log records that somebody
     tried without recording what they tried. They are declared parameters of a declared action, so
     they sit in the same vocabulary as declared properties and under the same rule.
+
+    `principal` is the attested caller, and it is `None` on every surface that cannot attest one —
+    `loom run`, `loom query`, and a stdio server, permanently and by construction. Its absence is
+    therefore not a gap in the record but a fact about the deployment that produced it: a log whose
+    rows all carry `None` was written by a deployment where nobody could be named, which is exactly
+    what `actor` beside it already said.
     """
 
     edit_id: str
@@ -166,12 +180,14 @@ class EditRecord:
     after: Mapping[str, Any] | None = None
     failures: Sequence[Mapping[str, Any]] = ()
     loom_version: str = ""
+    principal: str | None = None
 
     def row(self) -> dict[str, Any]:
         return {
             "edit_id": self.edit_id,
             "recorded_at": self.recorded_at,
             "actor": self.actor,
+            "principal": self.principal,
             "action": self.action,
             "object_type": self.object_type,
             "operation": self.operation,
@@ -274,16 +290,7 @@ def require_edit_log(ontology: Ontology, catalogs: Mapping[str, Catalog]) -> Non
     disagrees in one reading."""
     from ..governance import PolicyError
 
-    # Which catalogs this deployment could ever write to, and what would do the writing. A spec that
-    # declares no action leaves this empty and the posture refuses nothing — not a lenient answer,
-    # an empty subject.
-    demanded: dict[str, list[str]] = {}
-    for action in ontology.actions.values():
-        target = ontology.object_types.get(action.target_object_type)
-        if target is None:  # pragma: no cover - validator-enforced
-            continue
-        demanded.setdefault(target.backing_catalog, []).append(action.api_name)
-
+    demanded = _catalogs_actions_write_to(ontology)
     problems: list[str] = []
     for name in sorted(demanded):
         catalog = catalogs.get(name)
@@ -307,6 +314,83 @@ def require_edit_log(ontology: Ontology, catalogs: Mapping[str, Catalog]) -> Non
     lines.append("'governance.edit_log: optional' — under which a run whose record cannot be")
     lines.append("written still happens and reports 'log_failed' afterwards.")
     raise PolicyError("\n".join(lines))
+
+
+def require_principal_column(ontology: Ontology, catalogs: Mapping[str, Catalog]) -> None:
+    """Refuse a deployment that would attest a caller and then fail to record one.
+
+    **This exists because the drop would otherwise be silent, which is the worst available
+    outcome.** `append_edit` builds its Arrow batch against the *table's own* schema, and
+    `pa.Table.from_pylist` ignores keys the schema does not have. So a log table created before this
+    slice — one with no `principal` column — accepts every append, reports success, and discards the
+    attested caller. Nothing fails, nothing warns, and the record says the run had no principal,
+    which is indistinguishable from a run that genuinely had none.
+
+    That is the exact trap this module's docstring named as *the columns are forever*: a column left
+    out yesterday cannot reach a log table that already exists. The escape it named — put unsettled
+    things in a JSON column — does not apply, because a principal is not unsettled, and burying an
+    audited identity inside a JSON blob is a worse answer than a column.
+
+    **So the answer is a refusal rather than a widened port.** Two alternatives were rejected:
+
+    - *Evolve the table.* `EditLogWriter` would gain a verb that alters a table, and the port's whole
+      guarantee is that the runtime holds nothing that can point DDL at anything — `ensure_log` is
+      `append_edit` with the row removed precisely so the verb count buys nothing new. A test
+      enumerates those verbs; this would break it, and the guarantee it asserts is worth more than
+      the convenience.
+    - *Record the principal anyway and accept the loss.* That is a field written and never read,
+      inverted into something worse: a field written, silently dropped, and believed.
+
+    Checked only when the deployment can actually attest somebody (`McpConfig.attests`), so nothing
+    that worked before this slice starts refusing: a deployment with no `auth:` records `None` in a
+    column it may or may not have, and `None` is what an absent column already yields.
+
+    Raises `PolicyError`, collecting every catalog, for `require_edit_log`'s reason."""
+    from ..governance import PolicyError
+
+    demanded = _catalogs_actions_write_to(ontology)
+    problems: list[str] = []
+    for name in sorted(demanded):
+        catalog = catalogs.get(name)
+        if catalog is None:
+            continue
+        try:
+            if not catalog.table_exists(EDIT_LOG_TABLE):
+                # Nothing to be incompatible with. The first append creates it from `EDIT_COLUMNS`,
+                # which now carries `principal`.
+                continue
+            if "principal" not in catalog.describe(EDIT_LOG_TABLE).columns:
+                problems.append(
+                    f"catalog '{name}' (written by action(s) "
+                    f"{', '.join(repr(a) for a in sorted(demanded[name]))}) — its "
+                    f"'{EDIT_LOG_TABLE}' predates attested identity and has no 'principal' column"
+                )
+        except CatalogError as e:  # pragma: no cover - an unreadable log is require_edit_log's fault to report
+            problems.append(f"catalog '{name}' — {e}")
+
+    if not problems:
+        return
+    lines = ["'mcp.auth' attests a caller that this deployment's edit log cannot record:"]
+    lines += [f"  - {p}" for p in problems]
+    lines.append("An append against a table without that column succeeds and drops the principal,")
+    lines.append("so every run would be recorded as though nobody was named. Add the column to")
+    lines.append(f"'{EDIT_LOG_TABLE}' (a nullable string) in those catalogs, or point them at a")
+    lines.append("catalog that has never held a log — the first append creates it with the column.")
+    raise PolicyError("\n".join(lines))
+
+
+def _catalogs_actions_write_to(ontology: Ontology) -> dict[str, list[str]]:
+    """Which catalogs this deployment could ever write to, and the actions that would do it.
+
+    A spec that declares no action leaves this empty, and both postures above then refuse nothing —
+    not a lenient answer, an empty subject."""
+    demanded: dict[str, list[str]] = {}
+    for action in ontology.actions.values():
+        target = ontology.object_types.get(action.target_object_type)
+        if target is None:  # pragma: no cover - validator-enforced
+            continue
+        demanded.setdefault(target.backing_catalog, []).append(action.api_name)
+    return demanded
 
 
 def render_key(key: Any) -> str:

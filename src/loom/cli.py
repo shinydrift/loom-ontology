@@ -442,6 +442,21 @@ def _transport_mode(config) -> list[str]:
             f"bound to {mcp.host} · reachable by whoever can reach the port, not only by whoever "
             "can run this binary"
         )
+    # Said in both directions, because both are things an operator would otherwise have to infer
+    # from the absence of a line. "Who is recorded for a write" is exactly the question the write
+    # banner above leaves half-answered: `actor` names the deployment either way, and whether a
+    # *caller* is named beside it is the difference this line reports.
+    if mcp.auth is not None:
+        lines.append(
+            f"callers attested · bearer tokens verified against {mcp.auth.issuer} for audience "
+            f"'{mcp.auth.audience}' · unauthenticated requests are refused, and every run records "
+            "the caller beside the actor"
+        )
+    else:
+        lines.append(
+            "no caller attested · every request is served unauthenticated, and runs are recorded "
+            "under the deployment's actor alone"
+        )
     return lines
 
 

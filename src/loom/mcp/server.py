@@ -113,21 +113,26 @@ def build_server(ontology: Ontology, config: LoomConfig, catalogs: Mapping[str, 
     would each open their own otherwise, which is two connections and two chances to disagree about
     what the lake currently looks like.
 
-    **Where the principal stops.** Exactly where it did: `mcp.actor` reaches the edit log through the
-    `actor` argument the runtime already takes, and nothing else. The resolver is handed no identity,
-    because nothing here authenticates anybody and an invented per-call principal would be a value
-    with no source and no reader — the mistake `expect_snapshot_id` was kept out of `RowWriter` to
-    avoid.
+    **Where the principal stops, now that there is one.** M6's first slice gave `mcp.auth` a real
+    source for a per-call principal, and it changed *less* here than three earlier docstrings
+    predicted. What moved: `_run_tool`'s handler reads `auth.current_principal()` per call and passes
+    it to `ActionRuntime.run`, which records it in the edit log beside `mcp.actor`. What did not
+    move: **the resolver is still handed no identity**, and now permanently rather than for want of
+    one. A `when:` policy will be resolved into a decided `PolicySet` *above* the resolver, because a
+    principal is constant for the duration of a call and everything it conditions can therefore be
+    folded before the call begins — see `governance.py`.
 
-    M4 predicted that M5 would move this, and it did not, so the prediction is corrected here rather
-    than left standing. Governance does enforce in the resolver, and a direct call and an agent call
-    do filter identically — but a policy names no principal (`governance.py` has the argument, and
-    it turns on `loom query` having no transport to attest anything to), so what this function builds
-    **one** of is exactly what one deployment needs one of. Per-caller resolvers buy nothing until an
-    attested principal exists, and would not fix concurrency even then: the shared state that
-    serializes this process is one `DuckDBEngine` connection registering every scan under the global
-    aliases `t0`/`t1`/`m0`, which is the query layer's to fix and not this one's. Both changes still
-    belong to the milestone that lands attestation, and neither is M5's."""
+    So this function still builds **one** `Resolver` and **one** `ActionRuntime`, and that is the
+    right count even with attestation in hand. Two predictions are corrected rather than left
+    standing:
+
+    - M4 predicted M5 would move this for governance. It did not: a policy names no principal.
+    - This docstring and `build_mcp_server` then both predicted that the milestone landing
+      attestation would have to make these per-caller *and* fix the `t0`/`t1`/`m0` aliases. It did
+      not, and the reason is worth keeping: what forces per-caller construction is a *policy* that
+      varies per caller, and what forces the alias fix is **concurrency**. Attestation introduces
+      neither. Handlers are still synchronous, calls still do not overlap, and a per-call principal
+      is a value passed through a shared object rather than a reason to build a second one."""
     from ..catalog import open_catalogs
     from ..resolver import build_resolver
 
@@ -167,9 +172,14 @@ def build_mcp_server(loom_server: LoomMCPServer):
     - `build_server` builds one `Resolver` and one `ActionRuntime` for the lifetime of the process.
       That was written as "the same change M5 needs in order to filter by principal", and M5 turned
       out not to need it: a governance policy is deployment-scoped and names no caller, so one of
-      each is the right count for one deployment. The change belongs to the milestone that attests a
-      principal per call, which is where the second half of it — this alias problem — has to be
-      solved anyway.
+      each is the right count for one deployment. It was then written as belonging to the milestone
+      that attests a principal, "which is where the second half of it — this alias problem — has to
+      be solved anyway". **That is also wrong, and M6's first slice is where it was found out.**
+      Attestation landed, a principal now varies per call, and neither of these moved: what forces
+      per-caller objects is a policy that varies per caller, and what forces the alias fix is two
+      calls in flight at once. A per-call *value* threaded through shared objects needs neither. The
+      alias problem belongs to whatever milestone makes a handler `async`, and until one does, the
+      assertion below is what keeps it unnecessary.
     - The runtime's retry loop reasons about competing commits, not about competing callers in one
       process.
 
@@ -225,6 +235,57 @@ async def serve_stdio(loom_server: LoomMCPServer) -> None:  # pragma: no cover -
     server = build_mcp_server(loom_server)
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
+
+
+def _authenticated(endpoint, mcp: McpConfig):
+    """Wrap the MCP endpoint in the bearer-token stack, or hand it back untouched.
+
+    Untouched is the whole of "this deployment attests nobody", and it is what every deployment
+    before M6 was. There is no partial state between the two.
+
+    **Wrapped around the endpoint rather than mounted on the app, and that is a bug's worth of
+    reason.** The SDK's `RequireAuthMiddleware` does not check `scope["type"]` before deciding a
+    request is unauthenticated, so at app level it treats the ASGI **lifespan** scope as a request
+    with no user and answers it with a `401`. Starlette's own `AuthenticationMiddleware` guards
+    against exactly this (`if scope["type"] not in ("http", "websocket")`); this one does not. The
+    lifespan then never completes, `manager.run()` is never entered, and every real request fails
+    with *Task group is not initialized* — a startup failure that surfaces as a `500` on the first
+    tool call rather than as anything at startup. Wrapping the route's endpoint means these three
+    only ever see the scopes of the one path they are meant to protect.
+
+    **A token is required, not merely honoured.** With `auth:` declared, a request without a valid
+    one is a `401` and never reaches a tool. The alternative — accept it and treat the caller as
+    principal-less — would give one deployment two classes of caller, and the un-tokened class would
+    be recorded as `principal: null` while running exactly the same writes. That is the same shape
+    §6.1 refuses for policies (a caller that can arrange to be unnamed is a back door around the
+    naming), applied one layer down, and it is why `RequireAuthMiddleware` is in this stack rather
+    than just the two that populate the context.
+
+    **A `401` does not contradict §7's `isError` rule; it is the other question.** An HTTP status
+    answers *did this exchange happen*, `isError` answers *did this call become a run*. A rejected
+    token is an exchange that did not happen — the same category as a rejected `Host` or a malformed
+    body, both of which already answer non-`200` — and no tool outcome produces it. The rule that
+    every tool result is a `200` carrying content is untouched, because an unauthenticated request
+    never produces a tool result at all.
+
+    Three middlewares, outermost first, and each does one thing this codebase should not reimplement:
+    `AuthenticationMiddleware` runs Loom's verifier over the `Authorization` header,
+    `AuthContextMiddleware` puts the result where a synchronous handler can read it, and
+    `RequireAuthMiddleware` turns its absence into the `401`. What the SDK does not supply — and the
+    only part that is a *judgement* rather than plumbing — is whether a token is believable, which is
+    `auth.TokenVerifier` and the reason that module exists."""
+    if mcp.auth is None:
+        return endpoint
+    from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
+    from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend, RequireAuthMiddleware
+    from starlette.middleware.authentication import AuthenticationMiddleware
+
+    from ..auth import build_verifier
+
+    verifier = build_verifier(mcp.auth)
+    # Innermost out: refuse what is not authenticated, publish what is, and authenticate first.
+    guarded = RequireAuthMiddleware(AuthContextMiddleware(endpoint), required_scopes=[])
+    return AuthenticationMiddleware(guarded, backend=BearerAuthBackend(token_verifier=verifier))
 
 
 class _Endpoint:
@@ -292,7 +353,7 @@ async def serve_http(loom_server: LoomMCPServer, mcp: McpConfig) -> None:  # pra
     # method as a request/response handler, so the ASGI app has to arrive as something that is
     # neither.
     app = Starlette(
-        routes=[Route(mcp.path, _Endpoint(manager), methods=["GET", "POST", "DELETE"])],
+        routes=[Route(mcp.path, _authenticated(_Endpoint(manager), mcp), methods=["GET", "POST", "DELETE"])],
         lifespan=lifespan,
     )
     await uvicorn.Server(
