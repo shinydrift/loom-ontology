@@ -1041,6 +1041,16 @@ Consciously deferred in v0; each is a self-contained follow-up:
 - [ ] Composite (multi-property) primary keys — ripples into `key` exprs + objectRef encoding
 - [ ] Complex property types — `array` / `struct` / `map`
 - [ ] Computed / derived properties — backed by an expression instead of a column
+- [ ] **Fully typed object filters** — extend caller-supplied `search_<objectType>` filters from
+      the current equality/`searchable` substring behavior to equality plus the comparison and
+      range operators appropriate to each supported scalar/property type. Define string and enum
+      semantics explicitly; support `AND` composition first, with `OR` and `IN` included only once
+      their IR, engine, and transport behavior is specified. Generate the MCP JSON Schema from the
+      property types and supported operators; coerce and validate values before planning; enforce
+      governance and masking before accepting a filter; and preserve stable pagination and
+      backward compatibility for existing filter payloads. Acceptance covers unit tests plus
+      compiler, registry, stdio, and HTTP end-to-end tests, including a
+      `DailySalesPerformance` date-range query.
 - [ ] **Multi-object actions** — the post-v1 feature the single-object boundary reserves room for
 - [ ] **Edit-log erasure** — a command that *redacts* records in place (keep the row, empty
       `parameters`/`before`/`after`/`object_key`), never one that deletes them; a holder and a port
