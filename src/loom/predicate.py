@@ -349,6 +349,51 @@ def _compare(node: Binary, ctx: _Ctx) -> None:
             f"{what} compares '{left.kind}' with '{right.kind}', which are not comparable "
             "types — the same rule a validation rule's operands follow"
         )
+        return
+    _enum_membership(node, left, right, ctx)
+
+
+def _enum_membership(node: Binary, left: Any, right: Any, ctx: _Ctx) -> None:
+    """Refuse an enum compared against a value the enum does not have.
+
+    `object.tier != 'closed'` where `tier` is `[bronze, silver, gold]` type-checks — an enum compares
+    as its string storage, which is the rule that lets `object.tier == 'gold'` work at all — and then
+    means the same thing for every row. That is precisely the offence `check()` already refuses one
+    door down for a predicate naming no property: *a predicate that admits everything reads like
+    protection and is none, and one that admits nothing withholds the object type.* The two differ
+    only in how the constant gets in, so they refuse for the same reason, in the same words.
+
+    It is worth a rule of its own because of which direction the accident falls in. `!=` against a
+    non-member is always true, so the policy silently withholds **nothing** — a deployment that
+    believes it filters rows and serves all of them, with no refusal and no warning anywhere, and
+    the value in the file looking exactly like a value the column holds. Loom finding out at load is
+    the only place anybody finds out at all.
+
+    Only the declared side is checked, and only against a string literal. A claim is never an enum —
+    `auth.ClaimType`'s vocabulary is `string`, `string[]` and `boolean` — so in a guard this has
+    nothing to say, and it is written to be silent there rather than special-cased out.
+
+    **Equality only.** `object.tier > 'closed'` orders an enum against a string and is a different
+    answer per row whether or not the string is a member, so there is nothing constant to refuse —
+    only `==` and `!=` collapse to the same answer for every row."""
+    if node.op not in NULL_SAFE:
+        return
+    for declared, other in ((left, node.right), (right, node.left)):
+        if not isinstance(declared, PropType) or declared.kind != "enum" or not declared.values:
+            continue
+        if not isinstance(other, Literal) or not isinstance(other.value, str):
+            continue
+        if other.value in declared.values:
+            continue
+        always = "true" if node.op == "!=" else "false"
+        withholds = "withholds nothing at all" if node.op == "!=" else "withholds every row"
+        hint = suggest(other.value, declared.values) or f"declared: {', '.join(declared.values)}"
+        ctx.problems.append(
+            f"'{_render(node)}' compares an enum against a value it cannot hold — {hint}. The "
+            f"comparison is {always} for every row, so the policy {withholds} while reading like "
+            "one that filters"
+        )
+        return
 
 
 def _contains(node: Binary, ctx: _Ctx) -> None:

@@ -43,12 +43,13 @@ from __future__ import annotations
 
 import datetime as _dt
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from .. import filters
+from .._shape import suggest
 from ..auth import current_principal
 from ..governance import PolicyProgram
 from ..model import Action, ObjectType
@@ -85,6 +86,44 @@ class ToolSpec:
     description: str
     input_schema: dict
     handler: Callable[[dict], Any]
+
+    def argument_refusal(self, arguments: Mapping[str, Any]) -> str | None:
+        """Why this argument list is not one this tool accepts, or None.
+
+        **The top level, and deliberately only the top level**, because that is the one level of the
+        argument tree nothing else owns. Below it the vocabularies alternate (see the module
+        docstring) and each nested level already has an enforcer with a better sentence than a
+        generic one: a `filter` key no property answers to is refused by `Resolver._filters` naming
+        the object type and its properties, and a `parameters` key no parameter answers to is refused
+        by the action runtime as `unknown_parameter`, inside a typed `ActionResult`. Recursing here
+        would replace both with something vaguer, so it stops where the ownership starts.
+
+        What it buys is the two failures the top level had instead. An **unknown** argument was
+        silently dropped — `search_daily_sales_performance(salesDate={...})`, the shape you get by
+        forgetting the `filter` nesting, ran as an unfiltered search and answered `isError: false`
+        with the whole table. A surface that narrows on request must not widen on a typo, and that is
+        the widest a typo can get. A **missing required** argument reached the handler and came back
+        as `KeyError: 'key'` — a Python exception where every other refusal in this system is a
+        written sentence naming what to do instead.
+
+        Checked against `input_schema` rather than against a second list, so the enforcement cannot
+        drift from what `on_list_tools` advertises: `additionalProperties: False` is what every
+        generated schema already claims, and this is that claim becoming true."""
+        if self.input_schema.get("additionalProperties") is not False:  # pragma: no cover - all are
+            return None
+        accepted = self.input_schema.get("properties") or {}
+        unknown = [k for k in arguments if k not in accepted]
+        if unknown:
+            hint = suggest(unknown[0], accepted) if len(unknown) == 1 else None
+            named = ", ".join(f"'{k}'" for k in unknown)
+            what = "is not an argument" if len(unknown) == 1 else "are not arguments"
+            return (
+                f"{named} {what} of '{self.name}' — {hint or 'accepted: ' + (', '.join(accepted) or 'none')}"
+            )
+        missing = [k for k in self.input_schema.get("required") or () if k not in arguments]
+        if missing:
+            return f"'{self.name}' requires {', '.join(repr(k) for k in missing)}"
+        return None
 
 
 def snake_case(api_name: str) -> str:

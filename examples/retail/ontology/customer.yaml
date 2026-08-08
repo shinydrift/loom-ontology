@@ -8,6 +8,11 @@ objectType:
   properties:
     - { name: customerId, type: string, column: id, unique: true }
     - { name: name,       type: string, column: full_name }
-    - { name: tier,       type: enum, values: [bronze, silver, gold], column: tier }
+    # `closed` is a tier a customer *leaves* on rather than one they buy their way into, which is
+    # why `upgradeTier` declares its own narrower enum and cannot move anybody to it. It exists so
+    # the dashboard's `current-customers-only` policy has a row to withhold: a governance predicate
+    # comparing against a value the enum cannot hold is refused at load, precisely because it would
+    # otherwise read like a filter and be none.
+    - { name: tier,       type: enum, values: [bronze, silver, gold, closed], column: tier }
     - { name: ltv,        type: double, column: lifetime_value, nullable: true }
   searchable: [name, tier]

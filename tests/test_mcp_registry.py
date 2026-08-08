@@ -296,6 +296,48 @@ def test_an_unknown_tool_name_lists_the_real_ones(ontology):
     assert "unknown tool 'run_sql'" in text and "get_customer" in text
 
 
+def test_an_unknown_argument_is_refused_rather_than_dropped(ontology):
+    """The failure this closes is a **widening** one, which is why it is not a nicety.
+
+    `search_customer(name=…)` is what you get by forgetting that filters nest under `filter`. The
+    argument used to be dropped on the floor and the call ran as an unfiltered search — a request to
+    narrow answering with the whole table, `isError: false`, nothing anywhere saying why. Every
+    generated schema already says `additionalProperties: False`; this is that becoming true."""
+    resolver = Resolver(ontology=ontology, engine=StubEngine([{"customerId": "c1"}]))
+    server = LoomMCPServer.from_resolver(resolver)
+    text, is_error = server.call("search_customer", {"name": "Ada"})
+    assert is_error is True
+    assert "'name' is not an argument of 'search_customer'" in text
+    assert "filter" in text
+
+
+def test_a_missing_required_argument_is_a_sentence_not_a_keyerror(ontology):
+    resolver = Resolver(ontology=ontology, engine=StubEngine())
+    server = LoomMCPServer.from_resolver(resolver)
+    text, is_error = server.call("get_customer", {})
+    assert is_error is True
+    assert "KeyError" not in text
+    assert text == "'get_customer' requires 'key'"
+
+
+def test_an_unknown_argument_is_refused_with_a_suggestion(ontology):
+    resolver = Resolver(ontology=ontology, engine=StubEngine())
+    server = LoomMCPServer.from_resolver(resolver)
+    text, _ = server.call("search_customer", {"filtre": {}})
+    assert "did you mean 'filter'?" in text
+
+
+def test_the_argument_check_stops_at_the_top_level(ontology):
+    """Below the top level the vocabularies alternate and each level has an owner with a better
+    sentence: a bad `filter` key is the resolver's refusal, naming the object type and its
+    properties. A generic message here would replace it with something vaguer."""
+    resolver = Resolver(ontology=ontology, engine=StubEngine())
+    server = LoomMCPServer.from_resolver(resolver)
+    text, is_error = server.call("search_customer", {"filter": {"nosuchprop": "x"}})
+    assert is_error is True
+    assert "'Customer' has no property 'nosuchprop'" in text
+
+
 # ---- run_<action>: shape ---------------------------------------------------------
 
 
@@ -379,6 +421,34 @@ def test_a_run_through_the_tool_writes_the_row(ontology):
     assert catalog.row("crm.customers", "id", "c2")["tier"] == "gold"
     # Carried across, not nulled — the full-row read reaching an MCP caller unchanged.
     assert catalog.row("crm.customers", "id", "c2")["region"] == "amer"
+
+
+def test_a_bad_top_level_argument_never_becomes_a_run(ontology):
+    """The one place the argument check meets §7's `isError` rule, and it does not dent it.
+
+    `is_error` answers *did this call become a run*, and a `run_` tool whose arguments the tool
+    itself refuses never reached the runtime — there is no `ActionResult`, so no `status` to branch
+    on and nothing written to the edit log. `True` is the honest answer rather than an exception to
+    the rule. A misspelled *parameter*, one level down, is the other side of the same line: that one
+    does reach the runtime and comes back as a typed `refused`."""
+    catalog = FakeRowCatalog()
+    text, is_error = _server(ontology, catalog).call(
+        "run_upgrade_tier", {PARAMETERS_ARG: {"customer": "c2", "newTier": "gold"}, "dry_run": True}
+    )
+    assert is_error is True
+    assert "'dry_run' is not an argument of 'run_upgrade_tier'" in text
+    assert catalog.writes == []
+    # Not a JSON payload at all — the shape an agent gets for a usage error, same as an unknown tool.
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(text)
+
+    payload, is_error = _call(
+        _server(ontology, FakeRowCatalog()),
+        "run_upgrade_tier",
+        {PARAMETERS_ARG: {"customer": "c2", "newTier": "gold", "bogus": 1}},
+    )
+    assert is_error is False
+    assert payload["status"] == REFUSED
 
 
 def test_a_dry_run_previews_and_writes_nothing(ontology):

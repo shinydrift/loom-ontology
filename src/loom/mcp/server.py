@@ -76,11 +76,20 @@ class LoomMCPServer:
 
         So an agent branches on `status`, then `failures[].code`, then `retryable` — which the
         generated tool description says out loud, because the input schema cannot.
+
+        **An argument the tool does not accept is refused here, before the handler.** It is the same
+        category as the unknown tool name above and takes the same path: a usage error, `is_error`
+        true, because it never became a run — and for a `run_` tool that is the honest answer rather
+        than an exception to the paragraph above, since nothing reached the runtime and there is no
+        `status` to report. `ToolSpec.argument_refusal` says which arguments and why.
         """
         tool = self.tools.get(name)
         if tool is None:
             known = ", ".join(sorted(self.tools))
             return f"unknown tool '{name}'. Available: {known}", True
+        refusal = tool.argument_refusal(arguments or {})
+        if refusal is not None:
+            return refusal, True
         try:
             result = tool.handler(arguments or {})
         except (ResolverError, ActionError) as e:

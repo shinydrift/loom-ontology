@@ -82,7 +82,7 @@ def test_modify_rewrites_the_row_and_leaves_the_columns_nobody_declared_alone(se
     """The headline. `c3` is bronze with `region='apac'` and a null `segments`; `c1` is gold with
     two segments. Upgrading one must not disturb either's unmapped columns."""
     before = physical(seeded, "crm.customers")
-    assert [r["tier"] for r in before] == ["gold", "silver", "bronze"]
+    assert [r["tier"] for r in before] == ["gold", "silver", "bronze", "closed"]
     assert before[2]["region"] == "apac"
     assert before[0]["segments"] == ["enterprise", "early-adopter"]
 
@@ -92,12 +92,12 @@ def test_modify_rewrites_the_row_and_leaves_the_columns_nobody_declared_alone(se
     assert result.before["tier"] == "bronze" and result.after["tier"] == "gold"
 
     after = physical(seeded, "crm.customers")
-    assert [r["tier"] for r in after] == ["gold", "silver", "gold"]
+    assert [r["tier"] for r in after] == ["gold", "silver", "gold", "closed"]
     # The row that changed: one column different, everything else — mapped or not — identical.
     assert after[2] == {**before[2], "tier": "gold"}
     assert after[2]["region"] == "apac" and after[2]["segments"] is None
     # And the rows that didn't, including the one holding a value of a type Loom cannot name.
-    assert after[0] == before[0] and after[1] == before[1]
+    assert after[0] == before[0] and after[1] == before[1] and after[3] == before[3]
 
 
 def test_the_row_count_does_not_change_because_the_delete_and_the_append_are_one_commit(seeded, runtime):
@@ -106,7 +106,7 @@ def test_the_row_count_does_not_change_because_the_delete_and_the_append_are_one
     runtime.run("upgradeTier", {"customer": "c3", "newTier": "silver"})
 
     rows = physical(seeded, "crm.customers")
-    assert [r["id"] for r in rows] == ["c1", "c2", "c3"]
+    assert [r["id"] for r in rows] == ["c1", "c2", "c3", "c4"]
 
 
 def test_the_write_advances_the_snapshot_the_read_recorded(seeded, runtime):
@@ -147,14 +147,14 @@ def test_a_dry_run_writes_nothing(seeded, runtime):
 def test_create_writes_a_row_whose_declared_types_survived_the_trip(seeded, runtime):
     """decimal and timestamptz are where a write layer usually loses its promises: the total must
     come back as a `Decimal` with its scale intact, not a float."""
-    result = runtime.run("recordOrder", {"orderId": "o6", "customer": "c1", "total": "42.50"})
+    result = runtime.run("recordOrder", {"orderId": "o7", "customer": "c1", "total": "42.50"})
 
     assert result.status == APPLIED, result.failures
-    written = next(r for r in physical(seeded, "sales.orders") if r["id"] == "o6")
+    written = next(r for r in physical(seeded, "sales.orders") if r["id"] == "o7")
     assert written["total_amount"] == Decimal("42.50")
     assert isinstance(written["created_at"], datetime) and written["created_at"].tzinfo is not None
     assert written["customer_id"] == "c1"
-    assert len(physical(seeded, "sales.orders")) == 6
+    assert len(physical(seeded, "sales.orders")) == 7
 
 
 def test_delete_removes_one_row_and_only_that_row(seeded, runtime):
@@ -165,7 +165,7 @@ def test_delete_removes_one_row_and_only_that_row(seeded, runtime):
     assert result.status == APPLIED, result.failures
     assert result.before["name"] == "Grace Hopper" and result.after is None
     rows = physical(seeded, "crm.customers")
-    assert [r["id"] for r in rows] == ["c1", "c3"]
+    assert [r["id"] for r in rows] == ["c1", "c3", "c4"]
     # The surviving rows kept their unmapped columns too — a delete rewrites the files the row
     # lived in, so this is not free.
     assert {r["region"] for r in rows} == {"emea", "apac"}

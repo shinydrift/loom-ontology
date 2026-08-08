@@ -30,6 +30,11 @@
     --tier-bronze: #86b6ef;
     --tier-silver: #3987e5;
     --tier-gold:   #1c5cab;
+    /* `closed` is deliberately *off* the ramp: bronze→silver→gold is an ordered progression and a
+       former customer is not a rung on it. A neutral says "not on this scale" where a fourth blue
+       would say "more than gold". The same warm gray as --text-muted, which is already carried
+       unchanged into dark mode — the ramp above is validated for both surfaces and this matches. */
+    --tier-closed: #898781;
     /* Status palette. Fixed, never themed, never reused as a series color. */
     --good: #0ca30c;
     --warning: #fab219;
@@ -153,6 +158,7 @@
   .bar-bronze { fill: var(--tier-bronze); }
   .bar-silver { fill: var(--tier-silver); }
   .bar-gold   { fill: var(--tier-gold); }
+  .bar-closed { fill: var(--tier-closed); }
   .hit { fill: transparent; cursor: pointer; }
 
   .tooltip {
@@ -695,10 +701,16 @@ document.getElementById("sales-table-toggle").addEventListener("click", (e) => {
 
 // ---- tier chart -----------------------------------------------------------------------
 
+// The declared enum, in the order the spec declares it, with `closed` last and off the hue ramp —
+// it is where a customer ends up, not a rung above gold. The list is the *spec's*, not the data's:
+// under `current-customers-only` the closed bar drops to zero and stays on the axis, which is the
+// honest reading. A chart built from the tiers actually present would delete the row instead, and a
+// category that vanishes when a policy empties it looks like a category that was never declared.
 const TIERS = [
   { key: "bronze", cls: "bar-bronze", varname: "--tier-bronze" },
   { key: "silver", cls: "bar-silver", varname: "--tier-silver" },
   { key: "gold", cls: "bar-gold", varname: "--tier-gold" },
+  { key: "closed", cls: "bar-closed", varname: "--tier-closed" },
 ];
 
 function renderTierChart() {

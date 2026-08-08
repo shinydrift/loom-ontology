@@ -61,8 +61,16 @@ mcp:
 #                          customers table. The dashboard was not edited to do that — it reads the
 #                          `masked` list every tool envelope carries, and the property is not in the
 #                          SQL to begin with.
-#   current-customers-only rows leave the table, the tier chart and the traverse results at once,
-#                          because the predicate is applied to the table below all three.
+#   current-customers-only Karen Spärck Jones (`c4`, tier `closed`) leaves the customers table, the
+#                          `closed` bar of the tier chart drops to zero, and `traverse Order o6 ->
+#                          placedBy` comes back empty — all at once, because the predicate is applied
+#                          to the table below all three. `get_customer c4` answers `found: false`
+#                          rather than an error: a withheld row is indistinguishable from an absent
+#                          one, which is §6.1's refusal to run an existence oracle.
+#
+# `closed` is in the tier enum for this policy's sake. A predicate comparing against a value the
+# enum cannot hold is refused at load — `!=` against a non-member is true for every row, so it would
+# withhold nothing while reading like a filter, and this file used to make exactly that mistake.
 #
 # The third policy in `../loom.yaml` (`gold-desk`, guarded by `when: principal.groups contains …`)
 # is the one this file cannot use: it names a caller, and naming one requires `mcp.auth`. Uncomment

@@ -160,6 +160,41 @@ def test_a_predicate_that_reads_no_property_is_refused(customer):
     assert "names no property of 'Customer'" in problem
 
 
+def test_an_enum_compared_against_a_value_it_cannot_hold_is_refused(customer):
+    """The same offence as the test above, reached with a constant that *looks* like data.
+
+    `object.tier != 'closed'` reads like a filter, type-checks — an enum compares as its string
+    storage — and is true for every row, so the deployment withholds nothing. The shipped dashboard
+    example made exactly this mistake and nothing anywhere said so: the policy loaded, the banner
+    reported it, and every row came back."""
+    ont, obj = customer
+    (problem,) = check(_expr("object.tier != 'closed'"), obj, ont.object_types)
+    assert "a value it cannot hold" in problem
+    assert "bronze, silver, gold" in problem
+    # Which way the accident falls, because `!=` and `==` fail in opposite directions and an author
+    # needs to know which one they have.
+    assert "true for every row" in problem and "withholds nothing at all" in problem
+    (flipped,) = check(_expr("object.tier == 'closed'"), obj, ont.object_types)
+    assert "false for every row" in flipped and "withholds every row" in flipped
+
+
+def test_a_misspelled_enum_value_is_refused_with_a_suggestion(customer):
+    ont, obj = customer
+    (problem,) = check(_expr("object.tier == 'glod'"), obj, ont.object_types)
+    assert "did you mean 'gold'?" in problem
+
+
+def test_a_declared_enum_value_is_the_whole_point_and_stays_accepted(customer):
+    ont, obj = customer
+    assert check(_expr("object.tier == 'gold'"), obj, ont.object_types) == []
+    # Null is a value you may test an enum against — `==` is null-safe here — and it is not a member
+    # of anything, so the membership check must not reach for it.
+    assert check(_expr("object.tier != null"), obj, ont.object_types) == []
+    # Ordering is a different answer per row whether or not the string is a member, so there is
+    # nothing constant to refuse and this check stays out of it.
+    assert check(_expr("object.tier > 'closed'"), obj, ont.object_types) == []
+
+
 def test_every_problem_at_once(customer):
     """`check_capabilities`' bargain: somebody reconciling a policy with a spec learns the whole of
     what disagrees in one reading."""
