@@ -1432,6 +1432,15 @@ Consciously deferred in v0; each is a self-contained follow-up:
 ## Cross-cutting / infra
 
 - [ ] `pyproject` extras for engine backends (`[duckdb]`, `[trino]`) and catalog clients
-- [ ] Example end-to-end project under `examples/` (seedable local Iceberg + a demo agent loop)
+- [x] Example end-to-end project under `examples/` (seedable local Iceberg + a demo consumer of the
+      served surface) — `examples/retail/` is the seedable half; `examples/retail/dashboard/` is the
+      other half, and it turned out **not** to be an agent loop. What the box was reaching for is a
+      consumer that cannot reach past the tool surface, and an LLM in the middle would have made
+      that harder to see rather than easier: a loop's output is a function of the model, so a
+      missing capability reads as a bad turn. The dashboard is deterministic, so what it cannot do
+      is legible — and it is a *second deployment* of the same spec (socket, writes on, policies a
+      two-line edit away), which is the claim `examples/` existed to demonstrate and could not with
+      one deployment. A demo agent loop is still worth having; it is now a smaller box, because the
+      surface it would drive is exercised.
 - [ ] Docs site / expanded README now that M1 has landed
 - [ ] Type-check (mypy) + lint (ruff) in CI alongside pytest

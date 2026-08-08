@@ -1,0 +1,78 @@
+# A **second deployment of the same spec.**
+#
+# `../loom.yaml` is the one the README's walkthrough uses: stdio, read-only, the shape you point a
+# desktop MCP client at. This file serves the identical `../ontology` over a socket with writes on,
+# because a dashboard is a different deployment of the same ontology rather than a different
+# ontology — no spec was edited to get here, and that is the claim the directory exists to make.
+#
+# It is deliberately *not* discovered by `find_config`, which looks inside the ontology dir, then
+# beside it, then in the cwd. `app.py` names this file explicitly. So `loom serve
+# examples/retail/ontology` keeps meaning exactly what the README says it means, and running the
+# dashboard cannot change what any other command does.
+
+version: 0
+
+catalogs:
+  # The same warehouse `seed.py` creates — one lake, two deployments reading it. Relative paths in
+  # a loom.yaml resolve against the file's own directory, so these climb one level; point them at a
+  # `type: iceberg-rest` entry and nothing else in this directory changes.
+  local:
+    type: iceberg-sql
+    uri: sqlite:///../.warehouse/catalog.db
+    warehouse: file://../.warehouse
+
+engine:
+  type: duckdb
+
+mcp:
+  name: loom-retail-dashboard
+
+  # A socket rather than a pipe, because the dashboard is a *client* and a client that spawns its
+  # server can only ever be one client. `app.py --mcp-url` points the same UI at a `loom serve` you
+  # started yourself, which is the deployment this transport is actually for.
+  transport: http
+  host: 127.0.0.1
+  port: 8765
+  path: /mcp
+
+  # Writes on, which is what turns the three declared actions in `../ontology/actions/` into
+  # `run_` tools. Off by default everywhere else in this repo, and on here for one reason: a
+  # dashboard that could only read would never show you `applied` / `previewed` / `refused` /
+  # `failed`, which is the four-way outcome an agent has to branch on and the most instructive
+  # thing the action runtime produces.
+  #
+  # This is permitted only because the bind above is loopback. Move `host` off 127.0.0.1 and the
+  # config refuses to load — `actor` below names a *deployment*, and that is only an honest thing
+  # to record while the callers are the people who could already run this binary.
+  writes: true
+
+  # What `_loom_meta.edits` records for every run that arrives through a tool. Declared, never
+  # inferred: this deployment has no way to attest a caller (no `auth:` below), so the honest thing
+  # to write down is the name of the thing doing the writing.
+  actor: agent:retail-dashboard
+
+# What this deployment withholds. Nothing, as shipped — and the README walks you through turning it
+# on, because the interesting part is watching it change what the dashboard can see *without the
+# dashboard changing*.
+#
+# Uncomment either policy, restart `app.py`, reload:
+#
+#   hide-ltv               the LTV stat tile renders "withheld by policy" and the column leaves the
+#                          customers table. The dashboard was not edited to do that — it reads the
+#                          `masked` list every tool envelope carries, and the property is not in the
+#                          SQL to begin with.
+#   current-customers-only rows leave the table, the tier chart and the traverse results at once,
+#                          because the predicate is applied to the table below all three.
+#
+# The third policy in `../loom.yaml` (`gold-desk`, guarded by `when: principal.groups contains …`)
+# is the one this file cannot use: it names a caller, and naming one requires `mcp.auth`. Uncomment
+# it here and `app.py` refuses to start rather than applying the rest — see `build_resolver`.
+#
+# governance:
+#   policies:
+#     - name: hide-ltv
+#       objectType: Customer
+#       mask: [ltv]
+#     - name: current-customers-only
+#       objectType: Customer
+#       rows: "object.tier != 'closed'"

@@ -1,0 +1,1174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Retail Ops — a dashboard made of MCP tool calls</title>
+<!--
+  Every number on this page arrives through `callTool()`, which is the only function that talks to
+  the network. It appends to the rail on the right *before* it returns, so the rail is not a log the
+  UI writes about itself — it is the same objects the fetch layer sent and received. If a panel
+  could get data some other way, the rail would be a decoration; there is no other way.
+
+  No build step, no CDN, no dependencies. The charts are hand-rolled SVG for the same reason the
+  repo has no node_modules: an example that needs an install is one you read instead of run.
+-->
+<style>
+  :root {
+    color-scheme: light;
+    --surface-1: #fcfcfb;
+    --plane: #f9f9f7;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.10);
+    /* Sequential blue, the single series hue. */
+    --series-1: #2a78d6;
+    /* Ordinal tier ramp — one hue, light→dark, validated for both surfaces. */
+    --tier-bronze: #86b6ef;
+    --tier-silver: #3987e5;
+    --tier-gold:   #1c5cab;
+    /* Status palette. Fixed, never themed, never reused as a series color. */
+    --good: #0ca30c;
+    --warning: #fab219;
+    --serious: #ec835a;
+    --critical: #d03b3b;
+    --success-text: #006300;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface-1: #1a1a19;
+      --plane: #0d0d0d;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #898781;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --border: rgba(255, 255, 255, 0.10);
+      --series-1: #3987e5;
+      --success-text: #0ca30c;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --plane: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --series-1: #3987e5;
+    --success-text: #0ca30c;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--plane); color: var(--text-primary);
+    font: 14px/1.5 var(--sans); -webkit-font-smoothing: antialiased;
+  }
+  h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+  h1 { font-size: 17px; }
+  h2 { font-size: 15px; }
+  h3 { font-size: 13px; }
+  p { margin: 0; }
+  button, select, input { font: inherit; color: inherit; }
+  code, .mono { font-family: var(--mono); font-size: 12px; }
+
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 14px 20px; background: var(--surface-1);
+    border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10;
+  }
+  header .sub { color: var(--text-secondary); font-size: 13px; }
+  .spacer { flex: 1 1 auto; }
+  .badge {
+    font-family: var(--mono); font-size: 11px; padding: 3px 8px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--text-secondary); white-space: nowrap;
+  }
+  .badge.writes { border-color: var(--good); color: var(--success-text); }
+
+  .shell { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 16px; padding: 16px; align-items: start; }
+  @media (max-width: 1100px) { .shell { grid-template-columns: minmax(0, 1fr); } }
+  main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px;
+  }
+  .card > header { all: unset; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .card .hint { color: var(--text-muted); font-size: 12px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .grid2 { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 16px; }
+  @media (max-width: 860px) { .grid2 { grid-template-columns: minmax(0, 1fr); } }
+
+  /* ---- stat tiles ---- */
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+  .tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .tile .label { color: var(--text-secondary); font-size: 12px; }
+  .tile .value { font-size: 30px; font-weight: 600; letter-spacing: -0.02em; margin-top: 4px; }
+  .tile .note { color: var(--text-muted); font-size: 11.5px; margin-top: 2px; }
+  .tile .value.withheld { font-size: 15px; font-weight: 500; color: var(--text-secondary); padding: 7px 0; }
+
+  /* ---- controls ---- */
+  button, select, input[type=text], input[type=number], input[type=date] {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 7px; padding: 6px 10px;
+  }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--axis); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.primary { background: var(--series-1); border-color: var(--series-1); color: #fff; }
+  button.danger { border-color: var(--critical); color: var(--critical); }
+  button.chip { padding: 4px 10px; border-radius: 999px; font-size: 12.5px; }
+  button.chip[aria-pressed="true"] { background: var(--series-1); border-color: var(--series-1); color: #fff; }
+
+  /* ---- tables ---- */
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th { text-align: left; font-weight: 500; color: var(--text-secondary); font-size: 11.5px;
+       text-transform: uppercase; letter-spacing: 0.04em; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 7px 8px; border-bottom: 1px solid var(--grid); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tbody tr.clickable { cursor: pointer; }
+  tbody tr.clickable:hover { background: color-mix(in srgb, var(--series-1) 7%, transparent); }
+  tbody tr[aria-selected="true"] { background: color-mix(in srgb, var(--series-1) 12%, transparent); }
+  .swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; vertical-align: baseline; }
+
+  /* ---- charts ---- */
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .gridline { stroke: var(--grid); stroke-width: 1; }
+  .axisline { stroke: var(--axis); stroke-width: 1; }
+  .ticktext { fill: var(--text-muted); font-size: 11px; font-family: var(--sans); font-variant-numeric: tabular-nums; }
+  .labeltext { fill: var(--text-secondary); font-size: 11.5px; font-family: var(--sans); font-weight: 500; }
+  .sales-area { fill: var(--series-1); opacity: 0.10; }
+  .sales-line { fill: none; stroke: var(--series-1); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .sales-dot { fill: var(--series-1); stroke: var(--surface-1); stroke-width: 2; }
+  .crosshair { stroke: var(--axis); stroke-width: 1; }
+  .bar-bronze { fill: var(--tier-bronze); }
+  .bar-silver { fill: var(--tier-silver); }
+  .bar-gold   { fill: var(--tier-gold); }
+  .hit { fill: transparent; cursor: pointer; }
+
+  .tooltip {
+    position: fixed; pointer-events: none; z-index: 40; opacity: 0; transition: opacity .09s;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; font-size: 12.5px; box-shadow: 0 6px 20px rgba(0,0,0,.14); max-width: 260px;
+  }
+  .tooltip .tt-k { color: var(--text-secondary); }
+  .tooltip .tt-v { font-variant-numeric: tabular-nums; font-weight: 600; }
+
+  /* ---- status ---- */
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600;
+    padding: 3px 10px 3px 8px; border-radius: 999px; border: 1px solid var(--border);
+  }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .pill .ico { font-size: 12px; line-height: 1; }
+  .st-applied   .dot { background: var(--good); }
+  .st-previewed .dot { background: var(--series-1); }
+  .st-refused   .dot { background: var(--warning); }
+  .st-failed    .dot { background: var(--critical); }
+  .st-applied   { border-color: color-mix(in srgb, var(--good) 45%, transparent); }
+  .st-previewed { border-color: color-mix(in srgb, var(--series-1) 45%, transparent); }
+  .st-refused   { border-color: color-mix(in srgb, var(--warning) 60%, transparent); }
+  .st-failed    { border-color: color-mix(in srgb, var(--critical) 45%, transparent); }
+
+  .banner {
+    display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid color-mix(in srgb, var(--warning) 60%, transparent);
+    background: color-mix(in srgb, var(--warning) 9%, transparent); font-size: 12.5px;
+  }
+  .banner .ico { color: var(--text-primary); }
+  .banner.hidden { display: none; }
+
+  .kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 14px; font-size: 12.5px; }
+  .kv dt { color: var(--text-secondary); }
+  .kv dd { margin: 0; font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
+
+  .diff td.changed { background: color-mix(in srgb, var(--series-1) 13%, transparent); font-weight: 600; }
+
+  /* ---- the tool rail ---- */
+  aside { position: sticky; top: 64px; max-height: calc(100vh - 80px); display: flex; flex-direction: column; }
+  aside .card { display: flex; flex-direction: column; min-height: 0; }
+  #rail { overflow-y: auto; margin: 0 -6px; padding: 0 6px; }
+  .call { border-bottom: 1px solid var(--grid); padding: 7px 0; }
+  .call summary { cursor: pointer; display: flex; align-items: center; gap: 7px; list-style: none; }
+  .call summary::-webkit-details-marker { display: none; }
+  .call .cname { font-family: var(--mono); font-size: 12px; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .call .cms { color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .call .cdot { width: 7px; height: 7px; border-radius: 50%; background: var(--series-1); flex: none; }
+  .call.write .cdot { background: var(--good); }
+  .call.err .cdot { background: var(--critical); }
+  .call.notatool .cdot { background: var(--serious); }
+  .call pre {
+    margin: 6px 0 2px; padding: 8px; background: var(--plane); border-radius: 6px;
+    font-family: var(--mono); font-size: 11px; line-height: 1.45; overflow-x: auto;
+    max-height: 260px; overflow-y: auto; color: var(--text-secondary);
+  }
+  .call .plabel { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-muted); margin-top: 6px; }
+
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Retail&nbsp;Ops</h1>
+  <span class="sub">every number below is a Loom MCP tool call</span>
+  <span class="spacer"></span>
+  <span class="badge" id="server-badge">connecting…</span>
+  <span class="badge" id="writes-badge" hidden></span>
+  <span class="badge" id="actor-badge" hidden></span>
+  <button id="theme-toggle" class="chip" title="Toggle light / dark">◐&nbsp;Theme</button>
+</header>
+
+<div class="shell">
+  <main>
+
+    <!-- ---- KPI row ------------------------------------------------------ -->
+    <section class="kpis" id="kpis" aria-label="Key figures"></section>
+
+    <!-- ---- sales over time ---------------------------------------------- -->
+    <section class="card">
+      <header>
+        <h2>Gross sales</h2>
+        <span class="hint" id="sales-sub">from <code>search_daily_sales_performance</code></span>
+        <span class="spacer"></span>
+        <button class="chip" id="sales-table-toggle" aria-pressed="false">Table</button>
+      </header>
+
+      <div class="row" style="margin-bottom:10px">
+        <span class="hint">Range</span>
+        <button class="chip range" data-from="" data-to="" aria-pressed="true">All</button>
+        <button class="chip range" data-from="2026-01-01" data-to="2026-02-01" aria-pressed="false">Jan</button>
+        <button class="chip range" data-from="2026-02-01" data-to="2026-03-01" aria-pressed="false">Feb</button>
+        <button class="chip range" data-from="2026-03-01" data-to="2026-04-01" aria-pressed="false">Mar</button>
+        <span style="width:12px"></span>
+        <input type="date" id="range-from" aria-label="From date">
+        <span class="hint">→</span>
+        <input type="date" id="range-to" aria-label="To date (exclusive)">
+        <button class="chip" id="range-apply">Apply</button>
+      </div>
+
+      <p class="hint" style="margin-bottom:10px">
+        The range control <em>is</em> the filter — it becomes
+        <code id="filter-echo">{}</code>, a typed object filter the ontology declared by
+        marking <code>salesDate</code> searchable.
+      </p>
+
+      <div id="stale-banner" class="banner hidden" style="margin-bottom:12px">
+        <span class="ico" aria-hidden="true">⚠</span>
+        <div>
+          <strong>This chart is behind the orders table.</strong>
+          <span id="stale-detail"></span>
+          <code>DailySalesPerformance</code> is an <em>ingestion-time</em> aggregate, so a row written by
+          <code>run_record_order</code> does not appear here until the rollup is recomputed.
+          Recomputing is <strong>not</strong> a Loom tool — it is the ingestion side, outside the ontology.
+          <div style="margin-top:8px"><button id="refresh-agg">Recompute the aggregate (not a tool call)</button></div>
+        </div>
+      </div>
+
+      <div id="sales-chart"></div>
+      <div id="sales-table" hidden style="margin-top:12px"></div>
+    </section>
+
+    <!-- ---- customers ----------------------------------------------------- -->
+    <section class="grid2">
+      <div class="card">
+        <header>
+          <h2>Customers by tier</h2>
+          <span class="hint">click a bar to filter</span>
+        </header>
+        <div id="tier-chart"></div>
+      </div>
+
+      <div class="card">
+        <header>
+          <h2>Customers</h2>
+          <span class="hint" id="customers-sub"></span>
+          <span class="spacer"></span>
+          <button class="chip" id="clear-tier" hidden>Clear filter</button>
+        </header>
+        <div id="customers-table"></div>
+        <p class="hint" id="masked-note" style="margin-top:10px" hidden></p>
+      </div>
+    </section>
+
+    <!-- ---- one customer, and the link out of it -------------------------- -->
+    <section class="card">
+      <header>
+        <h2>Customer detail</h2>
+        <span class="hint">
+          <code>get_customer</code>, then <code>traverse</code> the <code>orders</code> link —
+          a declared hop, never a join you wrote
+        </span>
+      </header>
+      <div id="detail"><p class="hint">Select a customer above.</p></div>
+    </section>
+
+    <!-- ---- actions -------------------------------------------------------- -->
+    <section class="card" id="actions-card">
+      <header>
+        <h2>Actions</h2>
+        <span class="hint">
+          <strong>Preview</strong> sends <code>dryRun: true</code> — it reads and validates, then stops
+          before the write. It is an inspection verb, not an approval: nothing is held, and a run after
+          a preview reads again.
+        </span>
+      </header>
+      <div id="actions"></div>
+      <div id="action-result" style="margin-top:14px"></div>
+    </section>
+
+  </main>
+
+  <!-- ---- the tool rail --------------------------------------------------- -->
+  <aside>
+    <div class="card">
+      <header>
+        <h2>Tool calls</h2>
+        <span class="hint" id="call-count">0</span>
+        <span class="spacer"></span>
+        <button class="chip" id="clear-rail">Clear</button>
+      </header>
+      <p class="hint" style="margin-bottom:8px">
+        The exact requests and responses that produced this page. Nothing here is reconstructed —
+        the fetch layer appends each entry as it happens, and there is no other way for a panel to
+        get data.
+      </p>
+      <div id="rail"></div>
+    </div>
+  </aside>
+</div>
+
+<div class="tooltip" id="tooltip" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+
+// ---- the only network code in this file ------------------------------------------
+
+const state = {
+  surface: null,
+  tools: new Map(),
+  customers: [],
+  masked: [],
+  sales: [],
+  orders: [],
+  tierFilter: null,
+  selected: null,
+  range: { from: "", to: "" },
+};
+
+/**
+ * One tool call. Every panel goes through here, and here is what appends to the rail — so the
+ * rail cannot fall out of step with what the page actually asked for.
+ */
+async function callTool(name, args) {
+  const res = await fetch("/api/call", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name, arguments: args }),
+  });
+  const entry = await res.json();
+  if (!res.ok) {
+    logCall({ name, arguments: args, isError: true, result: entry, ms: 0 });
+    throw new Error(entry.error || "call failed");
+  }
+  logCall(entry);
+  return entry;
+}
+
+/** The one route that is not a tool call, kept visibly separate in the rail. */
+async function recomputeAggregate() {
+  const started = performance.now();
+  const res = await fetch("/api/refresh", { method: "POST" });
+  const body = await res.json();
+  logCall({
+    name: "POST /api/refresh",
+    arguments: { note: "not an MCP tool — ingestion-side recompute of sales.daily_sales_performance" },
+    isError: !res.ok,
+    result: body,
+    ms: Math.round(performance.now() - started),
+    notATool: true,
+  });
+  return body;
+}
+
+// ---- the rail --------------------------------------------------------------------
+
+let callCount = 0;
+
+function logCall(entry) {
+  callCount += 1;
+  document.getElementById("call-count").textContent =
+    callCount + (callCount === 1 ? " call" : " calls");
+
+  const el = document.createElement("details");
+  el.className = "call";
+  if (entry.isError) el.classList.add("err");
+  else if (entry.notATool) el.classList.add("notatool");
+  else if (entry.name.startsWith("run_")) el.classList.add("write");
+
+  const status = entry.isError
+    ? "error"
+    : entry.notATool
+    ? "not a tool"
+    : entry.result && entry.result.status
+    ? entry.result.status
+    : "ok";
+
+  el.innerHTML = `
+    <summary>
+      <span class="cdot" aria-hidden="true"></span>
+      <span class="cname"></span>
+      <span class="cms"></span>
+    </summary>
+    <div class="plabel">arguments</div>
+    <pre class="args"></pre>
+    <div class="plabel">result · ${escapeHtml(status)}</div>
+    <pre class="result"></pre>`;
+  el.querySelector(".cname").textContent = entry.name;
+  el.querySelector(".cms").textContent = entry.ms + " ms";
+  el.querySelector(".args").textContent = JSON.stringify(entry.arguments, null, 2);
+  el.querySelector(".result").textContent = JSON.stringify(entry.result, null, 2);
+
+  const rail = document.getElementById("rail");
+  rail.prepend(el);
+}
+
+document.getElementById("clear-rail").addEventListener("click", () => {
+  document.getElementById("rail").replaceChildren();
+});
+
+// ---- small helpers ----------------------------------------------------------------
+
+const escapeHtml = (s) =>
+  String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+const num = (v) => (v === null || v === undefined ? NaN : Number(v));
+
+function money(v, compact) {
+  const n = num(v);
+  if (!isFinite(n)) return "—";
+  if (compact && Math.abs(n) >= 1000) {
+    const units = [[1e9, "B"], [1e6, "M"], [1e3, "K"]];
+    for (const [scale, suffix] of units) {
+      if (Math.abs(n) >= scale) return "$" + (n / scale).toFixed(n / scale >= 100 ? 0 : 1) + suffix;
+    }
+  }
+  return "$" + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+const count = (n) => (isFinite(n) ? n.toLocaleString() : "—");
+const shortDate = (iso) =>
+  new Date(iso + "T00:00:00Z").toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
+const stamp = (iso) => (iso ? new Date(iso).toLocaleString() : "—");
+
+const svgEl = (tag, attrs = {}) => {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  return el;
+};
+
+/** Clean axis ticks: 1 / 2 / 2.5 / 5 × 10^n. */
+function niceTicks(max, wanted = 4) {
+  if (!(max > 0)) return [0, 1];
+  const raw = max / wanted;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw) || 10 * mag;
+  const out = [];
+  for (let v = 0; v <= max + step * 0.001; v += step) out.push(Number(v.toFixed(10)));
+  return out;
+}
+
+/** A bar with its data-end rounded and its baseline end square. */
+function barPath(x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w, h / 2));
+  if (w <= 0) return `M${x},${y} h0`;
+  return `M${x},${y} H${x + w - r} A${r},${r} 0 0 1 ${x + w},${y + r} V${y + h - r} A${r},${r} 0 0 1 ${x + w - r},${y + h} H${x} Z`;
+}
+
+const tooltipEl = document.getElementById("tooltip");
+function showTooltip(evt, html) {
+  tooltipEl.innerHTML = html;
+  tooltipEl.style.opacity = "1";
+  const pad = 14;
+  const box = tooltipEl.getBoundingClientRect();
+  let x = evt.clientX + pad;
+  let y = evt.clientY + pad;
+  if (x + box.width > window.innerWidth - 8) x = evt.clientX - box.width - pad;
+  if (y + box.height > window.innerHeight - 8) y = evt.clientY - box.height - pad;
+  tooltipEl.style.left = x + "px";
+  tooltipEl.style.top = y + "px";
+}
+const hideTooltip = () => (tooltipEl.style.opacity = "0");
+
+// ---- theme -------------------------------------------------------------------------
+
+document.getElementById("theme-toggle").addEventListener("click", () => {
+  const explicit = document.documentElement.getAttribute("data-theme");
+  const dark = explicit ? explicit === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.setAttribute("data-theme", dark ? "light" : "dark");
+  // The charts read their colors from CSS custom properties via classes, so they re-theme without
+  // a re-render. Only the tier legend swatches use inline color, and they are rebuilt cheaply.
+  renderTierChart();
+});
+
+// ================================================================================
+//  panels
+// ================================================================================
+
+// ---- KPI row -----------------------------------------------------------------------
+
+function renderKpis() {
+  const gross = state.sales.reduce((a, r) => a + num(r.grossSales), 0);
+  const orders = state.sales.reduce((a, r) => a + num(r.orderCount), 0);
+  const avg = orders ? gross / orders : NaN;
+  const ltvMasked = state.masked.includes("ltv");
+  const ltv = state.customers.reduce((a, c) => a + (num(c.ltv) || 0), 0);
+  const days = state.sales.length;
+
+  const tiles = [
+    { label: "Gross sales", value: money(gross, true), note: days + (days === 1 ? " day in range" : " days in range") },
+    { label: "Orders", value: count(orders), note: "sum of orderCount" },
+    { label: "Average order value", value: money(avg, false), note: "gross ÷ orders" },
+    ltvMasked
+      ? { label: "Lifetime value", withheld: true, note: "the property is not in the query, not dropped from the answer" }
+      : { label: "Lifetime value", value: money(ltv, true), note: state.customers.length + " customers" },
+  ];
+
+  document.getElementById("kpis").innerHTML = tiles
+    .map(
+      (t) => `<div class="tile">
+        <div class="label">${escapeHtml(t.label)}</div>
+        ${t.withheld
+          ? `<div class="value withheld">withheld by policy</div>`
+          : `<div class="value">${escapeHtml(t.value)}</div>`}
+        <div class="note">${escapeHtml(t.note)}</div>
+      </div>`
+    )
+    .join("");
+}
+
+// ---- sales chart --------------------------------------------------------------------
+
+function renderSalesChart() {
+  const host = document.getElementById("sales-chart");
+  host.replaceChildren();
+  const rows = [...state.sales].sort((a, b) => a.salesDate.localeCompare(b.salesDate));
+  if (!rows.length) {
+    host.innerHTML = `<p class="hint" style="padding:28px 0;text-align:center">No days in this range.</p>`;
+    return;
+  }
+
+  const W = 860, H = 272;
+  // `top` carries the direct label that rides above the peak marker, so it is deeper than the
+  // plot needs — a label that would be clipped is worse than no label.
+  const M = { top: 30, right: 26, bottom: 30, left: 58 };
+  const iw = W - M.left - M.right;
+  const ih = H - M.top - M.bottom;
+
+  const xs = rows.map((r) => Date.parse(r.salesDate + "T00:00:00Z"));
+  const ys = rows.map((r) => num(r.grossSales));
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  const ticks = niceTicks(Math.max(...ys));
+  const yMax = ticks[ticks.length - 1];
+
+  const px = (t) => M.left + (x1 === x0 ? iw / 2 : ((t - x0) / (x1 - x0)) * iw);
+  const py = (v) => M.top + ih - (yMax ? (v / yMax) * ih : 0);
+
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
+  const title = svgEl("title");
+  title.textContent = `Gross sales per day, ${rows.length} days, peak ${money(Math.max(...ys), false)}`;
+  svg.append(title);
+
+  // gridlines + y ticks
+  for (const t of ticks) {
+    svg.append(svgEl("line", { class: "gridline", x1: M.left, x2: M.left + iw, y1: py(t), y2: py(t) }));
+    const label = svgEl("text", { class: "ticktext", x: M.left - 10, y: py(t) + 4, "text-anchor": "end" });
+    label.textContent = t >= 1000 ? "$" + (t / 1000) + "k" : "$" + t;
+    svg.append(label);
+  }
+  svg.append(svgEl("line", { class: "axisline", x1: M.left, x2: M.left + iw, y1: M.top + ih, y2: M.top + ih }));
+
+  // area + line
+  const pts = rows.map((r, i) => [px(xs[i]), py(ys[i])]);
+  const line = pts.map(([x, y], i) => `${i ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+  svg.append(
+    svgEl("path", { class: "sales-area", d: `${line} L${pts[pts.length - 1][0].toFixed(1)},${M.top + ih} L${pts[0][0].toFixed(1)},${M.top + ih} Z` })
+  );
+  svg.append(svgEl("path", { class: "sales-line", d: line }));
+
+  // x ticks — the ends, plus the peak when it has room. Three labels is already the ceiling for a
+  // 860px axis, and the peak is dropped rather than nudged when it would collide: a tick shifted
+  // off its own point is a label that lies about where it is.
+  const peak = ys.indexOf(Math.max(...ys));
+  const MIN_TICK_GAP = 78;
+  const ends = [0, rows.length - 1];
+  const peakHasRoom = ends.every((i) => Math.abs(pts[peak][0] - pts[i][0]) >= MIN_TICK_GAP);
+  const showX = [...new Set(peakHasRoom ? [0, peak, rows.length - 1] : ends)].sort((a, b) => a - b);
+  for (const i of showX) {
+    const label = svgEl("text", {
+      class: "ticktext", x: pts[i][0], y: M.top + ih + 18,
+      "text-anchor": i === 0 ? "start" : i === rows.length - 1 ? "end" : "middle",
+    });
+    label.textContent = shortDate(rows[i].salesDate);
+    svg.append(label);
+  }
+
+  // one direct label, on the extreme
+  const peakLabel = svgEl("text", {
+    class: "labeltext", x: pts[peak][0], y: pts[peak][1] - 12,
+    "text-anchor": pts[peak][0] > M.left + iw - 60 ? "end" : "middle",
+  });
+  peakLabel.textContent = money(ys[peak], true);
+  svg.append(peakLabel);
+
+  // markers
+  pts.forEach(([x, y]) => svg.append(svgEl("circle", { class: "sales-dot", cx: x, cy: y, r: 4.5 })));
+
+  // hover layer: a crosshair snapped to the nearest day
+  const crosshair = svgEl("line", { class: "crosshair", y1: M.top, y2: M.top + ih, opacity: 0 });
+  svg.append(crosshair);
+  const hit = svgEl("rect", { class: "hit", x: M.left, y: M.top, width: iw, height: ih });
+  svg.append(hit);
+
+  const move = (evt) => {
+    const box = svg.getBoundingClientRect();
+    const vx = ((evt.clientX - box.left) / box.width) * W;
+    let best = 0;
+    pts.forEach(([x], i) => { if (Math.abs(x - vx) < Math.abs(pts[best][0] - vx)) best = i; });
+    crosshair.setAttribute("x1", pts[best][0]);
+    crosshair.setAttribute("x2", pts[best][0]);
+    crosshair.setAttribute("opacity", 1);
+    const r = rows[best];
+    showTooltip(evt, `
+      <div class="tt-k">${escapeHtml(r.salesDate)}</div>
+      <div class="tt-v">${escapeHtml(money(r.grossSales, false))}</div>
+      <div class="tt-k">${escapeHtml(count(num(r.orderCount)))} orders · ${escapeHtml(count(num(r.uniqueCustomers)))} customers</div>`);
+  };
+  hit.addEventListener("pointermove", move);
+  hit.addEventListener("pointerleave", () => { crosshair.setAttribute("opacity", 0); hideTooltip(); });
+
+  host.append(svg);
+  renderSalesTable(rows);
+}
+
+function renderSalesTable(rows) {
+  document.getElementById("sales-table").innerHTML = `
+    <table>
+      <caption class="visually-hidden">Gross sales per day</caption>
+      <thead><tr>
+        <th>Date</th><th class="num">Gross sales</th><th class="num">Orders</th>
+        <th class="num">Customers</th><th>Refreshed</th>
+      </tr></thead>
+      <tbody>${rows
+        .map(
+          (r) => `<tr>
+            <td>${escapeHtml(r.salesDate)}</td>
+            <td class="num">${escapeHtml(money(r.grossSales, false))}</td>
+            <td class="num">${escapeHtml(count(num(r.orderCount)))}</td>
+            <td class="num">${escapeHtml(count(num(r.uniqueCustomers)))}</td>
+            <td class="mono">${escapeHtml(stamp(r.refreshedAt))}</td>
+          </tr>`
+        )
+        .join("")}</tbody>
+    </table>`;
+}
+
+document.getElementById("sales-table-toggle").addEventListener("click", (e) => {
+  const table = document.getElementById("sales-table");
+  const open = table.hasAttribute("hidden");
+  table.toggleAttribute("hidden", !open);
+  e.currentTarget.setAttribute("aria-pressed", String(open));
+});
+
+// ---- tier chart -----------------------------------------------------------------------
+
+const TIERS = [
+  { key: "bronze", cls: "bar-bronze", varname: "--tier-bronze" },
+  { key: "silver", cls: "bar-silver", varname: "--tier-silver" },
+  { key: "gold", cls: "bar-gold", varname: "--tier-gold" },
+];
+
+function renderTierChart() {
+  const host = document.getElementById("tier-chart");
+  host.replaceChildren();
+
+  const counts = TIERS.map((t) => ({
+    ...t,
+    n: state.allCustomers ? state.allCustomers.filter((c) => c.tier === t.key).length : 0,
+  }));
+  const max = Math.max(1, ...counts.map((c) => c.n));
+
+  const W = 300, rowH = 40, barH = 22, M = { top: 6, right: 46, bottom: 6, left: 66 };
+  const H = M.top + counts.length * rowH + M.bottom;
+  const iw = W - M.left - M.right;
+
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
+  const title = svgEl("title");
+  title.textContent = "Customers by tier";
+  svg.append(title);
+  svg.append(svgEl("line", { class: "axisline", x1: M.left, x2: M.left, y1: M.top, y2: H - M.bottom }));
+
+  counts.forEach((c, i) => {
+    // rowH 40 with a 22px bar leaves 18px of air — comfortably past the 2px surface gap minimum.
+    const y = M.top + i * rowH + (rowH - barH) / 2;
+    const w = (c.n / max) * iw;
+
+    const label = svgEl("text", { class: "labeltext", x: M.left - 10, y: y + barH / 2 + 4, "text-anchor": "end" });
+    label.textContent = c.key;
+    svg.append(label);
+
+    if (w > 0) svg.append(svgEl("path", { class: c.cls, d: barPath(M.left, y, w, barH, 4) }));
+
+    const value = svgEl("text", { class: "ticktext", x: M.left + w + 8, y: y + barH / 2 + 4 });
+    value.textContent = c.n;
+    svg.append(value);
+
+    const hit = svgEl("rect", { class: "hit", x: 0, y: M.top + i * rowH, width: W, height: rowH });
+    hit.addEventListener("pointermove", (evt) =>
+      showTooltip(evt, `<div class="tt-k">${escapeHtml(c.key)}</div><div class="tt-v">${c.n} customer${c.n === 1 ? "" : "s"}</div>
+        <div class="tt-k">click → search_customer</div>`)
+    );
+    hit.addEventListener("pointerleave", hideTooltip);
+    hit.addEventListener("click", () => { hideTooltip(); filterByTier(c.key); });
+    svg.append(hit);
+  });
+
+  host.append(svg);
+}
+
+// ---- customers table -------------------------------------------------------------------
+
+function renderCustomers() {
+  const masked = state.masked;
+  const hasLtv = !masked.includes("ltv");
+  document.getElementById("customers-sub").textContent = state.tierFilter
+    ? `search_customer · tier = ${state.tierFilter}`
+    : "list_customer";
+  document.getElementById("clear-tier").toggleAttribute("hidden", !state.tierFilter);
+
+  const note = document.getElementById("masked-note");
+  if (masked.length) {
+    note.hidden = false;
+    note.innerHTML = `<strong>${escapeHtml(masked.join(", "))}</strong> withheld by a governance policy.
+      The dashboard was not edited to hide it — every tool envelope carries a <code>masked</code> list, and
+      the column is absent from the SQL rather than dropped from the rows on the way back.`;
+  } else {
+    note.hidden = true;
+  }
+
+  document.getElementById("customers-table").innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Customer</th><th>Tier</th>${hasLtv ? '<th class="num">LTV</th>' : "<th>LTV</th>"}
+      </tr></thead>
+      <tbody>${state.customers
+        .map(
+          (c) => `<tr class="clickable" data-key="${escapeHtml(c.customerId)}"
+                      aria-selected="${state.selected === c.customerId}">
+            <td>${escapeHtml(c.name)}<div class="hint mono">${escapeHtml(c.customerId)}</div></td>
+            <td><span class="swatch" style="background:var(--tier-${escapeHtml(c.tier)})"></span>${escapeHtml(c.tier)}</td>
+            ${hasLtv
+              ? `<td class="num">${c.ltv === null || c.ltv === undefined ? '<span class="hint">null</span>' : escapeHtml(money(c.ltv, false))}</td>`
+              : `<td class="hint">withheld</td>`}
+          </tr>`
+        )
+        .join("")}</tbody>
+    </table>`;
+
+  document.querySelectorAll("#customers-table tr.clickable").forEach((tr) =>
+    tr.addEventListener("click", () => selectCustomer(tr.dataset.key))
+  );
+}
+
+async function filterByTier(tier) {
+  state.tierFilter = tier;
+  const { result } = await callTool("search_customer", { filter: { tier } });
+  state.customers = result.objects;
+  state.masked = result.masked || [];
+  renderCustomers();
+}
+
+document.getElementById("clear-tier").addEventListener("click", async () => {
+  state.tierFilter = null;
+  await loadCustomers();
+});
+
+// ---- customer detail -------------------------------------------------------------------
+
+async function selectCustomer(key) {
+  state.selected = key;
+  renderCustomers();
+  const host = document.getElementById("detail");
+  host.innerHTML = `<p class="hint">Loading ${escapeHtml(key)}…</p>`;
+
+  const [got, hop] = [
+    await callTool("get_customer", { key }),
+    await callTool("traverse", { objectType: "Customer", key, link: "orders" }),
+  ];
+
+  if (!got.result.found) {
+    host.innerHTML = `<p class="hint">
+      <code>get_customer</code> answered <code>found: false</code>. Either no such key, or a row policy
+      filters it — the tool says the same thing both ways on purpose: a filtered row is simply absent,
+      because "you may not see this one" would be an oracle over the data.</p>`;
+    return;
+  }
+
+  const c = got.result.object;
+  const orders = hop.result.objects;
+  const total = orders.reduce((a, o) => a + num(o.total), 0);
+
+  host.innerHTML = `
+    <div class="grid2">
+      <div>
+        <h3>${escapeHtml(c.name)}</h3>
+        <dl class="kv" style="margin-top:10px">
+          <dt>customerId</dt><dd>${escapeHtml(c.customerId)}</dd>
+          <dt>tier</dt><dd>${escapeHtml(c.tier)}</dd>
+          <dt>ltv</dt><dd>${c.ltv === null || c.ltv === undefined ? "null" : escapeHtml(money(c.ltv, false))}</dd>
+        </dl>
+        <p class="hint" style="margin-top:12px">
+          ${orders.length} order${orders.length === 1 ? "" : "s"} · ${escapeHtml(money(total, false))} total,
+          reached by <code>traverse</code> over <code>placedBy</code>'s reverse
+          (<code>${escapeHtml(hop.result.cardinality)}</code>).
+        </p>
+      </div>
+      <div>
+        ${orders.length
+          ? `<table>
+              <thead><tr><th>Order</th><th class="num">Total</th><th>Placed</th></tr></thead>
+              <tbody>${orders
+                .map(
+                  (o) => `<tr>
+                    <td class="mono">${escapeHtml(o.orderId)}</td>
+                    <td class="num">${escapeHtml(money(o.total, false))}</td>
+                    <td class="hint">${escapeHtml(stamp(o.placedAt))}</td>
+                  </tr>`
+                )
+                .join("")}</tbody>
+            </table>`
+          : `<p class="hint">No orders.</p>`}
+      </div>
+    </div>`;
+}
+
+// ---- actions ----------------------------------------------------------------------------
+
+/**
+ * The forms are generated from the tools' own input schemas, not hand-written. A parameter's
+ * control is chosen by the schema fragment the spec's declared type produced — which is the same
+ * claim the tool surface makes, one layer up: what you can ask for is a function of the spec.
+ */
+function renderActions() {
+  const host = document.getElementById("actions");
+  const runners = state.surface.tools.filter((t) => t.name.startsWith("run_"));
+
+  if (!runners.length) {
+    host.innerHTML = `<p class="hint">
+      This deployment serves no <code>run_</code> tools. The spec still declares its actions and
+      <code>loom run</code> still reaches them — <code>mcp.writes</code> switches the <em>surface</em>
+      off, not the runtime.</p>`;
+    return;
+  }
+
+  host.innerHTML = runners
+    .map((tool) => {
+      const params = (tool.inputSchema.properties.parameters || {}).properties || {};
+      const required = new Set((tool.inputSchema.properties.parameters || {}).required || []);
+      const fields = Object.entries(params)
+        .map(([name, schema]) => `
+          <label style="display:flex;flex-direction:column;gap:3px">
+            <span class="hint">${escapeHtml(name)}${required.has(name) ? "" : " (optional)"}</span>
+            ${controlFor(tool.name, name, schema)}
+          </label>`)
+        .join("");
+
+      return `<div style="padding:12px 0;border-top:1px solid var(--grid)">
+        <div class="row" style="justify-content:space-between;align-items:baseline">
+          <h3 class="mono">${escapeHtml(tool.name)}</h3>
+        </div>
+        <p class="hint" style="margin:4px 0 10px">${escapeHtml((tool.description || "").split("\n")[0])}</p>
+        <div class="row" style="align-items:flex-end;gap:12px" data-form="${escapeHtml(tool.name)}">
+          ${fields}
+          <button data-run="${escapeHtml(tool.name)}" data-dry="true">Preview</button>
+          <button class="${tool.name === "run_forget_customer" ? "danger" : "primary"}"
+                  data-run="${escapeHtml(tool.name)}" data-dry="false">Run</button>
+        </div>
+      </div>`;
+    })
+    .join("");
+
+  host.querySelectorAll("button[data-run]").forEach((btn) =>
+    btn.addEventListener("click", () => runAction(btn.dataset.run, btn.dataset.dry === "true"))
+  );
+}
+
+/** A control derived from the parameter's JSON-Schema fragment. */
+function controlFor(toolName, name, schema) {
+  if (Array.isArray(schema.enum)) {
+    return `<select name="${escapeHtml(name)}">${schema.enum
+      .map((v) => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`)
+      .join("")}</select>`;
+  }
+  // An objectRef to Customer: offer the keys that exist rather than a free-text box.
+  if (/customer/i.test(name)) {
+    return `<select name="${escapeHtml(name)}" data-customers></select>`;
+  }
+  if (schema.type === "number" || schema.type === "integer" || /decimal/i.test(schema.description || "")) {
+    return `<input type="text" inputmode="decimal" name="${escapeHtml(name)}" size="9" placeholder="0.00">`;
+  }
+  return `<input type="text" name="${escapeHtml(name)}" size="10">`;
+}
+
+function fillCustomerSelects() {
+  const options = (state.allCustomers || [])
+    .map((c) => `<option value="${escapeHtml(c.customerId)}">${escapeHtml(c.name)} (${escapeHtml(c.customerId)})</option>`)
+    .join("");
+  document.querySelectorAll("select[data-customers]").forEach((sel) => {
+    const keep = sel.value;
+    sel.innerHTML = options;
+    if (keep) sel.value = keep;
+  });
+}
+
+async function runAction(toolName, dryRun) {
+  const form = document.querySelector(`[data-form="${toolName}"]`);
+  const parameters = {};
+  form.querySelectorAll("input[name], select[name]").forEach((el) => {
+    if (el.value !== "") parameters[el.name] = el.value;
+  });
+
+  if (!dryRun && toolName === "run_forget_customer") {
+    if (!confirm(`Delete ${parameters.customer}? The row goes; the edit-log record stays.`)) return;
+  }
+
+  const args = dryRun ? { parameters, dryRun: true } : { parameters };
+  const entry = await callTool(toolName, args);
+  renderActionResult(entry);
+  if (!dryRun && !entry.isError && entry.result.status === "applied") await reloadAll();
+}
+
+const STATUS_META = {
+  applied: { icon: "✓", cls: "st-applied", says: "the row changed, and the edit log has the record" },
+  previewed: { icon: "◑", cls: "st-previewed", says: "read and validated, then stopped — nothing was written and nothing is held" },
+  refused: { icon: "⊘", cls: "st-refused", says: "a rule the spec declares said no; this is the precondition working, not an error" },
+  failed: { icon: "✕", cls: "st-failed", says: "the runtime decided to write and the write did not land" },
+};
+
+function renderActionResult(entry) {
+  const host = document.getElementById("action-result");
+  const r = entry.result;
+
+  if (entry.isError) {
+    host.innerHTML = `<div class="banner">
+      <span class="ico" aria-hidden="true">⚠</span>
+      <div><strong>The call never became a run.</strong>
+        <code>isError: true</code> means a usage error — an unknown tool, a value that isn't the declared
+        type. It never means an action refused.
+        <pre class="mono" style="margin-top:6px">${escapeHtml(JSON.stringify(r, null, 2))}</pre></div>
+    </div>`;
+    return;
+  }
+
+  const meta = STATUS_META[r.status] || { icon: "•", cls: "", says: "" };
+  const props = [...new Set([...Object.keys(r.before || {}), ...Object.keys(r.after || {})])];
+  const changed = (p) => JSON.stringify((r.before || {})[p]) !== JSON.stringify((r.after || {})[p]);
+
+  host.innerHTML = `
+    <div class="row" style="gap:10px;margin-bottom:10px">
+      <span class="pill ${meta.cls}">
+        <span class="dot" aria-hidden="true"></span>
+        <span class="ico" aria-hidden="true">${meta.icon}</span>
+        ${escapeHtml(r.status)}
+      </span>
+      <span class="hint">${escapeHtml(meta.says)}</span>
+    </div>
+
+    ${r.failures && r.failures.length
+      ? `<div class="banner" style="margin-bottom:12px">
+          <span class="ico" aria-hidden="true">⚠</span>
+          <div>${r.failures
+            .map(
+              (f) => `<div><code>${escapeHtml(f.code)}</code> — ${escapeHtml(f.message)}
+                ${f.retryable ? `<strong>retryable</strong>` : `<span class="hint">not retryable</span>`}
+                ${f.detail ? `<div class="hint mono">${escapeHtml(JSON.stringify(f.detail))}</div>` : ""}</div>`
+            )
+            .join("")}</div>
+        </div>`
+      : ""}
+
+    <div class="grid2">
+      <dl class="kv">
+        <dt>action</dt><dd>${escapeHtml(r.action)} · ${escapeHtml(r.operation)}</dd>
+        <dt>key</dt><dd>${escapeHtml(String(r.key))}</dd>
+        <dt>editId</dt><dd>${r.editId ? escapeHtml(r.editId) : '<span class="hint">nothing recorded — a preview never named a row</span>'}</dd>
+        <dt>attempts</dt><dd>${escapeHtml(String(r.attempts))}</dd>
+        <dt>readSnapshotId</dt><dd>${escapeHtml(String(r.readSnapshotId))}</dd>
+        <dt>concurrency</dt><dd style="font-family:var(--sans);font-size:12.5px">${escapeHtml(r.concurrency)}</dd>
+      </dl>
+      <div>
+        ${props.length
+          ? `<table class="diff">
+              <thead><tr><th>Property</th><th>Before</th><th>After</th></tr></thead>
+              <tbody>${props
+                .map(
+                  (p) => `<tr>
+                    <td class="mono">${escapeHtml(p)}</td>
+                    <td class="mono">${escapeHtml(JSON.stringify((r.before || {})[p]) ?? "—")}</td>
+                    <td class="mono ${changed(p) ? "changed" : ""}">${escapeHtml(JSON.stringify((r.after || {})[p]) ?? "—")}</td>
+                  </tr>`
+                )
+                .join("")}</tbody>
+            </table>
+            <p class="hint" style="margin-top:8px">
+              The object <em>as the ontology sees it</em> — declared properties only, minus anything a policy
+              withholds. The unmapped columns beside them were carried across the write untouched, and are
+              deliberately not reported.</p>`
+          : `<p class="hint">No row to show.</p>`}
+      </div>
+    </div>`;
+}
+
+// ---- the stale-aggregate check --------------------------------------------------------
+
+function renderStaleBanner() {
+  const newestOrder = state.orders.reduce((a, o) => (o.placedAt > a ? o.placedAt : a), "");
+  const refreshed = state.allSales.reduce((a, r) => (r.refreshedAt > a ? r.refreshedAt : a), "");
+  const stale = newestOrder && refreshed && newestOrder > refreshed;
+  document.getElementById("stale-banner").classList.toggle("hidden", !stale);
+  if (stale) {
+    document.getElementById("stale-detail").textContent =
+      ` The newest order was placed ${stamp(newestOrder)}; the rollup was last computed ${stamp(refreshed)}.`;
+  }
+}
+
+document.getElementById("refresh-agg").addEventListener("click", async (e) => {
+  // Captured before the first await: `currentTarget` is only meaningful while the event is being
+  // dispatched, and is null by the time the continuation runs.
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  try {
+    await recomputeAggregate();
+    await reloadAll();
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ---- range control ---------------------------------------------------------------------
+
+function currentFilter() {
+  const bounds = {};
+  if (state.range.from) bounds.gte = state.range.from;
+  if (state.range.to) bounds.lt = state.range.to;
+  return Object.keys(bounds).length ? { salesDate: bounds } : {};
+}
+
+function echoFilter() {
+  const f = currentFilter();
+  document.getElementById("filter-echo").textContent =
+    Object.keys(f).length ? JSON.stringify({ filter: f }) : "{} — no filter, every day";
+}
+
+document.querySelectorAll("button.range").forEach((btn) =>
+  btn.addEventListener("click", async () => {
+    document.querySelectorAll("button.range").forEach((b) => b.setAttribute("aria-pressed", "false"));
+    btn.setAttribute("aria-pressed", "true");
+    state.range = { from: btn.dataset.from, to: btn.dataset.to };
+    document.getElementById("range-from").value = btn.dataset.from;
+    document.getElementById("range-to").value = btn.dataset.to;
+    await loadSales();
+  })
+);
+
+document.getElementById("range-apply").addEventListener("click", async () => {
+  document.querySelectorAll("button.range").forEach((b) => b.setAttribute("aria-pressed", "false"));
+  state.range = {
+    from: document.getElementById("range-from").value,
+    to: document.getElementById("range-to").value,
+  };
+  await loadSales();
+});
+
+// ================================================================================
+//  loading
+// ================================================================================
+
+async function loadSales() {
+  echoFilter();
+  const filter = currentFilter();
+  const { result } = await callTool("search_daily_sales_performance", Object.keys(filter).length ? { filter } : {});
+  state.sales = result.objects;
+  document.getElementById("sales-sub").innerHTML = `from <code>search_daily_sales_performance</code> · ${result.count} day(s)`;
+  renderSalesChart();
+  renderKpis();
+}
+
+async function loadCustomers() {
+  const { result } = await callTool("list_customer", {});
+  state.customers = result.objects;
+  state.allCustomers = result.objects;
+  state.masked = result.masked || [];
+  renderCustomers();
+  renderTierChart();
+  fillCustomerSelects();
+  renderKpis();
+}
+
+async function reloadAll() {
+  const [{ result: allSales }, { result: orders }] = [
+    await callTool("list_daily_sales_performance", { limit: 200 }),
+    await callTool("list_order", { limit: 200 }),
+  ];
+  state.allSales = allSales.objects;
+  state.orders = orders.objects;
+  renderStaleBanner();
+  await loadCustomers();
+  await loadSales();
+  if (state.selected) await selectCustomer(state.selected);
+}
+
+async function boot() {
+  const surface = await (await fetch("/api/surface")).json();
+  state.surface = surface;
+  surface.tools.forEach((t) => state.tools.set(t.name, t));
+
+  document.getElementById("server-badge").textContent = surface.serverName + " · " + surface.tools.length + " tools";
+  const writes = document.getElementById("writes-badge");
+  writes.hidden = false;
+  writes.textContent = surface.writes ? "writes on" : "read-only";
+  writes.classList.toggle("writes", surface.writes);
+  if (surface.actor) {
+    const actor = document.getElementById("actor-badge");
+    actor.hidden = false;
+    actor.textContent = "actor " + surface.actor;
+  }
+
+  renderActions();
+  await reloadAll();
+  fillCustomerSelects();
+}
+
+boot().catch((err) => {
+  document.querySelector("main").insertAdjacentHTML(
+    "afterbegin",
+    `<div class="card"><strong>Could not reach the ontology.</strong>
+      <p class="hint" style="margin-top:6px">${escapeHtml(err.message)}</p></div>`
+  );
+});
+</script>
+</body>
+</html>
