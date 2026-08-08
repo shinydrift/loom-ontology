@@ -21,3 +21,6 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+
+# Agent tooling scratch space
+.agentos/

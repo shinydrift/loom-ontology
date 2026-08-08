@@ -431,6 +431,38 @@ documented:
   `retryable`). It is the only encoding that can describe a write that committed and then failed to
   log itself, which a boolean gets backwards.
 
+### An app on top of it
+
+`examples/retail/dashboard/` is the same ontology with a UI in front of it — a "Retail Ops"
+dashboard whose entire data plane is the tool surface above.
+
+```bash
+python examples/retail/seed.py           # once
+python examples/retail/dashboard/app.py  # → http://127.0.0.1:8080
+```
+
+No build step, no `npm install`, no CDN: one Python file, one HTML file, hand-rolled SVG charts.
+It is **a second deployment of the same spec** — `dashboard/loom.yaml` serves `examples/retail/ontology`
+over a socket with `writes: true`, and no spec was edited to get there.
+
+The point is not that Loom can draw a chart. It is that the dashboard has **no privileged access**,
+and the constraint is structural rather than aspirational: the browser-facing data plane is a single
+passthrough route, so there is nowhere to put a filter the ontology never declared or a join the spec
+never linked. A rail down the right-hand side shows every `get_` / `search_` / `traverse` / `run_`
+call as it happens, with its arguments and response — which is exactly what an agent would have
+issued. The date-range picker *is* a typed `{gte, lt}` filter; the customer drill-down is a
+`traverse` over a declared link; the action panel is where `applied` / `previewed` / `refused` /
+`failed` stops being a table in this README and becomes a thing on screen.
+
+Then uncomment five lines of `governance.policies` in `dashboard/loom.yaml`, restart, and reload:
+the LTV tile reads *withheld by policy* and the column leaves the table, with **no dashboard change**
+— because the mask is applied to the projection below the tool layer, and every envelope carries the
+`masked` list the UI renders.
+
+One thing it cannot be is a page talking to Loom directly. `serve_http` sets `allowed_origins=[]`
+("no browser is a legitimate client of this endpoint"), so `app.py` holds the MCP session and the
+page talks to `app.py`. See [`examples/README.md`](examples/README.md).
+
 ## Planning a schema change
 
 `loom plan` is the write path's dry run: it derives the tables the spec wants, diffs them against
