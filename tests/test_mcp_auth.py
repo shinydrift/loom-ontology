@@ -489,13 +489,13 @@ def test_a_guard_decides_whether_a_policy_applies_to_this_caller(governed, issue
     from them, which is exactly why it cannot be sugar for a longer `rows:` — the same text inside
     the predicate would withhold everything instead.
 
-    The seeded customers are one gold, one silver, one bronze."""
+    The seeded customers are one gold, one silver, one bronze and one closed."""
     inside = issuer.headers("c1", groups=["gold-desk", "support"])
     outside = issuer.headers("c1", groups=["support"])
     (restricted,) = _run(governed.url, inside, [("list_customer", {})])
     (unrestricted,) = _run(governed.url, outside, [("list_customer", {})])
     assert [row["tier"] for row in _objects(restricted)] == ["gold"]
-    assert sorted(row["tier"] for row in _objects(unrestricted)) == ["bronze", "gold", "silver"]
+    assert sorted(row["tier"] for row in _objects(unrestricted)) == ["bronze", "closed", "gold", "silver"]
 
 
 def test_a_caller_whose_token_lacks_the_claim_gets_the_policy_applied(governed, issuer):

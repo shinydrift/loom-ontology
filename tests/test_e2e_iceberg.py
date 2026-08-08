@@ -98,7 +98,7 @@ def test_catalog_introspection_reports_real_iceberg_types(catalogs):
 
 def test_daily_sales_performance_is_a_physical_precomputed_table(catalogs):
     rows = catalogs["local"].scan("sales.daily_sales_performance").to_pylist()
-    assert len(rows) == 5
+    assert len(rows) == 6
     feb_11 = next(row for row in rows if str(row["sales_date"]) == "2026-02-11")
     assert feb_11["gross_sales"] == Decimal("450.00")
     assert feb_11["order_count"] == 1
@@ -151,7 +151,7 @@ def test_get_preserves_decimal_and_timestamp_types(resolver):
 
 
 def test_list_is_ordered_by_primary_key(resolver):
-    assert [c["customerId"] for c in resolver.list("Customer")] == ["c1", "c2", "c3"]
+    assert [c["customerId"] for c in resolver.list("Customer")] == ["c1", "c2", "c3", "c4"]
 
 
 def test_search_substring_is_case_insensitive(resolver):
@@ -187,7 +187,7 @@ def test_a_range_and_a_substring_are_anded_across_properties(resolver):
         "DailySalesPerformance",
         {"salesDate": {"gte": "2026-03-01"}, "sourceTable": {"eq": "sales.orders"}},
     )
-    assert [str(r["salesDate"]) for r in rows] == ["2026-03-02", "2026-03-09"]
+    assert [str(r["salesDate"]) for r in rows] == ["2026-03-02", "2026-03-09", "2026-03-17"]
 
 
 def test_an_open_range_over_a_decimal_compares_as_a_decimal(resolver):
@@ -199,7 +199,7 @@ def test_an_open_range_over_a_decimal_compares_as_a_decimal(resolver):
 def test_an_ordering_comparison_does_not_return_a_null_row(resolver):
     """c3 has no `ltv`. Undecided is not admitted — and with no negation in this grammar, that is
     also exactly SQL's answer, which is why the two can't disagree."""
-    assert [c["customerId"] for c in resolver.search("Customer", {"ltv": {"gt": 0}})] == ["c1", "c2"]
+    assert [c["customerId"] for c in resolver.search("Customer", {"ltv": {"gt": 0}})] == ["c1", "c2", "c4"]
     assert [c["customerId"] for c in resolver.search("Customer", {"ltv": {"eq": None}})] == ["c3"]
 
 
@@ -212,7 +212,7 @@ def test_paging_is_stable_across_pages(resolver):
     page1 = resolver.list("Customer", limit=2, offset=0)
     page2 = resolver.list("Customer", limit=2, offset=2)
     assert [c["customerId"] for c in page1] == ["c1", "c2"]
-    assert [c["customerId"] for c in page2] == ["c3"]
+    assert [c["customerId"] for c in page2] == ["c3", "c4"]
 
 
 # ---- traversal -----------------------------------------------------------------
@@ -423,7 +423,7 @@ def test_a_governed_read_never_asks_the_warehouse_for_the_column(project, catalo
     resolver = build_resolver(ontology, governed, catalogs)
     resolver.engine = _Spy(resolver.engine)
 
-    assert [c["customerId"] for c in resolver.list("Customer")] == ["c1", "c2", "c3"]
+    assert [c["customerId"] for c in resolver.list("Customer")] == ["c1", "c2", "c3", "c4"]
     (compiled,) = resolver.engine.compiled
     assert "lifetime_value" not in compiled.sql
     assert all("lifetime_value" not in scan.columns for scan in compiled.scans)
@@ -456,7 +456,7 @@ def test_a_row_predicate_withholds_the_row_from_every_surface(project, catalogs)
 
     resolver = build_resolver(ontology, governed, catalogs)
     assert resolver.get("Customer", "c2") is None
-    assert [row["customerId"] for row in resolver.list("Customer")] == ["c1", "c3"]
+    assert [row["customerId"] for row in resolver.list("Customer")] == ["c1", "c3", "c4"]
     # The anchor end: c2 has o3, o4 and o5, and none of them comes back.
     assert resolver.traverse("Customer", "c2", "orders") == []
     assert [o["orderId"] for o in resolver.traverse("Customer", "c1", "orders")] == ["o1", "o2"]

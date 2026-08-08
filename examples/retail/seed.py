@@ -74,22 +74,34 @@ def _utc(y: int, m: int, d: int) -> dt.datetime:
 
 CUSTOMERS = pa.table(
     {
-        "id": ["c1", "c2", "c3"],
-        "full_name": ["Ada Lovelace", "Grace Hopper", "Alan Turing"],
-        "tier": ["gold", "silver", "bronze"],
-        "lifetime_value": [48210.50, 12750.00, None],
-        "region": ["emea", "amer", "apac"],
-        "segments": [["enterprise", "early-adopter"], ["smb"], None],
+        # c4 is `closed`, and is here to be withheld: the dashboard's `current-customers-only`
+        # policy has nothing to demonstrate against a table where every row is a current customer.
+        "id": ["c1", "c2", "c3", "c4"],
+        "full_name": ["Ada Lovelace", "Grace Hopper", "Alan Turing", "Karen Spärck Jones"],
+        "tier": ["gold", "silver", "bronze", "closed"],
+        "lifetime_value": [48210.50, 12750.00, None, 3120.00],
+        "region": ["emea", "amer", "apac", "emea"],
+        "segments": [["enterprise", "early-adopter"], ["smb"], None, ["smb"]],
     },
     schema=CUSTOMERS_SCHEMA,
 )
 
 ORDERS = pa.table(
     {
-        "id": ["o1", "o2", "o3", "o4", "o5"],
-        "customer_id": ["c1", "c1", "c2", "c2", "c2"],
-        "total_amount": [Decimal(x) for x in ("1299.99", "450.00", "89.95", "2100.00", "17.50")],
-        "created_at": [_utc(2026, 1, 4), _utc(2026, 2, 11), _utc(2026, 2, 14), _utc(2026, 3, 2), _utc(2026, 3, 9)],
+        # o6 belongs to the closed customer, so `traverse Order o6 -> placedBy` is a route that
+        # returns a row normally and nothing under `current-customers-only`. A policy applied to the
+        # table below every read is the claim; a link with nothing on the far end is how you see it.
+        "id": ["o1", "o2", "o3", "o4", "o5", "o6"],
+        "customer_id": ["c1", "c1", "c2", "c2", "c2", "c4"],
+        "total_amount": [Decimal(x) for x in ("1299.99", "450.00", "89.95", "2100.00", "17.50", "640.25")],
+        "created_at": [
+            _utc(2026, 1, 4),
+            _utc(2026, 2, 11),
+            _utc(2026, 2, 14),
+            _utc(2026, 3, 2),
+            _utc(2026, 3, 9),
+            _utc(2026, 3, 17),
+        ],
     },
     schema=ORDERS_SCHEMA,
 )

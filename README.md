@@ -454,10 +454,15 @@ issued. The date-range picker *is* a typed `{gte, lt}` filter; the customer dril
 `traverse` over a declared link; the action panel is where `applied` / `previewed` / `refused` /
 `failed` stops being a table in this README and becomes a thing on screen.
 
-Then uncomment five lines of `governance.policies` in `dashboard/loom.yaml`, restart, and reload:
-the LTV tile reads *withheld by policy* and the column leaves the table, with **no dashboard change**
-— because the mask is applied to the projection below the tool layer, and every envelope carries the
-`masked` list the UI renders.
+Then uncomment `governance.policies` in `dashboard/loom.yaml`, restart, and reload — with **no
+dashboard change** either time, because both policies apply below the tool layer:
+
+- `hide-ltv` — the LTV tile reads *withheld by policy* and the column leaves the table. The mask is
+  applied to the projection, so the column is not in the SQL; every envelope carries the `masked`
+  list the UI renders.
+- `current-customers-only` — the one `closed` customer leaves the table, their bar in the tier chart
+  drops to zero, and the traverse to them comes back empty. `get_` on their key answers
+  `found: false`: a withheld row is indistinguishable from an absent one.
 
 One thing it cannot be is a page talking to Loom directly. `serve_http` sets `allowed_origins=[]`
 ("no browser is a legitimate client of this endpoint"), so `app.py` holds the MCP session and the
