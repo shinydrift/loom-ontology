@@ -7,11 +7,22 @@ Run once, then serve:
     loom validate --physical examples/retail/ontology
     loom serve examples/retail/ontology
 
-This script talks to pyiceberg directly rather than going through Loom, and that's deliberate:
-Loom writes one row at a time, through a declared action. Bulk loading is the *user's* concern —
-the framework's claim is that it can serve, migrate and act on what's in the lake, not that it is
-the way data gets there. (`loom apply` would create these tables from the spec alone; this script
-also puts rows in them, and adds two columns the spec never mentions.)
+This script talks to pyiceberg directly rather than going through Loom, and that is still
+deliberate — but the reason has narrowed, and the sentence that used to be here was:
+
+    Bulk loading is the *user's* concern — the framework's claim is that it can serve, migrate and
+    act on what's in the lake, not that it is the way data gets there.
+
+That is no longer the whole truth, and M9 is where it changed. Loom does now load a batch, through a
+declared `ingest:` entry — see `sales_performance.py` for the two halves side by side. What did not
+change is *why* this script stays outside it: ingest never creates or alters a table, and this one
+creates them, with two columns the spec never mentions. Bootstrapping a warehouse is `loom apply`'s
+job or yours; ingest lands rows in tables that already exist.
+
+So the claim moved from *Loom is not the way data gets there* to something narrower and more
+defensible: **Loom is not the way data is produced or moved, but it is the way a batch becomes rows
+in a table the ontology describes** — checked against the declared types, written as one commit, and
+recorded in `_loom_meta.loads`.
 
 The schemas below are the physical side of the contract in `ontology/*.yaml`. Change one without
 the other and `loom validate --physical` will say so, which is the point.

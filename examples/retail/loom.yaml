@@ -68,7 +68,39 @@ mcp:
   #   claims:
   #     groups: string[]
 
-# What this deployment withholds. Uncomment and `loom query`, `loom run` and every generated tool
+# How rows get in, in bulk. An entry names an object type, a mode and a file format; the file
+# itself is the one thing that varies per run, so it is the only thing `loom ingest` takes on the
+# command line. Everything else lives here because a load is a fact about a *deployment* — this
+# warehouse gets its daily numbers from a Parquet drop — rather than about the ontology.
+#
+# It is deliberately not in the spec. §7 says the tool set is a function of the spec, so an ingest
+# declared there would have to decide whether an `ingest_<type>` tool appears on the MCP surface —
+# and the answer is no, for the reason `loom serve` exposes no raw-SQL tool. Declaring it here means
+# no tool can be *derived* from it, structurally rather than by a rule someone remembers.
+#
+# `mode` is the whole of what a load does to the rows already there: `append` adds, `merge` replaces
+# the ones it names (carrying every column the ontology does not map, so a merge never nulls
+# somebody else's data), `replace` makes the table exactly the batch. Only `merge` and `replace`
+# read, so only they assert the snapshot they read; an append puts no row over another and asserts
+# nothing, which is what lets two pipelines load one table without refusing each other.
+#
+# Ingest **never migrates**. A batch that does not fit the table is refused naming the column, and
+# the fix is `loom plan` / `loom apply` — the `BulkWriter` port has no DDL verb at all.
+ingest:
+  # The materialization `sales_performance.py` computes. `mode: replace` because a daily aggregate
+  # is a whole answer rather than a set of edits: recomputing it and appending would leave two rows
+  # per day, and merging would leave yesterday's answer for a day the source no longer has.
+  #
+  # Loom does not compute this. Something else does — see `write_daily_sales_performance` — and
+  # hands over a file. That split is the boundary: Loom checks the batch against the ontology,
+  # writes it as one commit, and records that it did.
+  - name: daily-sales
+    objectType: DailySalesPerformance
+    mode: replace
+    format: parquet
+
+# What this deployment withholds, and what it permits. Uncomment `policies:` and `loom query`,
+# `loom run` and every generated tool
 # stop returning `ltv` — enforced in the resolver's projection, so the column is not in the SQL
 # rather than dropped from the rows on the way back.
 #
@@ -108,7 +140,17 @@ mcp:
 # discovered after the row landed. It deliberately promises nothing about an individual run: there
 # is no transaction spanning a row's table and the log, so an append that fails *after* the commit
 # still reports `log_failed`, and the run's `edit_id` is in the Iceberg snapshot summary either way.
-# governance:
+governance:
+  # Declaring an `ingest:` entry above says what a load *would* be; this says whether this
+  # deployment does that at all. Default-refused, which is `mcp.writes`' posture and not
+  # `edit_log`'s: an upgrade that shipped ingest and a config that happens to describe a load are
+  # two things that happen for unrelated reasons, and their product must not be somebody's lake
+  # quietly gaining a way to be overwritten wholesale.
+  ingest: allowed
+  #
+  # `edit_log: required` covers both logs — a bulk load is a write, so a posture that proved only
+  # `_loom_meta.edits` would leave this deployment able to load unrecorded while believing it could
+  # not. With it set, `_loom_meta.loads` is created at startup too.
 #   edit_log: required
 #   policies:
 #     - name: hide-ltv

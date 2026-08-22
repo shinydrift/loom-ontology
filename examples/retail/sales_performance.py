@@ -2,6 +2,18 @@
 
 This is intentionally an ingestion-time aggregate, not a new Loom query primitive. Loom only
 retrieves the small, typed Iceberg table; the business calculation stays explicit and repeatable.
+
+**Two ways to land it, and the difference is the point.** `refresh_daily_sales_performance` writes
+the table through pyiceberg directly — a hand-built Arrow schema kept in lockstep with the spec by
+hand, a `txn.overwrite`, and a write nothing in the lake records. `write_daily_sales_performance`
+stops at a Parquet file and lets `loom ingest daily-sales` do the rest: the same rows, checked
+against the ontology's declared types, written as one commit stamped with its own load id, and one
+row in `_loom_meta.loads` saying what happened.
+
+Both are kept, because the comparison is the example. The first is what every lake already does and
+what the edit log cannot see; the second is the same work with the contract and the record put back.
+Neither computes the aggregate inside Loom — that is the boundary this milestone draws, and it is
+why the second one still hands over a file.
 """
 
 from __future__ import annotations
@@ -62,17 +74,69 @@ def build_daily_sales_performance(
     )
 
 
-def refresh_daily_sales_performance(catalog, *, refreshed_at: dt.datetime | None = None) -> pa.Table:
-    """Recompute and atomically replace the materialization from the current orders snapshot."""
+# The ontology's names for the same seven columns. A batch handed to `loom ingest` speaks the
+# *spec's* vocabulary, not the lake's: an entry maps property names to source columns and defaults
+# to the identity, so a file written this way needs no `columns:` block at all. Which is also the
+# honest direction of the coupling — the pipeline producing the file is writing against the
+# published ontology, and `loom plan` is what moves the physical column underneath it.
+PROPERTY_NAMES = {
+    "sales_date": "salesDate",
+    "gross_sales": "grossSales",
+    "order_count": "orderCount",
+    "unique_customers": "uniqueCustomers",
+    "refreshed_at": "refreshedAt",
+    "source_table": "sourceTable",
+    "source_snapshot_id": "sourceSnapshotId",
+}
+
+
+def _compute(catalog, refreshed_at: dt.datetime | None) -> pa.Table:
+    """The aggregate itself, from the current `sales.orders` snapshot.
+
+    Shared by both halves deliberately: the whole claim being demonstrated is that they produce the
+    *same rows* and differ only in how those rows land, and two copies of this would be two chances
+    for that to stop being true."""
     source = catalog.load_table(SOURCE_TABLE)
     snapshot = source.current_snapshot()
     if snapshot is None:
         raise RuntimeError(f"{SOURCE_TABLE} has no snapshot to materialize")
-    rows = build_daily_sales_performance(
+    return build_daily_sales_performance(
         source.scan().to_arrow(),
         refreshed_at=refreshed_at or dt.datetime.now(dt.UTC),
         source_snapshot_id=snapshot.snapshot_id,
     )
+
+
+def write_daily_sales_performance(
+    catalog, path, *, refreshed_at: dt.datetime | None = None
+) -> pa.Table:
+    """Recompute the materialization and write it to `path` as Parquet, touching no table.
+
+    The pipeline half of the declared load. It reads `sales.orders` — which is the aggregate's
+    input, not Loom's business — and stops at a file, because everything after the file is what the
+    `daily-sales` entry in `loom.yaml` describes:
+
+        python -c 'from examples.retail.sales_performance import *' ...   # produce the file
+        loom ingest daily-sales daily.parquet examples/retail/ontology     # land it
+
+    `mode: replace` there rather than `append`, for the reason this function recomputes every day
+    rather than the new one: a daily aggregate is a whole answer, so appending would leave two rows
+    per day and merging would leave yesterday's answer for a day the source no longer has."""
+    import pyarrow.parquet as pq
+
+    rows = _compute(catalog, refreshed_at)
+    named = rows.rename_columns([PROPERTY_NAMES[c] for c in rows.column_names])
+    pq.write_table(named, path)
+    return named
+
+
+def refresh_daily_sales_performance(catalog, *, refreshed_at: dt.datetime | None = None) -> pa.Table:
+    """Recompute and atomically replace the materialization from the current orders snapshot.
+
+    The hand-rolled half, kept as the comparison: it creates the table if it is missing, writes it
+    with a schema this file maintains by hand, and leaves nothing in `_loom_meta` behind it. That
+    last part is what `loom ingest` exists to change."""
+    rows = _compute(catalog, refreshed_at)
 
     namespace = MATERIALIZATION_TABLE.split(".")[0]
     if (namespace,) not in catalog.list_namespaces():

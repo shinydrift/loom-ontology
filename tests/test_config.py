@@ -557,3 +557,108 @@ def test_the_claims_every_token_carries_cannot_be_redeclared(tmp_path: Path):
         "    jwks_uri: https://issuer.test/jwks.json\n    claims:\n      sub: boolean\n",
     )
     assert "redeclares 'sub'" in str(diag)
+
+
+# ---- ingest --------------------------------------------------------------------
+
+
+INGEST = VALID + """
+ingest:
+  - name: orders-nightly
+    objectType: Order
+    mode: append
+    format: parquet
+    columns:
+      orderId: order_id
+      total: gross
+governance:
+  ingest: allowed
+"""
+
+
+def test_ingest_entries_are_parsed_in_order(tmp_path: Path):
+    cfg, diag = _load(tmp_path, INGEST)
+    assert diag.errors == []
+    assert len(cfg.ingest) == 1
+    entry = cfg.ingest[0]
+    assert entry.name == "orders-nightly"
+    assert entry.object_type == "Order"
+    assert entry.mode == "append"
+    assert entry.format == "parquet"
+    assert entry.columns == {"orderId": "order_id", "total": "gross"}
+    assert cfg.ingest_posture == "allowed"
+
+
+def test_ingest_defaults_to_refused(tmp_path: Path):
+    """`mcp.writes`' posture rather than `edit_log`'s: a deployment that never asked for bulk
+    writes is not asking to become bulk-writable. Declaring an entry is necessary and not
+    sufficient."""
+    cfg, diag = _load(tmp_path, INGEST.replace("  ingest: allowed", "  edit_log: optional"))
+    assert diag.errors == []
+    assert len(cfg.ingest) == 1  # still declared, still parsed
+    assert cfg.ingest_posture == "refused"
+
+
+def test_no_ingest_block_is_no_entries(tmp_path: Path):
+    cfg, diag = _load(tmp_path, VALID)
+    assert diag.errors == [] and cfg.ingest == () and cfg.ingest_posture == "refused"
+
+
+def test_an_unknown_ingest_posture_is_refused_and_falls_back_to_refusing(tmp_path: Path):
+    """The fallback direction is the safe one, unlike `mcp.writes` where safe and default happened
+    to coincide."""
+    cfg, diag = _load(tmp_path, INGEST.replace("ingest: allowed", "ingest: sure"))
+    assert any("governance.ingest" in e.message for e in diag.errors)
+    assert cfg.ingest_posture == "refused"
+
+
+def test_mode_and_format_are_required_and_never_inferred(tmp_path: Path):
+    text = VALID + """
+ingest:
+  - name: x
+    objectType: Order
+"""
+    cfg, diag = _load(tmp_path, text)
+    messages = " ".join(e.message for e in diag.errors)
+    assert "'mode'" in messages and "'format'" in messages
+    assert cfg.ingest == ()
+
+
+def test_an_unknown_mode_is_refused_with_a_suggestion(tmp_path: Path):
+    text = INGEST.replace("mode: append", "mode: apend")
+    _, diag = _load(tmp_path, text)
+    assert any("'mode' must be one of" in e.message for e in diag.errors)
+    assert any(e.hint and "append" in e.hint for e in diag.errors)
+
+
+def test_an_unknown_format_is_refused(tmp_path: Path):
+    _, diag = _load(tmp_path, INGEST.replace("format: parquet", "format: avro"))
+    assert any("'format' must be one of" in e.message for e in diag.errors)
+
+
+def test_two_entries_with_one_name_are_refused(tmp_path: Path):
+    """A refusal names the entry, and two entries answering to one name make that message ambiguous
+    exactly when it matters."""
+    text = INGEST.replace(
+        "governance:",
+        "  - name: orders-nightly\n    objectType: Order\n    mode: merge\n    format: csv\n"
+        "governance:",
+    )
+    _, diag = _load(tmp_path, text)
+    assert any("both named 'orders-nightly'" in e.message for e in diag.errors)
+
+
+def test_two_properties_reading_one_source_column_are_refused(tmp_path: Path):
+    text = INGEST.replace("total: gross", "total: order_id")
+    _, diag = _load(tmp_path, text)
+    assert any("both read source column 'order_id'" in e.message for e in diag.errors)
+
+
+def test_ingest_must_be_a_list(tmp_path: Path):
+    _, diag = _load(tmp_path, VALID + "\ningest: {a: b}\n")
+    assert any("'ingest' must be a list" in e.message for e in diag.errors)
+
+
+def test_an_unknown_key_in_an_entry_is_refused(tmp_path: Path):
+    _, diag = _load(tmp_path, INGEST.replace("    mode: append", "    mode: append\n    table: x"))
+    assert any("unexpected key 'table'" in e.message for e in diag.errors)

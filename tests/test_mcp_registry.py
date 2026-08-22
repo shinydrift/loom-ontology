@@ -662,3 +662,25 @@ def test_both_transports_are_handed_one_server(ontology):
         assert advertised.description == built.description
         assert advertised.input_schema == built.input_schema
     assert "There is no SQL interface." in (sdk_server.instructions or "")
+
+
+def test_no_declared_ingest_can_reach_the_tool_surface(ontology):
+    """A hard rule, and one the surface gets for free rather than by remembering.
+
+    §7 says the tool set is a function of the *spec*, and an `ingest:` entry lives in `loom.yaml`.
+    So `build_tools` is handed a resolver and a runtime and has nothing to build an ingest tool
+    *from* — there is no argument through which one could arrive. That is why the entry is declared
+    where it is: a verb that writes an arbitrary batch is not a declared single-object action, and
+    handing one to an agent gives back everything §4's boundary withholds.
+
+    Asserted the way the raw-SQL rule is asserted: by naming what must never appear, so a future
+    slice that wires ingest into the registry has to delete a test that says why not."""
+    tools = _tools(ontology, runtime=_runtime(ontology), actor="a")
+    assert tools, "the surface is non-empty, so this is not passing by accident"
+    for name in tools:
+        assert not name.startswith("ingest_")
+        assert "ingest" not in name and "load" not in name
+    for tool in tools.values():
+        for schema in _objects(tool.input_schema):
+            for field in (schema.get("properties") or {}):
+                assert field not in ("mode", "format", "batch", "rows", "source", "loadId")

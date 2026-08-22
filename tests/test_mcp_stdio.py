@@ -47,7 +47,11 @@ def _seeded(tmp_path_factory, name: str, config_extra: str = "") -> Path:
     shutil.copytree(EXAMPLE, target, ignore=shutil.ignore_patterns(".warehouse"))
     if config_extra:
         config = target / "loom.yaml"
-        config.write_text(config.read_text() + config_extra)
+        # Inserted directly under `mcp:` rather than appended to the file. Appending worked only
+        # while `mcp:` happened to be the last top-level block, so the first later block — `ingest:`
+        # — silently reparented these keys and the server refused to start with
+        # "unexpected key 'writes' in governance". Naming the block it belongs to is the fix.
+        config.write_text(config.read_text().replace("\nmcp:\n", f"\nmcp:\n{config_extra}", 1))
 
     spec = importlib.util.spec_from_file_location("stdio_seed", target / "seed.py")
     module = importlib.util.module_from_spec(spec)

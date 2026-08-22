@@ -21,7 +21,14 @@ import yaml
 from ._shape import check_keys, require, suggest
 from .auth import BUILT_IN_CLAIMS, CLAIM_TYPES, MAX_SKEW, ClaimType
 from .errors import Diagnostics, SourceLoc
-from .governance import EDIT_LOG_OPTIONAL, Policy, parse_edit_log, parse_policies
+from .governance import (
+    EDIT_LOG_OPTIONAL,
+    INGEST_REFUSED,
+    Policy,
+    parse_edit_log,
+    parse_ingest_posture,
+    parse_policies,
+)
 
 CONFIG_FILENAME = "loom.yaml"
 SPEC_VERSION = 0
@@ -37,7 +44,22 @@ DEFAULT_HTTP_PORT = 8000
 DEFAULT_HTTP_PATH = "/mcp"
 DEFAULT_HTTP_HOST = "127.0.0.1"
 
-_TOP_KEYS = {"version", "catalogs", "engine", "mcp", "governance"}
+INGEST_APPEND = "append"
+INGEST_MERGE = "merge"
+INGEST_REPLACE = "replace"
+INGEST_MODES = (INGEST_APPEND, INGEST_MERGE, INGEST_REPLACE)
+"""What an `ingest[].mode` may say. No default — see `_parse_ingest`."""
+
+INGEST_FORMATS = frozenset({"parquet", "ndjson", "csv"})
+"""The source shapes `loom ingest` can read.
+
+A short list on purpose: each one is a *file*, and that is the boundary this milestone draws. Loom
+does not connect to Kafka, crawl an object store, or open a JDBC connection — a pipeline hands it a
+batch and Loom decides whether that batch may become rows. Widening this set is a decision about
+formats; adding a *source* would be a decision about what Loom is."""
+
+_TOP_KEYS = {"version", "catalogs", "engine", "mcp", "governance", "ingest"}
+_INGEST_KEYS = {"name", "objectType", "mode", "format", "columns"}
 _CATALOG_KEYS = {"type", "uri", "warehouse", "auth", "properties"}
 _ENGINE_KEYS = {"type", "options"}
 _MCP_KEYS = {"name", "transport", "writes", "actor", "host", "port", "path", "allowed_hosts", "auth"}
@@ -47,7 +69,7 @@ _ADDRESS_KEYS = ("host", "port", "path", "allowed_hosts")
 config that sets them under `transport: stdio` is refused rather than ignored — the rule
 `_check_governance` states, applied to a second set of keys that would otherwise be silently
 dropped."""
-_GOVERNANCE_KEYS = {"policies", "edit_log"}
+_GOVERNANCE_KEYS = {"policies", "edit_log", "ingest"}
 
 
 def is_loopback(host: str) -> bool:
@@ -236,14 +258,53 @@ class McpAuth:
 
 
 @dataclass(frozen=True)
+class IngestEntry:
+    """One entry under `ingest:` — a named, declared way that rows get into one object type.
+
+    **It lives in `loom.yaml` and not in the ontology, and that placement is the design.** §7 says
+    the tool set, its names and its argument namespaces are a function of the spec. Put ingest in the
+    spec and something has to decide whether an `ingest_<type>` tool appears on the MCP surface — and
+    the answer has to be *no*, for the reason `loom serve` exposes no raw-SQL tool: a verb that
+    writes an arbitrary batch is not a declared single-object action, and handing one to an agent
+    gives back everything §4's boundary was built to withhold. Keeping the declaration in the
+    deployment config means no tool can be *derived* from it, structurally rather than by a rule
+    someone has to remember not to break. The precedent is `governance.policies`, which also lives
+    here and also names an `objectType`.
+
+    What it therefore is: a fact about a **deployment** — this warehouse gets its Orders from a
+    nightly Parquet drop — rather than a fact about the ontology, which is the same test that put
+    catalogs and engines here.
+
+    `object_type` is spelled `objectType:` in YAML, matching a policy's subject for the same reason.
+
+    `columns` maps **property name -> source column name**, in the spec's direction (a declaration
+    names the property and says where its value comes from, exactly as `Property.column` does one
+    level down). Absent, it is the identity on property names. A source column no property claims is
+    refused at load time rather than dropped — see `ingest.runtime`, where the data is.
+
+    `mode` and `format` are both **required and never inferred**. A format could be guessed from a
+    file extension and is not: a `.dat` has no extension to guess from, a `.csv` that is really TSV
+    guesses wrong, and the guess would be made per invocation rather than declared once in the file
+    an operator reviews. A mode could default to `append` and must not, because the three modes
+    differ in what they *destroy* and a default would make the safest reading of an under-specified
+    config the one nobody wrote down."""
+
+    name: str
+    object_type: str
+    mode: str
+    format: str
+    columns: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class LoomConfig:
     catalogs: Mapping[str, CatalogConfig] = field(default_factory=dict)
     engine: EngineConfig = field(default_factory=EngineConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
-    # `governance:` had exactly one key in v0 and now has two, and they still arrive flat rather
-    # than behind a config object: they are two unrelated facts about a deployment — what it
-    # withholds from a caller, and whether it will write without recording — read by two different
-    # planes, not one thing with two fields.
+    # `governance:` had exactly one key in v0 and now has three, and they still arrive flat rather
+    # than behind a config object: they are unrelated facts about a deployment — what it withholds
+    # from a caller, whether it will write without recording, and whether it bulk-loads at all —
+    # read by different planes, not one thing with three fields.
     #
     # `policies` is unresolved on purpose: these are policies as *written*, and nothing here has an
     # ontology to check them against — `build_resolver` and `build_runtime` bind them.
@@ -251,8 +312,17 @@ class LoomConfig:
     edit_log: str = EDIT_LOG_OPTIONAL
     """Whether this deployment refuses to run when it cannot record what it writes.
 
-    Read by `build_runtime` alone. The read plane produces no records, so `build_resolver` has
-    nothing to check here — the one governance key that binds a single plane."""
+    Read by `build_runtime` and `build_ingest`, and by nothing on the read plane: it produces no
+    records, so `build_resolver` has nothing to check here. It used to be *the one governance key
+    that binds a single plane*, and ingest is where that sentence narrows rather than breaks — it
+    still binds no read plane, and it now binds both write planes, because it was always a demand
+    about writes and there is now a second kind of one."""
+    ingest: tuple[IngestEntry, ...] = ()
+    """The declared loads, as written. Unresolved here for `policies`' reason: nothing in this
+    module has an ontology to check an `objectType` against."""
+    ingest_posture: str = INGEST_REFUSED
+    """Whether this deployment performs the loads it declares. Default-refused — see
+    `governance.INGEST_POSTURES` for why this default points the opposite way to `edit_log`'s."""
     version: int = SPEC_VERSION
     source: str | None = None  # path it was loaded from, for error messages
 
@@ -299,7 +369,8 @@ def load_config(path: str | Path, diag: Diagnostics) -> LoomConfig | None:
     catalogs = _parse_catalogs(doc.get("catalogs"), loc, diag, base)
     engine = _parse_engine(doc.get("engine"), loc, diag)
     mcp = _parse_mcp(doc.get("mcp"), loc, diag)
-    policies, edit_log = _parse_governance(doc.get("governance"), loc, diag)
+    policies, edit_log, ingest_posture = _parse_governance(doc.get("governance"), loc, diag)
+    ingest = _parse_ingest(doc.get("ingest"), loc, diag)
 
     return LoomConfig(
         catalogs=catalogs,
@@ -307,6 +378,8 @@ def load_config(path: str | Path, diag: Diagnostics) -> LoomConfig | None:
         mcp=mcp,
         policies=policies,
         edit_log=edit_log,
+        ingest=ingest,
+        ingest_posture=ingest_posture,
         version=SPEC_VERSION,
         source=str(path),
     )
@@ -648,12 +721,132 @@ def _check_transport_posture(config: McpConfig, raw: dict, loc: SourceLoc, diag:
         )
 
 
-def _parse_governance(raw: object, loc: SourceLoc, diag: Diagnostics) -> tuple[tuple[Policy, ...], str]:
-    """`governance.policies` and `governance.edit_log`, shape-checked here.
+def _parse_ingest(raw: object, loc: SourceLoc, diag: Diagnostics) -> tuple[IngestEntry, ...]:
+    """`ingest:` as written, shape-checked here and resolved against an ontology later.
 
-    The policies are resolved against an ontology later; `edit_log` is a posture about a deployment
-    and has nothing in a spec to be resolved against, so what is checked here is the whole of what
-    can be checked without opening a catalog.
+    The same two-phase split `_parse_governance` describes: whether the file *names* an object type,
+    a mode and a format is a fact about the file, and whether that object type exists is a fact about
+    a pairing. `build_ingest` does the second.
+
+    A **list** rather than a mapping keyed by name, unlike `catalogs:`, because a load is ordered
+    prose an operator reads top to bottom and because `policies:` — the other list of named things
+    that name an `objectType` — settled the shape already. Duplicate names are refused for the reason
+    a policy's are: a refusal names the entry, and two entries answering to one name make the message
+    ambiguous exactly when it matters."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        diag.error("'ingest' must be a list of load declarations", loc)
+        return ()
+
+    out: list[IngestEntry] = []
+    seen: set[str] = set()
+    for index, body in enumerate(raw):
+        ctx = f"ingest[{index}]"
+        if not isinstance(body, dict):
+            diag.error(f"{ctx} must be a mapping", loc)
+            continue
+        check_keys(body, _INGEST_KEYS, loc, diag, ctx)
+
+        name = require(body, "name", loc, diag, ctx)
+        if name is not None and (not isinstance(name, str) or not name.strip()):
+            diag.error(f"{ctx}: 'name' must be a non-empty string, got {name!r}", loc)
+            name = None
+        if isinstance(name, str):
+            name = name.strip()
+            ctx = f"ingest '{name}'"
+            if name in seen:
+                diag.error(f"two ingest entries are both named '{name}'", loc)
+                name = None
+            else:
+                seen.add(name)
+
+        object_type = require(body, "objectType", loc, diag, ctx)
+        if object_type is not None and (not isinstance(object_type, str) or not object_type.strip()):
+            diag.error(f"{ctx}: 'objectType' must be a non-empty string, got {object_type!r}", loc)
+            object_type = None
+
+        mode = require(body, "mode", loc, diag, ctx)
+        if mode is not None and (not isinstance(mode, str) or mode.strip() not in INGEST_MODES):
+            diag.error(
+                f"{ctx}: 'mode' must be one of {', '.join(INGEST_MODES)}, got {mode!r}",
+                loc,
+                suggest(mode, INGEST_MODES) if isinstance(mode, str) else None,
+            )
+            mode = None
+
+        fmt = require(body, "format", loc, diag, ctx)
+        if fmt is not None and (not isinstance(fmt, str) or fmt.strip() not in INGEST_FORMATS):
+            diag.error(
+                f"{ctx}: 'format' must be one of {', '.join(sorted(INGEST_FORMATS))}, got {fmt!r}",
+                loc,
+                suggest(fmt, INGEST_FORMATS) if isinstance(fmt, str) else None,
+            )
+            fmt = None
+
+        columns = _parse_ingest_columns(body.get("columns"), ctx, loc, diag)
+
+        if name is None or object_type is None or mode is None or fmt is None:
+            continue
+        out.append(
+            IngestEntry(
+                name=name,
+                object_type=str(object_type).strip(),
+                mode=str(mode).strip(),
+                format=str(fmt).strip(),
+                columns=columns,
+            )
+        )
+    return tuple(out)
+
+
+def _parse_ingest_columns(
+    raw: object, ctx: str, loc: SourceLoc, diag: Diagnostics
+) -> dict[str, str]:
+    """`ingest[].columns` — property name -> source column name.
+
+    Empty is the identity mapping and is the default, so the common case (a file whose headers are
+    already the property names) declares nothing. Two properties reading one source column is
+    refused: it is expressible, it is almost certainly a copy-paste, and the alternative to refusing
+    is silently writing one value into two places."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        diag.error(f"{ctx}: 'columns' must be a mapping of property name to source column", loc)
+        return {}
+    out: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    for prop, source in raw.items():
+        if not isinstance(prop, str) or not prop.strip():
+            diag.error(f"{ctx}: 'columns' has a property name that is not a string: {prop!r}", loc)
+            continue
+        if not isinstance(source, str) or not source.strip():
+            diag.error(
+                f"{ctx}: 'columns.{prop}' must be a non-empty source column name, got {source!r}", loc
+            )
+            continue
+        prop, source = prop.strip(), source.strip()
+        if source in sources:
+            diag.error(
+                f"{ctx}: properties '{sources[source]}' and '{prop}' both read source column "
+                f"'{source}'",
+                loc,
+                "one source column cannot fill two properties — only one of them is the mapping",
+            )
+            continue
+        sources[source] = prop
+        out[prop] = source
+    return out
+
+
+def _parse_governance(
+    raw: object, loc: SourceLoc, diag: Diagnostics
+) -> tuple[tuple[Policy, ...], str, str]:
+    """`governance.policies`, `governance.edit_log` and `governance.ingest`, shape-checked here.
+
+    The policies are resolved against an ontology later; the two postures are statements about a
+    deployment and have nothing in a spec to be resolved against, so what is checked here is the
+    whole of what can be checked without opening a catalog.
 
     This used to refuse every declared policy outright, on the grounds that silently ignoring an
     access policy is far worse than not booting. That rule did not go away when enforcement landed —
@@ -664,9 +857,13 @@ def _parse_governance(raw: object, loc: SourceLoc, diag: Diagnostics) -> tuple[t
     ontology is checked here, where a config is read and diagnostics accumulate; what needs the spec
     is checked in `build_resolver`, which is the one place the two are paired."""
     if raw is None:
-        return (), EDIT_LOG_OPTIONAL
+        return (), EDIT_LOG_OPTIONAL, INGEST_REFUSED
     if not isinstance(raw, dict):
         diag.error("'governance' must be a mapping", loc)
-        return (), EDIT_LOG_OPTIONAL
+        return (), EDIT_LOG_OPTIONAL, INGEST_REFUSED
     check_keys(raw, _GOVERNANCE_KEYS, loc, diag, "governance")
-    return parse_policies(raw.get("policies"), loc, diag), parse_edit_log(raw.get("edit_log"), loc, diag)
+    return (
+        parse_policies(raw.get("policies"), loc, diag),
+        parse_edit_log(raw.get("edit_log"), loc, diag),
+        parse_ingest_posture(raw.get("ingest"), loc, diag),
+    )
