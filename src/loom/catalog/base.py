@@ -5,26 +5,41 @@ canonical spelling `PropType.iceberg_type()` produces, so physical validation is
 comparison against the type system's own output and nothing above this port needs pyiceberg
 imported to reason about types.
 
-**Four ports, three planes, and no supersets.** `Catalog` reads. `CatalogWriter` changes a table's
-*shape*. `RowWriter` changes a table's *rows*. `EditLogWriter` appends to *Loom's own record*. The
-read path — the resolver, the query engines, `loom serve` — is handed a `Catalog` and cannot write
-at all. `loom apply` asks for a `CatalogWriter` and therefore cannot delete a row: the port has no
-verb for it. The action runtime asks for a `RowWriter` and therefore cannot alter a schema, for the
-same reason. No writer extends another, because the argument that separated reads from writes points
-every way at once one layer down — `apply` has no business touching rows and an action has no
-business touching DDL.
+**Six ports, four planes, and no supersets.** `Catalog` reads. `CatalogWriter` changes a table's
+*shape*. `RowWriter` changes one of a table's *rows*, keyed. `BulkWriter` changes *many* of them at
+once. `EditLogWriter` and `LoadLogWriter` append to *Loom's own record*. The read path — the
+resolver, the query engines, `loom serve` — is handed a `Catalog` and cannot write at all. `loom
+apply` asks for a `CatalogWriter` and therefore cannot delete a row: the port has no verb for it. The
+action runtime asks for a `RowWriter` and therefore cannot alter a schema, for the same reason. No
+writer extends another, because the argument that separated reads from writes points every way at
+once one layer down — `apply` has no business touching rows and an action has no business touching
+DDL.
 
-It was three ports until the edit log, and the count is the honest thing to change. The third plane
-is real rather than a convenience: `_loom_meta` is a table Loom created, whose schema Loom defines,
-which no spec has ever named and which `plan` therefore never visits. Writing it is not a schema
-change to somebody's table and not a row write to somebody's data, and giving the action runtime
-either of the ports that *can* do those in order to record what it did would have handed it the
-whole of that plane to get one append. What the fourth port costs is stated on `EditLogWriter`
-itself; what it buys is that the runtime still holds no verb that can reach a table the spec names,
-except the three singular keyed ones on `RowWriter`.
+It was three ports until the edit log and five until ingest, and the count is the honest thing to
+change each time. The record plane was real rather than a convenience: `_loom_meta` is a namespace
+Loom created, whose schemas Loom defines, which no spec has ever named and which `plan` therefore
+never visits. Writing it is not a schema change to somebody's table and not a row write to somebody's
+data, and giving a runtime either of the ports that *can* do those in order to record what it did
+would have handed it a whole plane to get one append.
 
-Asking is explicit in every case: `writer_for()` / `row_writer_for()` / `edit_log_writer_for()` fail
-loudly, naming the catalog, against a backend that doesn't implement what was asked for.
+**`BulkWriter` is the fifth port and it opens no new plane** — it writes rows, which `RowWriter`
+already did. It is separate because of what `RowWriter` *is*: every verb there is singular and keyed
+on purpose, which is how spec §4's single-object boundary is enforced at the bottom of the stack and
+not merely at spec-load. A batch verb added there would hand the action runtime a multi-row write and
+dissolve exactly the guarantee the port exists to make. So the two sit side by side, and the thing
+that decides which one a caller holds is which one it asked for. Neither can reach the other's verbs,
+and `BulkWriter` has no DDL verb — **ingest never migrates**; a batch that does not fit the table is
+refused, and the fix is `loom plan` / `loom apply`.
+
+**`LoadLogWriter` is the sixth and it is `EditLogWriter` again, for a different table**, because the
+guarantee those two make is *the table name is not an argument*. One port with a table parameter
+would be one a caller could point at the other log — or at anything else in `_loom_meta` — which is
+the whole of what the shape buys. Two ports whose verbs are named differently are two capabilities a
+structural check can tell apart; one port used twice is not.
+
+Asking is explicit in every case: `writer_for()` / `row_writer_for()` / `bulk_writer_for()` /
+`edit_log_writer_for()` / `load_log_writer_for()` fail loudly, naming the catalog, against a backend
+that doesn't implement what was asked for.
 """
 
 from __future__ import annotations
@@ -299,6 +314,113 @@ class RowWriter(Protocol):
         ...
 
 
+@runtime_checkable
+class BulkWriter(Protocol):
+    """The *many rows at once* half of a catalog: what an ingest declares and a pipeline hands over.
+
+    Deliberately **not** `RowWriter` with a batch argument. Every verb there is singular and keyed
+    because that is where §4's single-object boundary is enforced — a runtime holding a batch verb
+    could write a hundred rows from an action that declared one. And deliberately **not**
+    `CatalogWriter`, whose `append_rows` is the right shape and the wrong neighbours: it sits beside
+    `alter_table`, so a loader holding it could migrate the table it is loading into.
+
+    **There is no schema verb here, permanently.** Ingest never migrates. A batch whose columns do
+    not fit the table is refused naming the column, and the fix is `loom plan` / `loom apply`. This
+    is the never-drop rule pointed at a new plane: Loom will not infer a schema change from the shape
+    of somebody's file, any more than it infers a column drop from the silence of a spec.
+
+    **The three verbs are the three things a declared load can mean**, and each is a different
+    promise about the rows that were already there — `append` adds to them, `merge` replaces the ones
+    it names, `replace` is the whole table. There is no `delete_where`: a bulk delete is a
+    destruction nothing in a spec declares, and the two verbs here that destroy do it as the
+    documented consequence of a mode an operator wrote down.
+
+    **`append_batch` takes no `expect_snapshot_id`, and the other two require one.** That asymmetry
+    is the point rather than an inconsistency with `RowWriter`, where all three verbs are checked:
+
+    - An append **follows no read and puts no row over another**, which is `EditLogWriter`'s
+      argument for the same absence, said about a bigger batch. There is no honest value to pass:
+      the caller read nothing, so it holds no expectation, and *a caller that genuinely has no
+      expectation has not read anything* is the rule that argument exists to state. Requiring one
+      would also make every concurrent append to a busy table refuse the others — a table that
+      cannot be loaded twice at once, to check something no append can get wrong.
+    - A **merge** reads the rows it is about to rewrite, so that the columns the ontology does not
+      map are carried across rather than nulled. That read is exactly `RowWriter.replace_row`'s, and
+      committing over a table that has moved writes somebody else's newer value back to what it used
+      to be — one row at a time there, a batch at a time here.
+    - A **replace** reads nothing and destroys everything, which sounds like the append case and is
+      the opposite of it. What it must not do is destroy a write nobody saw: the expectation is the
+      snapshot the loader observed when it decided the table's whole contents were this batch, and a
+      commit that landed since is precisely the thing that decision did not account for.
+
+    The check is atomic with the write on the two verbs that take it, under `RowWriter`'s rule and
+    with no softening: an implementation that re-reads, compares and then writes has not implemented
+    this port, and a backend that cannot express the assertion must raise rather than approximate
+    one. Refusal is `ConcurrencyError`, and nothing is written.
+
+    **Every verb takes `commit_properties`, and it is required on all three** — including the
+    append, which takes no snapshot. The two arguments answer different questions and only one of
+    them is about a race: a stamp is how the write says which load it was, and that is as true of an
+    append as of anything else. It is recorded with the commit the write produces, which is the only
+    place a record of a write is atomic with the write itself; the log table beside it is a second
+    commit, and `ingest.log` is honest about which of the two can be lost.
+
+    **Whole-batch or nothing.** Each verb is one commit. A partial load — some rows landed, some
+    refused — is the state nobody declared and nothing can describe afterwards, so implementations
+    must not chunk a batch into several commits to make a large one fit. A batch too large to commit
+    is a `CatalogError`, not a series of smaller successes.
+    """
+
+    name: str
+
+    def append_batch(
+        self,
+        table: str,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        commit_properties: Mapping[str, str],
+    ) -> None:
+        """Append every row, each keyed by column name, in one commit.
+
+        Adds to what is there and reads none of it. Nothing here checks whether a key already
+        exists: that question needs the table, and the verb that asks it is `merge_batch`."""
+        ...
+
+    def merge_batch(
+        self,
+        table: str,
+        key_column: str,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        expect_snapshot_id: int | None,
+        commit_properties: Mapping[str, str],
+    ) -> None:
+        """Delete every row whose `key_column` is among the batch's keys and append the batch, in
+        **one transaction**: a reader sees the whole old set or the whole new one.
+
+        Each row must be **complete**, including the columns no property maps — the same requirement
+        `replace_row` makes and for the same reason. A merge is an equality-delete plus an append,
+        so a column the caller leaves out is not preserved, it is nulled. The carry-across is the
+        caller's job because that is where a fake catalog can prove it happened."""
+        ...
+
+    def replace_table(
+        self,
+        table: str,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        expect_snapshot_id: int | None,
+        commit_properties: Mapping[str, str],
+    ) -> None:
+        """Make the table's contents exactly `rows`, in one transaction.
+
+        The only verb in Loom that destroys rows it never read, which is why it is reachable solely
+        from a declared `mode: replace` an operator wrote in `loom.yaml` and never from a default.
+        An empty `rows` empties the table, and that is a real value rather than a no-op — a
+        materialization whose source went empty says so."""
+        ...
+
+
 EDIT_LOG_TABLE = "_loom_meta.edits"
 """The one table `EditLogWriter` writes.
 
@@ -380,6 +502,63 @@ class EditLogWriter(Protocol):
         ...
 
 
+LOAD_LOG_TABLE = "_loom_meta.loads"
+"""The one table `LoadLogWriter` writes, named here for `EDIT_LOG_TABLE`'s reason.
+
+A **sibling** of `_loom_meta.edits` rather than more rows in it, and the argument is that table's own
+"the columns are forever". `edits` holds one row per run of a declared action, and its schema says
+so: `action`, `operation`, `object_key`, `before`, `after`, `attempts`. A load has none of those and
+has four things `edits` has no column for and can never grow one — how many rows landed, how many
+were rejected, which mode, and which load. Writing loads into `edits` would mean every row carrying
+half a schema that does not apply to it, and every reader of the table learning to tell two record
+kinds apart by which columns are null.
+
+The precedent is one level up and points the same way: `_loom_meta.applied` is what `apply` did to
+schemas, and it was not folded into anything either. What varies is the plane being recorded, and a
+plane gets a table."""
+
+
+@runtime_checkable
+class LoadLogWriter(Protocol):
+    """Loom's own record of what an ingest did to a table — append-only, to one table, named here.
+
+    `EditLogWriter` again, verb for verb, and the repetition is deliberate: the property that makes
+    that port safe to hand a runtime is that **the table is not an argument**, and a single port
+    parameterized by table name would lose exactly that. A caller holding this can reach
+    `LOAD_LOG_TABLE` and nothing else, in a namespace Loom owns, to a schema the caller supplies.
+
+    The verbs are named apart from `EditLogWriter`'s (`append_load`, not `append_edit`) because
+    `runtime_checkable` structural checks look at verb *names*: two ports sharing a signature would
+    be one capability wearing two labels, and `_port_for` could not tell an implementation of one
+    from an implementation of the other.
+
+    **There is no delete verb here either, and for the same permanent reason.** An expired record and
+    a lost one are the same sight to a reader holding a stamped snapshot with no matching row, and
+    that distinction is the whole return on writing the record after the commit rather than before
+    it. See `EditLogWriter` for the full argument; nothing about a bulk write weakens it.
+    """
+
+    name: str
+
+    def append_load(self, columns: Sequence[Column], row: Mapping[str, Any]) -> None:
+        """Append one record to `LOAD_LOG_TABLE`, creating it with `columns` if it is not there.
+
+        Unconditional and purely additive: the caller read nothing and is overwriting nothing, so
+        there is no snapshot to assert. `columns` is the table's full schema in order, supplied on
+        every call and consulted only on the first."""
+        ...
+
+    def ensure_load_log(self, columns: Sequence[Column]) -> None:
+        """Create `LOAD_LOG_TABLE` with `columns` if it is not there, and append nothing.
+
+        `EditLogWriter.ensure_log`'s twin, and it exists because `governance.edit_log: required` now
+        has two logs to prove rather than one. A deployment that demands it can record what it writes
+        is demanding it about **writes**, and a bulk load is a write — so a posture that proved only
+        the edit log would leave the deployment able to load unrecorded while believing otherwise,
+        which is the exact half-truth ingest was built to close."""
+        ...
+
+
 def writer_for(catalog: Catalog) -> CatalogWriter:
     """Exchange a read handle for one that can change a table's shape. `loom apply` asks."""
     return _port_for(catalog, CatalogWriter, "schema writes", "'loom apply' to execute against")
@@ -394,6 +573,15 @@ def row_writer_for(catalog: Catalog) -> RowWriter:
     return _port_for(catalog, RowWriter, "row writes", "an action to execute against")
 
 
+def bulk_writer_for(catalog: Catalog) -> BulkWriter:
+    """Exchange a read handle for one that can change many of a table's rows. Ingest asks.
+
+    A sibling of `row_writer_for` and not a mode of it, for the reason the two ports are separate:
+    the plane *and the scope* you are asking for should be visible at the call site, and a runtime
+    that can write one row must not be able to reach this by passing a flag."""
+    return _port_for(catalog, BulkWriter, "bulk row writes", "a declared ingest to load through")
+
+
 def edit_log_writer_for(catalog: Catalog) -> EditLogWriter:
     """Exchange a read handle for one that can append to Loom's own record. The action runtime asks.
 
@@ -401,6 +589,13 @@ def edit_log_writer_for(catalog: Catalog) -> EditLogWriter:
     second one exists: the plane being asked for should be visible at the call site."""
     return _port_for(
         catalog, EditLogWriter, "edit-log writes", "an action to record what it did in"
+    )
+
+
+def load_log_writer_for(catalog: Catalog) -> LoadLogWriter:
+    """Exchange a read handle for one that can append to Loom's record of ingests. Ingest asks."""
+    return _port_for(
+        catalog, LoadLogWriter, "load-log writes", "an ingest to record what it loaded in"
     )
 
 

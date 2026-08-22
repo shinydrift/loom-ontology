@@ -601,8 +601,16 @@ mcp:
     jwks_uri: https://issuer.example/jwks
     clock_skew: 0                 # seconds, bounded — for drift, not for longer sessions
     claims: { dept: string, groups: "string[]" }   # what a policy may name of a caller
+ingest:                           # optional · how rows get in, in bulk · §6.2
+  - name: daily-sales             # required, unique — a refusal names it
+    objectType: DailySalesPerformance
+    mode: replace                 # append | merge | replace · required, never defaulted
+    format: parquet               # parquet | ndjson | csv · required, never inferred
+    columns:                      # property -> source column · defaults to the identity
+      salesDate: sales_date
 governance:                       # optional · what this deployment withholds, and what it demands
   edit_log: optional              # optional | required · refuse to run if it cannot record a write
+  ingest: refused                 # refused | allowed · whether the loads above ever run
   policies:
     - name: hide-ltv              # required, unique — a refusal names it
       objectType: Customer        # the objectType it governs
@@ -863,6 +871,93 @@ is optional exactly where it can be derived: a loopback bind knows the three nam
 non-loopback bind does not know the name the world reaches it by, so it is required there rather
 than guessed.
 
+### 6.2 `ingest` — how rows get in, in bulk
+
+An entry names an object type, a mode and a file format. `loom ingest <entry> <file>` runs one, and
+the file is the only thing it takes on the command line, because the file is the only thing that
+varies per run.
+
+**It is in `loom.yaml` and not in the ontology, and that placement is the design.** §7 says the tool
+set, its names and its argument namespaces are a function of the spec. Put ingest in the spec and
+something has to decide whether an `ingest_<type>` tool appears on the MCP surface — and the answer
+is **no**, for the reason `loom serve` exposes no raw-SQL tool: a verb that writes an arbitrary batch
+is not a declared single-object action, and handing one to an agent gives back everything §4's
+boundary was built to withhold. Declaring it here means no tool can be *derived* from it,
+structurally rather than by a rule someone remembers not to break. The precedent is
+`governance.policies`, which also lives here and also names an `objectType`.
+
+What an entry therefore *is*: a fact about a deployment — this warehouse gets its daily numbers from
+a Parquet drop — rather than a fact about the ontology, which is the same test that put catalogs and
+engines here.
+
+**Three modes, and they differ in what they destroy.**
+
+| mode | what it does to the rows already there | reads first? |
+|---|---|---|
+| `append` | adds to them | no — and therefore asserts no snapshot |
+| `merge` | replaces the ones the batch names, by primary key | yes |
+| `replace` | the table becomes exactly the batch | yes |
+
+`merge` carries **every column the ontology does not map** across from the existing row. That is
+§4.1's rule at batch scale and it is why `merge` is a mode rather than a flag on `append`: a merge is
+an equality-delete plus an append, so a column Loom never declared is carried or it is silently
+nulled.
+
+`append` is the one verb with no snapshot expectation, and the asymmetry is deliberate. An append
+follows no read and puts no row over another — `EditLogWriter`'s argument at batch scale — so there
+is no honest value to assert, and requiring one would make two pipelines loading the same table
+refuse each other over a race neither can lose. `merge` and `replace` both assert: the first because
+its carried columns come from a read, the second because it must not destroy a commit nobody saw.
+
+**Ingest never migrates.** The `BulkWriter` port has no DDL verb. A batch that does not fit the table
+is refused naming the column, and the fix is `loom plan` / `loom apply` — the never-drop rule pointed
+at a new plane, refusing to infer a schema change from the shape of somebody's file.
+
+**Neither half of a policy conditions a load.** A `mask:` withholds a property from a caller and a
+load has no caller; a `rows:` predicate decides which rows a deployment will *show*, which is not a
+claim about which rows may exist; and a `when:` guard is unanswerable where nothing can attest
+anybody, exactly as it is for `loom query`. What governs ingest is `governance.ingest`, and what
+demands a record of it is `governance.edit_log`.
+
+**`governance.ingest` defaults to `refused`**, which is `mcp.writes`' posture rather than
+`edit_log`'s, and the two defaults point opposite ways for the same test — *what does a deployment
+that never asked for this get?* A deployment that never asked for the `edit_log` posture is not
+asking to stop working; a deployment that never asked for bulk writes is not asking to become
+bulk-writable. So declaring an entry is necessary and not sufficient, exactly as declaring an
+`action` is necessary and not sufficient for `run_<action>` to be served.
+
+**`governance.edit_log: required` covers both logs.** Its own words are *a deployment that cannot log
+does not run*, and they were written when the only thing Loom could write was one row through an
+action. A bulk load is a write, so a posture that proved only `_loom_meta.edits` would leave a
+deployment able to load unrecorded while believing it could not — which is the half-truth ingest
+exists to close, reproduced inside the fix for it. Under `required`, `_loom_meta.loads` is created at
+startup too.
+
+**A load has an identity, and re-running one is a refusal.** The id is supplied with `--load-id` or
+derived from the entry, the mode and a SHA-256 of the file's bytes. It is stamped into the write's own
+Iceberg commit as `loom.load_id` — the only record of a load that is atomic with it — and recorded in
+`_loom_meta.loads` beside the row counts, the source path and its fingerprint. A pipeline that times
+out and retries hands Loom the same file, and Loom answers *that is one load happening twice*; an
+operator who meant the other thing says so with `--load-id`.
+
+**A refusal is whole.** One bad value refuses the whole batch, because a partial load leaves the lake
+in a state nobody declared. `--reject-to <path>` is the escape hatch and it is narrow: it quarantines
+the rows that failed **their own** checks and loads the rest. It cannot rescue a load whose columns
+are wrong — there is no subset of a batch that has the right columns — and it cannot absorb a
+duplicate primary key, because choosing which of two rows sharing a key survives is a decision the
+file does not contain.
+
+**A zero-byte file cannot empty a table.** `mode: replace` with an empty batch is a real value — a
+materialization whose source went empty is saying so — but an empty NDJSON declares no *columns*, so
+it fails the ordinary column check with no special case anywhere. A truncated upload and a deliberate
+empty batch are the same zero bytes, and one of them wipes a table. A header-only CSV or an empty
+Parquet table can say *these columns, and no rows*; NDJSON cannot.
+
+**Formats are files, and that is the boundary.** `parquet`, `ndjson`, `csv`. Loom does not connect to
+Kafka, crawl an object store or open a JDBC connection. A pipeline hands Loom a batch; Loom decides
+whether that batch may become rows. Adding a fourth format is a small decision about parsers; adding
+a *source* would be a large one about what Loom is.
+
 ---
 
 ## 7. What the grammar compiles to (deterministic)
@@ -881,6 +976,12 @@ surface. Nothing here is hand-authored.
 Tool names are the api name in `snake_case`, for every row of that table. This one used to read
 `run_upgradeTier`, which no other row's spelling would have produced — a slip, corrected, in the
 same class as the two §4/§5 bugs the action runtime turned up.
+
+**And an `ingest:` entry generates nothing, which is why it is not in the spec.** It is the one
+declared, named, runnable thing in Loom with no row in this table — a `loom ingest` command and
+nothing else. That is enforced by where it is written rather than by a rule about what to skip: this
+table maps the *spec* to a tool set, `ingest:` lives in `loom.yaml`, and a surface assembled from the
+spec therefore cannot reach it. See §6.2.
 
 **One tool per action, not one `run(action, params)`.** `traverse` is generic and an action is not,
 and the rule that decides both is about the *schema* rather than the name: a generic tool is right
@@ -1090,15 +1191,22 @@ JOIN, and exposes `get_customer`, `search_customer`, `list_customer`, `get_order
 Part of the contract because these are tables in *your* lake, not implementation details: anything
 with an Iceberg client can read them, and a later Loom must keep them readable.
 
-The namespace holds two tables, one per catalog, and neither is ever named by a spec:
+The namespace holds three tables, one per catalog, and none is ever named by a spec:
 
 | table | records | created by |
 |---|---|---|
 | `_loom_meta.applied` | what `apply` did to **schemas** | the first `loom apply` touching that catalog |
-| `_loom_meta.edits` (§9.2) | what an action did to **rows** | the first action run against that catalog |
+| `_loom_meta.edits` (§9.2) | what an action did to **one row** | the first action run against that catalog |
+| `_loom_meta.loads` (§9.3) | what an ingest did to **many** | the first load run against that catalog |
 
-Neither is a planner input and neither can be planned *against*: `plan` only ever visits the tables
-the spec declares, so it proposes nothing for either of these and reports neither as unmanaged.
+None is a planner input and none can be planned *against*: `plan` only ever visits the tables the
+spec declares, so it proposes nothing for any of these and reports none as unmanaged.
+
+**Three tables rather than one log with a `kind` column**, and the reason is `applied`'s schema
+rather than tidiness: each of these is only ever *created*, never altered, so a column left out today
+can never reach a table that already exists. Merging planes would mean every row carrying two-thirds
+of a schema that does not apply to it, and every reader learning to tell record kinds apart by which
+columns are null. What varies is the plane being recorded, and a plane gets a table.
 
 `_loom_meta.applied`, created by the first `loom apply` that touches that catalog:
 
@@ -1278,6 +1386,66 @@ The answer that keeps the invariant is a **redaction in place** — the row kept
 `object_key` emptied — so the skeleton stays citeable, the stamp still finds a row, and the personal
 data is gone. That is a rewrite rather than an append, by a holder that is not the action runtime.
 See "Open edges".
+
+### 9.3 `loads` — what an ingest did
+
+One table per catalog, created by the **first load run against that catalog** — `edits`' rule, for
+`edits`' reason. Under `governance.edit_log: required` it is created at startup instead, beside the
+edit log, because that posture is a demand about writes and a bulk load is a write.
+
+```
+_loom_meta.loads
+  load_id             string       required   # also stamped into the write's own Iceberg commit
+  recorded_at         timestamptz  required
+  entry               string                  # the `ingest:` entry that ran
+  actor               string                  # `unknown` when nobody was named
+  principal           string                  # always null today — ingest attests nobody
+  object_type         string
+  mode                string                  # append | merge | replace
+  catalog             string
+  table_name          string
+  source              string                  # the path that was read
+  source_fingerprint  string                  # sha256 of its bytes
+  status              string                  # applied | refused | failed
+  rows_read           long
+  rows_written        long
+  rows_rejected       long
+  read_snapshot_id    long                    # null for an append, which reads nothing
+  failures            string                  # JSON
+  loom_version        string
+```
+
+**One row per load, not per row loaded.** The alternative is unaffordable — a million-row load would
+write a million records — but it is also wrong in the way one record per *attempt* would have been
+wrong for an action: a load is one decision and one commit. What varies per row is whether it was
+written or rejected, and that is three integers.
+
+**There is no `before` and no `after`, and that is a difference rather than an omission.** An
+action's record carries them because a caller supplied a handful of values and *what did this change*
+has an answer that fits in a row. A load's answer is the batch, and copying it here would make this
+table an unabridged second copy of somebody's nightly drop — §9.2's leak at a scale where it is also
+a storage bill. `source` and `source_fingerprint` replace them: not the data, but enough that an
+auditor holding the file can prove it is the one that landed.
+
+**A refusal is recorded once the load named itself.** `edits`' gate is *the run named a row*; this
+one is *the load acquired an id*, which happens as soon as the file has been read and fingerprinted.
+Everything after that — a bad column, a value that would not coerce, a lost race — writes a row with
+`rows_written: 0`, because *who tried to replace this table* is as much an audit question as *who
+tried to delete this customer*. The two refusals above the gate do not: a file that cannot be read
+produces no id, so the record would cite nothing, and a deployment whose `governance.ingest` is
+`refused` is declining to be the kind of thing that loads at all — recording it would mean creating
+this table in exactly the deployments that set the posture to avoid having one.
+
+**A `--dry-run` records nothing at all, including a refusal**, matching what `preview()` does on the
+action plane. Asking whether a load would work must not write to the lake, and it must not create
+this table in a catalog whose operator was asking a question. That interacts with one thing worth
+naming, because `loom ingest` previews before every real load: a refusal discovered at preview would
+otherwise never be recorded, so unless `--dry-run` was asked for, the command runs the refusing load
+for real. Nothing is written either way — a refusal changes nothing — and the record then belongs to
+an attempt somebody actually made.
+
+**Nothing removes a row here either**, for §9.2's reason exactly, and the erasure question does not
+arise the same way: this table holds counts and a fingerprint, never a customer.
 
 ---
 

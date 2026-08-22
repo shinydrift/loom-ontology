@@ -5,7 +5,10 @@ dev command for exercising the read path by hand, and `serve` exposes those same
 tools. `plan` dry-runs the migration engine, `apply` executes exactly what `plan` printed, and
 `rollback` restores a spec out of `_loom_meta` and re-plans it — the same loop, an older spec.
 `run` is `query`'s counterpart on the write path: one declared action, through the same runtime
-M4's `run_<action>` tool will call.
+M4's `run_<action>` tool will call. `ingest` is `run` at batch scale and the one command with no
+tool behind it: a declared load, from a file, checked against the ontology and written as one commit
+— deliberately reachable only from here, because a verb that writes an arbitrary batch is not
+something any agent surface should be able to name.
 """
 
 from __future__ import annotations
@@ -319,6 +322,158 @@ def _render_run(result, title: str) -> str:
         lines.append("  decide is a conflict you are told about, never a silent overwrite.")
     for failure in result.failures:
         lines.append(f"\n  ! {failure.code}: {failure.message}")
+    if result.failures:
+        lines.append("  nothing was written.")
+    return "\n".join(lines)
+
+
+def cmd_ingest(args) -> int:
+    """Run one declared bulk load. `loom run`'s counterpart at batch scale.
+
+    It takes an **entry name and a file**, and nothing else that describes the load: not a table, not
+    a mode, not a column mapping. Those live in `loom.yaml` because a load is a fact about a
+    deployment, and a flag that could contradict the reviewed file is the thing `mcp.writes` refused
+    to be. What the command line carries is what genuinely varies per invocation — which file, and
+    the three operator decisions below.
+
+    `--load-id` overrides the id derived from the entry, the mode and the file's bytes. It is how an
+    operator says *yes, this file again, on purpose* — the one thing the derived id would otherwise
+    refuse forever.
+
+    `--reject-to` turns whole-batch refusal into quarantine-and-continue for the failures that are a
+    row's own. It cannot rescue a load whose columns are wrong, and the refusals that survive it say
+    so by name.
+
+    `--dry-run` previews. Every real load previews first anyway, for `cmd_run`'s reason: what the
+    prompt shows should be what is about to happen rather than a second guess at it."""
+    diag = Diagnostics()
+    try:
+        ontology, config = _load_project(args.path, diag)
+    except SpecErrors as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    from .catalog import LOAD_LOG_TABLE, CatalogError, open_catalogs
+    from .governance import PolicyError
+    from .ingest import LOG_FAILED, IngestError, build_ingest
+    from .mcp.registry import json_safe
+    from .migrate.meta import default_actor
+
+    try:
+        runtime = build_ingest(ontology, config, open_catalogs(config))
+        # `reject_to` is passed to the preview as well as to the run, and it has to be: without it
+        # the preview refuses any batch with a single bad row, the command exits on that refusal, and
+        # the flag whose whole purpose is to *avoid* whole-batch refusal never reaches the load it
+        # was meant to change.
+        preview = runtime.load(
+            args.entry,
+            args.source,
+            load_id=args.load_id,
+            dry_run=True,
+            reject_to=args.reject_to,
+        )
+    except (IngestError, PolicyError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except CatalogError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    print(_render_load(preview, str(args.path)), file=sys.stderr)
+    if args.dry_run:
+        print(json.dumps(json_safe(preview.as_json()), indent=2, default=str))
+        return 0 if preview.ok else 1
+
+    # A refused preview still runs for real, and there is nothing to confirm first because a refusal
+    # writes nothing. It runs because a preview records nothing — so without this, every refusal an
+    # operator hit from the command line would be absent from `_loom_meta.loads`, and *who tried to
+    # replace this table* would be answerable only for loads that succeeded.
+    if preview.ok and not _confirmed(args.yes, "load"):
+        print("aborted — nothing was written", file=sys.stderr)
+        return 1
+
+    try:
+        result = runtime.load(
+            args.entry,
+            args.source,
+            actor=default_actor(),
+            load_id=args.load_id,
+            reject_to=args.reject_to,
+        )
+    except CatalogError as e:  # pragma: no cover - the runtime folds these into WRITE_FAILED
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    print(json.dumps(json_safe(result.as_json()), indent=2, default=str))
+    for failure in result.failures:
+        print(f"error: {failure.code}: {failure.message}", file=sys.stderr)
+    unlogged = any(f.code == LOG_FAILED for f in result.failures)
+    if result.load_id and not unlogged:
+        print(f"note: recorded in {LOAD_LOG_TABLE} as {result.load_id}.", file=sys.stderr)
+    elif unlogged:
+        # The id is still worth printing: the write stamped it into its own Iceberg commit, so it is
+        # how someone finds this load in the table's history now that the log has not got it.
+        print(
+            f"note: the load log did not record this load — the commit it stamped carries "
+            f"{result.load_id}.",
+            file=sys.stderr,
+        )
+    if result.rows_rejected:
+        print(
+            f"note: {result.rows_rejected} row(s) were rejected and written to {args.reject_to} — "
+            f"they are not in the table.",
+            file=sys.stderr,
+        )
+    if result.read_snapshot_id != preview.read_snapshot_id:
+        print(
+            f"note: the table moved while you decided (previewed at {preview.read_snapshot_id}, "
+            f"loaded at {result.read_snapshot_id}) — the result above is what happened, not the "
+            f"preview above it.",
+            file=sys.stderr,
+        )
+    print(
+        f"{result.status} · {result.rows_written} row(s) into {result.table}", file=sys.stderr
+    )
+    return 0 if result.ok else 1
+
+
+def _render_load(result, title: str) -> str:
+    """What is about to happen, before the prompt.
+
+    Shaped like `_render_run` and `render_plan`, and the symbol carries the same meaning it does
+    there: `+` adds, `~` changes in place, `-` goes away. A mode is exactly a statement about which
+    of those three a batch does to the rows already in the table, so the three modes get the three
+    symbols rather than a word an operator has to translate."""
+    marks = {"append": "+", "merge": "~", "replace": "-"}
+    lines = [f"Loom ingest — {result.entry} on {title}", ""]
+    lines.append(
+        f"  {marks.get(result.mode, '?')} {result.mode} {result.rows_read} row(s) "
+        f"into {result.object_type} ({result.table})"
+    )
+    lines.append(f"      from  {result.source}")
+    lines.append(f"      load  {result.load_id or '(none — refused before it was identified)'}")
+    if result.mode == "replace":
+        # Said in words, above the prompt, because it is the one mode whose whole effect is on rows
+        # nobody named and no other command in Loom destroys data it never read.
+        lines.append(
+            "\n  ! replace empties this table first — every row not in the batch is gone,"
+            "\n    including rows this ontology does not describe."
+        )
+    if result.rows_rejected:
+        lines.append(f"\n  {result.rows_rejected} row(s) would be rejected rather than loaded.")
+    if result.read_snapshot_id is not None:
+        lines.append(f"\n  previewed at snapshot {result.read_snapshot_id} — nothing is held:")
+        lines.append("  the load reads again and asserts that read, so a table that moves while you")
+        lines.append("  decide is a conflict you are told about, never a silent overwrite.")
+    elif result.ok:
+        lines.append(
+            "\n  an append asserts no snapshot — it reads nothing and puts no row over another."
+        )
+    for failure in result.failures:
+        lines.append(f"\n  ! {failure.code}: {failure.message}")
+        hint = failure.detail.get("hint")
+        if hint:
+            lines.append(f"    hint: {hint}")
     if result.failures:
         lines.append("  nothing was written.")
     return "\n".join(lines)
@@ -746,6 +901,28 @@ def main(argv: list[str] | None = None) -> int:
     r_.add_argument("--dry-run", action="store_true", help="bind and validate, but write nothing")
     r_.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     r_.set_defaults(func=cmd_run)
+
+    i = sub.add_parser("ingest", help="run one declared bulk load from a file")
+    i.add_argument("entry", help="the ingest entry declared in loom.yaml, e.g. orders-nightly")
+    i.add_argument("source", help="path to the file to load, in the format the entry declares")
+    i.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")
+    i.add_argument("--dry-run", action="store_true", help="check the batch, but write nothing")
+    i.add_argument(
+        "--load-id",
+        default=None,
+        metavar="ID",
+        help="override the id derived from the entry, the mode and the file — how you say "
+        "'this file again, on purpose'",
+    )
+    i.add_argument(
+        "--reject-to",
+        default=None,
+        metavar="PATH",
+        help="write rows that fail their own checks here as NDJSON and load the rest, instead of "
+        "refusing the whole batch",
+    )
+    i.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    i.set_defaults(func=cmd_ingest)
 
     s = sub.add_parser("serve", help="serve the ontology as MCP tools over stdio")
     s.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")

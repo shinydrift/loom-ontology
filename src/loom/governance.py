@@ -192,7 +192,32 @@ EDIT_LOG_POSTURES = (EDIT_LOG_OPTIONAL, EDIT_LOG_REQUIRED)
 """What `governance.edit_log` may say, and `optional` is what it says when nobody says anything.
 
 A sibling of `policies:` rather than an entry in it, for `mcp.writes`' reason — see this module's
-docstring. Enforced by `action.log.require_edit_log`, from `build_runtime`."""
+docstring. Enforced by `action.log.require_edit_log` from `build_runtime`, and by
+`ingest.log.require_load_log` from `build_ingest` — one posture, two logs, because it is a demand
+about *writes* and a bulk load is a write. A deployment that proved only the edit log would be able
+to load unrecorded while believing it could not."""
+
+INGEST_REFUSED = "refused"
+INGEST_ALLOWED = "allowed"
+INGEST_POSTURES = (INGEST_REFUSED, INGEST_ALLOWED)
+"""What `governance.ingest` may say, and `refused` is what it says when nobody says anything.
+
+**Default-refused, which is `mcp.writes`' posture rather than `edit_log`'s.** The two defaults point
+opposite ways and both are right for the same test — *what does a deployment that never asked for
+this get?* `edit_log` defaults to `optional` because a deployment that never asked for the posture is
+not asking to stop working. `ingest` defaults to `refused` because a deployment that never asked for
+bulk writes is not asking to become bulk-writable: an upgrade that shipped ingest and a `loom.yaml`
+that happens to describe a load are two things that happen for unrelated reasons, and their product
+must not be somebody's lake quietly gaining a way to be overwritten wholesale.
+
+So declaring an `ingest:` entry is necessary and not sufficient, exactly as declaring an `action` is
+necessary and not sufficient for `run_<action>` to be served. The entry says *what a load would be*;
+this says *whether this deployment does that at all*. A refused deployment still validates its
+entries — a spec error is worth reporting whether or not the posture would let it run — and refuses
+at the point one would execute.
+
+Not a policy in `policies:` for the reason `mcp.writes` is not one: it names no principal, filters no
+row, and switches a whole surface rather than subtracting from one."""
 
 
 class PolicyError(RuntimeError):
@@ -511,6 +536,28 @@ def parse_edit_log(raw: object, loc: SourceLoc, diag: Diagnostics) -> str:
             suggest(raw, EDIT_LOG_POSTURES) if isinstance(raw, str) else None,
         )
         return EDIT_LOG_OPTIONAL
+    return raw.strip()
+
+
+def parse_ingest_posture(raw: object, loc: SourceLoc, diag: Diagnostics) -> str:
+    """`governance.ingest` — whether this deployment performs the loads it declares.
+
+    A string of two values rather than a boolean, matching `edit_log` beside it, because the pair
+    reads as one vocabulary and because `ingest: false` invites the misreading `mcp.writes` had to
+    guard against by hand: under YAML a quoted `"no"` is a string that is not `false`, and a posture
+    that silently fell back to permitting would be the one misreading of this key that costs somebody
+    a table. Here an unrecognised value is an error and the fallback is `refused` — the safe
+    direction, unlike `writes`, where the safe direction and the default happened to coincide."""
+    if raw is None:
+        return INGEST_REFUSED
+    if not isinstance(raw, str) or raw.strip() not in INGEST_POSTURES:
+        allowed = ", ".join(INGEST_POSTURES)
+        diag.error(
+            f"'governance.ingest' must be one of {allowed}, got {raw!r}",
+            loc,
+            suggest(raw, INGEST_POSTURES) if isinstance(raw, str) else None,
+        )
+        return INGEST_REFUSED
     return raw.strip()
 
 

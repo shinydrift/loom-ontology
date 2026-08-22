@@ -17,7 +17,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .base import EDIT_LOG_TABLE, CatalogError, Column, ConcurrencyError, SchemaEdit, TableSchema
+from .base import (
+    EDIT_LOG_TABLE,
+    LOAD_LOG_TABLE,
+    CatalogError,
+    Column,
+    ConcurrencyError,
+    SchemaEdit,
+    TableSchema,
+)
 
 _DECIMAL = re.compile(r"^decimal\((\d+),\s*(\d+)\)$")
 
@@ -73,12 +81,12 @@ def _namespace_of(table: str) -> str:
 
 @dataclass
 class PyIcebergCatalog:
-    """Adapts a constructed pyiceberg catalog to the `Catalog`, `CatalogWriter` and `RowWriter`
-    ports.
+    """Adapts a constructed pyiceberg catalog to every port in `base.py`.
 
-    One class implements all three because pyiceberg can do all three; that is not the same as the
-    ports being one port. What each *caller* is handed is decided by which of `writer_for` /
-    `row_writer_for` it asked, and the type it holds is what bounds what it can do."""
+    One class implements all six because pyiceberg can do all six; that is not the same as the ports
+    being one port. What each *caller* is handed is decided by which of `writer_for` /
+    `row_writer_for` / `bulk_writer_for` / `edit_log_writer_for` / `load_log_writer_for` it asked,
+    and the type it holds is what bounds what it can do."""
 
     name: str
     _impl: Any
@@ -412,6 +420,103 @@ class PyIcebergCatalog:
             found=found,
         )
 
+    # --- BulkWriter ----------------------------------------------------------------------
+    # Many rows, one commit each. No DDL verb reaches this section — a batch that does not fit the
+    # table's schema fails in `_batch`, which builds against the table's *own* schema, so a column
+    # the table does not have is an error rather than a column quietly added.
+
+    def append_batch(
+        self,
+        table: str,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        commit_properties: Mapping[str, str],
+    ) -> None:
+        """Every row, one commit, no assertion — `append_edit`'s shape at batch scale.
+
+        Deliberately not routed through `_guarded`: there is no snapshot to assert because the
+        caller read nothing and this appends over nothing, and manufacturing an expectation here
+        would make two pipelines loading the same table refuse each other for a race neither can
+        lose."""
+        if not rows:
+            return
+        tbl = self._load(table)
+        try:
+            tbl.append(self._batch(tbl, rows), snapshot_properties=dict(commit_properties))
+        except Exception as e:
+            raise CatalogError(
+                f"could not append {len(rows)} row(s) to '{table}' in catalog '{self.name}': {e}"
+            ) from e
+
+    def merge_batch(
+        self,
+        table: str,
+        key_column: str,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        expect_snapshot_id: int | None,
+        commit_properties: Mapping[str, str],
+    ) -> None:
+        """Equality-delete on the batch's keys plus an append of the batch, as one commit.
+
+        The same thing `replace_row` does to one row, over a set of them: `overwrite` inside a
+        transaction drops or rewrites the files matching the filter and adds the new rows, and the
+        whole thing lands as one Iceberg commit. A reader sees the whole old set or the whole new
+        one — never a mixture, and never a key twice."""
+        if not rows:
+            return
+        with self._guarded(table, expect_snapshot_id, "merge rows into") as (tbl, txn):
+            txn.overwrite(
+                self._batch(tbl, rows),
+                overwrite_filter=self._keys_filter(key_column, [r.get(key_column) for r in rows]),
+                snapshot_properties=dict(commit_properties),
+            )
+
+    def replace_table(
+        self,
+        table: str,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        expect_snapshot_id: int | None,
+        commit_properties: Mapping[str, str],
+    ) -> None:
+        """The table's whole contents become `rows`, as one commit.
+
+        An empty batch takes the `delete` branch rather than the `overwrite` one, because an
+        overwrite with nothing to write has no rows to derive an Arrow schema from and would either
+        raise or quietly do nothing — and *quietly nothing* is the worst available answer to "make
+        this table empty"."""
+        from pyiceberg.expressions import AlwaysTrue
+
+        with self._guarded(table, expect_snapshot_id, "replace the contents of") as (tbl, txn):
+            if rows:
+                txn.overwrite(
+                    self._batch(tbl, rows),
+                    overwrite_filter=AlwaysTrue(),
+                    snapshot_properties=dict(commit_properties),
+                )
+            else:
+                txn.delete(
+                    delete_filter=AlwaysTrue(), snapshot_properties=dict(commit_properties)
+                )
+
+    @staticmethod
+    def _keys_filter(key_column: str, values: Sequence[Any]):
+        """`key_column IN (…)`, with nulls disjoined in rather than dropped.
+
+        `_key_filter`'s rule at batch scale, and it matters more here: Iceberg's `In` never matches a
+        null, exactly as SQL's `IN` does not, so a null key folded into the list would delete nothing
+        while the append beside it added the row — turning a merge into a duplicate. The ingest
+        runtime refuses a null key before it ever gets here; this stays correct anyway, because a
+        port that is only safe when its caller is careful is not safe."""
+        from pyiceberg.expressions import AlwaysFalse, In, IsNull, Or
+
+        present = [v for v in values if v is not None]
+        expr: Any = In(key_column, present) if present else AlwaysFalse()
+        if len(present) != len(values):
+            expr = IsNull(key_column) if isinstance(expr, AlwaysFalse) else Or(expr, IsNull(key_column))
+        return expr
+
     # --- EditLogWriter -------------------------------------------------------------------
 
     def ensure_log(self, columns: Sequence[Column]) -> None:
@@ -420,10 +525,7 @@ class PyIcebergCatalog:
         The one piece of DDL reachable from the action runtime, bounded by the port rather than by a
         check in here: neither method takes a table name, so `EDIT_LOG_TABLE` is the only thing
         either can ever create."""
-        if self.table_exists(EDIT_LOG_TABLE):
-            return
-        self.ensure_namespace(EDIT_LOG_TABLE)
-        self.create_table(EDIT_LOG_TABLE, columns, properties={"loom.managed": "true"})
+        self._ensure_meta_table(EDIT_LOG_TABLE, columns)
 
     def append_edit(self, columns: Sequence[Column], row: Mapping[str, Any]) -> None:
         """One record into `EDIT_LOG_TABLE`, which this method creates if it is not there.
@@ -432,13 +534,41 @@ class PyIcebergCatalog:
         caller read nothing and this appends over nothing. Routing it there to reuse the plumbing
         would have manufactured an expectation nobody holds, and made the log table's own traffic
         able to refuse a write."""
-        self.ensure_log(columns)
-        tbl = self._load(EDIT_LOG_TABLE)
+        self._append_meta_row(EDIT_LOG_TABLE, columns, row, "record an edit in")
+
+    # --- LoadLogWriter -------------------------------------------------------------------
+
+    def ensure_load_log(self, columns: Sequence[Column]) -> None:
+        """`ensure_log` for the other log. Bounded by the port rather than by a check in here:
+        neither verb takes a table name, so `LOAD_LOG_TABLE` is the only thing either can create."""
+        self._ensure_meta_table(LOAD_LOG_TABLE, columns)
+
+    def append_load(self, columns: Sequence[Column], row: Mapping[str, Any]) -> None:
+        """One record into `LOAD_LOG_TABLE`, which this method creates if it is not there.
+
+        Unguarded for `append_edit`'s reason: nothing was read, nothing is being written over, and
+        routing it through `_guarded` would let the log table's own traffic refuse the record of a
+        load that already committed."""
+        self._append_meta_row(LOAD_LOG_TABLE, columns, row, "record a load in")
+
+    # --- shared by both log ports --------------------------------------------------------
+
+    def _ensure_meta_table(self, table: str, columns: Sequence[Column]) -> None:
+        if self.table_exists(table):
+            return
+        self.ensure_namespace(table)
+        self.create_table(table, columns, properties={"loom.managed": "true"})
+
+    def _append_meta_row(
+        self, table: str, columns: Sequence[Column], row: Mapping[str, Any], doing: str
+    ) -> None:
+        self._ensure_meta_table(table, columns)
+        tbl = self._load(table)
         try:
             tbl.append(self._batch(tbl, [row]))
         except Exception as e:
             raise CatalogError(
-                f"could not record an edit in '{EDIT_LOG_TABLE}' in catalog '{self.name}': {e}"
+                f"could not {doing} '{table}' in catalog '{self.name}': {e}"
             ) from e
 
     @staticmethod

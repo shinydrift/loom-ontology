@@ -89,8 +89,10 @@ def served(tmp_path_factory):
     # Replaced rather than appended: a second `transport:` key would be a duplicate pyyaml resolves
     # silently, and the whole point of the file is that it says what the deployment is.
     config.write_text(
-        config.read_text().replace("  transport: stdio\n", f"  transport: http\n  port: {port}\n")
-        + f"  writes: true\n  actor: {ACTOR}\n"
+        config.read_text().replace(
+            "  transport: stdio\n",
+            f"  transport: http\n  port: {port}\n  writes: true\n  actor: {ACTOR}\n",
+        )
     )
 
     spec = importlib.util.spec_from_file_location("http_seed", project / "seed.py")

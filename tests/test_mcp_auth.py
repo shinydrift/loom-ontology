@@ -156,13 +156,18 @@ def served(tmp_path_factory, issuer):
     shutil.copytree(EXAMPLE, project, ignore=shutil.ignore_patterns(".warehouse"))
     port = _free_port()
     config = project / "loom.yaml"
+    auth_block = (
+        "  auth:\n"
+        f"    issuer: {ISSUER}\n"
+        f"    audience: {AUDIENCE}\n"
+        f"    jwks_uri: {issuer.jwks_uri}\n"
+    )
     config.write_text(
-        config.read_text().replace("  transport: stdio\n", f"  transport: http\n  port: {port}\n")
-        + f"  writes: true\n  actor: {ACTOR}\n"
-        + "  auth:\n"
-        + f"    issuer: {ISSUER}\n"
-        + f"    audience: {AUDIENCE}\n"
-        + f"    jwks_uri: {issuer.jwks_uri}\n"
+        config.read_text().replace(
+            "  transport: stdio\n",
+            f"  transport: http\n  port: {port}\n  writes: true\n"
+            f"  actor: {ACTOR}\n{auth_block}",
+        )
     )
 
     spec = importlib.util.spec_from_file_location("auth_seed", project / "seed.py")
@@ -417,9 +422,7 @@ def test_no_principal_is_current_without_a_transport():
 # different rows, decided by claims a real issuer signed and a real verifier checked.
 
 
-GOVERNED = """
-governance:
-  policies:
+GOVERNED = """  policies:
     - name: own-orders
       objectType: Order
       rows: "object.customerId == principal.sub"
@@ -428,6 +431,11 @@ governance:
       when: "principal.groups contains 'gold-desk'"
       rows: "object.tier == 'gold'"
 """
+"""The policies this fixture adds, as keys *under* the example's own `governance:` block.
+
+A whole second `governance:` block appended to the file was the obvious shape and is a trap: YAML
+resolves a duplicate key silently, so the example's own `ingest:` posture would have vanished and the
+only symptom would have been a deployment governed differently from the one under test."""
 
 
 @pytest.fixture(scope="module")
@@ -439,14 +447,17 @@ def governed(tmp_path_factory, issuer):
     shutil.copytree(EXAMPLE, project, ignore=shutil.ignore_patterns(".warehouse"))
     port = _free_port()
     config = project / "loom.yaml"
+    auth_block = (
+        "  auth:\n"
+        f"    issuer: {ISSUER}\n"
+        f"    audience: {AUDIENCE}\n"
+        f"    jwks_uri: {issuer.jwks_uri}\n"
+        "    claims:\n      groups: string[]\n"
+    )
     config.write_text(
-        config.read_text().replace("  transport: stdio\n", f"  transport: http\n  port: {port}\n")
-        + "  auth:\n"
-        + f"    issuer: {ISSUER}\n"
-        + f"    audience: {AUDIENCE}\n"
-        + f"    jwks_uri: {issuer.jwks_uri}\n"
-        + "    claims:\n      groups: string[]\n"
-        + GOVERNED
+        config.read_text()
+        .replace("  transport: stdio\n", f"  transport: http\n  port: {port}\n{auth_block}")
+        .replace("  ingest: allowed\n", f"  ingest: allowed\n{GOVERNED}")
     )
 
     spec = importlib.util.spec_from_file_location("governed_seed", project / "seed.py")

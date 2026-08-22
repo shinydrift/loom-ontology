@@ -256,6 +256,7 @@ spelling — the hints are ANDed, so one per value would prune to the rows match
 | Governance — policies that name the caller | ✅ `when:` and `principal.<claim>`, rows only |
 | Fully typed object filters | ✅ `filter: {salesDate: {gte: …, lt: …}}`, scalars, ANDed |
 | Membership filters | ✅ `filter: {tier: {in: [...]}}` — null-safe, empty list refused |
+| Bulk ingest — a declared load, checked and recorded | ✅ `loom ingest`, `_loom_meta.loads` |
 
 `docs/spec-v0.md` is the full grammar — the framework's public contract.
 `docs/ROADMAP.md` tracks what's next, milestone by milestone.
@@ -295,6 +296,20 @@ computed once during refresh, not on every agent request. Every materialized row
 from which source snapshot it was derived. To refresh after loading orders, call
 `refresh_daily_sales_performance(catalog)` from `examples/retail/sales_performance.py`; rerunning
 `seed.py` performs the same full refresh for the local demonstration warehouse.
+
+That same file also shows the other way to land it, and the comparison is the point:
+`write_daily_sales_performance(catalog, path)` stops at a Parquet file, and the `daily-sales` entry
+in `loom.yaml` is what turns it into rows —
+
+```bash
+loom ingest daily-sales daily.parquet examples/retail/ontology   # → checked, one commit, recorded
+```
+
+Same rows, and a test asserts it. What the declared load adds is the two things the hand-rolled
+`txn.overwrite` beside it has no way to produce: every value checked against the ontology's declared
+types before it lands, and a row in `_loom_meta.loads` saying which file became which commit. Loom
+does not compute the aggregate in either case — a pipeline hands it a file, which is exactly where
+the claim stops.
 
 That run also created `_loom_meta.edits` and appended to it — no `loom apply` in this lake's history
 at all, because the log is created by whatever run needs it first rather than by a migration:
@@ -798,6 +813,56 @@ that actually checked an identity — a validated bearer token, not a header rea
 would be a caller filling in its own name on its own audit record. `ActionRuntime.run` already takes
 the argument per call for it, and until then the bind is what bounds the claim: a write surface is
 refused on anything but a loopback address.
+
+## Loading a batch
+
+An action writes one row. `loom ingest` writes a file's worth, through an entry declared in
+`loom.yaml` — an object type, a mode, a format, and nothing on the command line but which file:
+
+```
+$ loom ingest daily-sales daily.parquet examples/retail/ontology
+Loom ingest — daily-sales on examples/retail/ontology
+
+  - replace 31 row(s) into DailySalesPerformance (sales.daily_sales_performance)
+      from  daily.parquet
+      load  3f2a…9c1
+
+  ! replace empties this table first — every row not in the batch is gone,
+    including rows this ontology does not describe.
+
+  previewed at snapshot 6119…207 — nothing is held:
+  the load reads again and asserts that read, so a table that moves while you
+  decide is a conflict you are told about, never a silent overwrite.
+
+Load these changes? [y/N] y
+```
+
+Five things shape it, and the first is what the rest are for:
+
+- **The lake records it.** One row in `_loom_meta.loads` — which entry, which file and its
+  fingerprint, how many rows landed, how many were rejected, and the status — plus `loom.load_id`
+  stamped into the write's own Iceberg commit, which is the only attribution atomic with the write.
+  Until this existed, `governance.edit_log: required` could answer *what did this actor do today* for
+  every single-row agent write and have nothing to say about the overwrite that moved the numbers.
+- **The mode is the whole of what a load does to the rows already there.** `append` adds; `merge`
+  replaces the ones it names by primary key, carrying every column the ontology does not map so it
+  never nulls somebody else's data; `replace` makes the table exactly the batch. Only the two that
+  read assert a snapshot — an append puts no row over another, which is what lets two pipelines load
+  one table without refusing each other.
+- **It never migrates.** A batch that does not fit is refused naming the column, and the fix is
+  `loom plan` / `loom apply`. The port a load holds has no DDL verb at all.
+- **A refusal is whole, and re-running is a refusal too.** One bad value refuses the batch, because a
+  partial load leaves the lake in a state nobody declared; `--reject-to` quarantines the rows that
+  failed their own checks and loads the rest. And a load's id is derived from the entry, the mode and
+  the file's bytes, so a pipeline that times out and retries is told it already ran — `--load-id` is
+  how you say *this file again, on purpose*.
+- **It is not on the tool surface, and cannot be.** The entry lives in `loom.yaml` rather than in the
+  spec, and the MCP surface is assembled from the spec — so a verb that writes an arbitrary batch is
+  not something an agent can reach, structurally rather than by a rule someone remembers. It is off
+  by default too: `governance.ingest` defaults to `refused`.
+
+Loom does not connect to Kafka, crawl an object store, or open a JDBC connection. A pipeline hands it
+a file; Loom decides whether that file may become rows.
 
 The validator accumulates every problem and reports them in one pass with source locations:
 

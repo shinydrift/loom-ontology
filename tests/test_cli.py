@@ -220,14 +220,14 @@ linkType:
 # --- loom run -------------------------------------------------------------------------------
 
 
-def _seeded(tmp_path: Path) -> Path:
+def _seeded(tmp_path: Path, config: str = LOCAL_CONFIG) -> Path:
     """The valid fixture applied to a real local warehouse, with one Customer in it.
 
     Seeded through `loom run` itself rather than through pyiceberg: an action is how a row gets
     into a Loom-managed table, and using anything else here would leave the CLI's own write path
     only half exercised."""
     pytest.importorskip("pyiceberg", reason="needs the [iceberg] extra")
-    ontology = _project(tmp_path)
+    ontology = _project(tmp_path, config)
     assert main(["apply", str(ontology), "--yes"]) == 0
     return ontology
 
@@ -243,8 +243,11 @@ def test_run_is_the_write_paths_query_and_takes_no_table_column_or_predicate():
         assert forbidden not in args
 
 
-def _parsed(argv: list[str]):
-    """The CLI's own parser, without running the command."""
+def _parsed(argv: list[str], command: str = "cmd_run"):
+    """The CLI's own parser, without running the command.
+
+    `command` names the handler to intercept, so the same helper can ask what any subcommand's
+    argument set is — which is the shape these tests assert, for `run` and for `ingest`."""
     import loom.cli as cli
 
     holder: dict = {}
@@ -253,13 +256,13 @@ def _parsed(argv: list[str]):
         holder["args"] = args
         return 0
 
-    original = cli.cmd_run
-    cli.cmd_run = capture
+    original = getattr(cli, command)
+    setattr(cli, command, capture)
     try:
         # `main` rebuilds the parser on each call, so patching the function is enough.
         cli.main(argv)
     finally:
-        cli.cmd_run = original
+        setattr(cli, command, original)
     return holder["args"]
 
 
@@ -450,3 +453,192 @@ def test_the_serve_banner_says_whether_this_server_can_write(tmp_path):
 
     anonymous = "\n".join(_write_mode(LoomConfig(mcp=McpConfig(writes=True)), ontology))
     assert "actor 'unknown'" in anonymous and "set mcp.actor" in anonymous
+
+
+# ---- ingest --------------------------------------------------------------------
+
+
+INGEST_CONFIG = LOCAL_CONFIG + """
+ingest:
+  - name: customers
+    objectType: Customer
+    mode: append
+    format: ndjson
+governance:
+  ingest: allowed
+"""
+
+BATCH = '{"customerId": "c9", "name": "Alan Turing", "tier": "bronze", "ltv": 12.5}\n'
+
+
+def test_ingest_takes_an_entry_and_a_file_and_nothing_that_describes_the_load():
+    """The load's shape lives in `loom.yaml` because a load is a fact about a deployment, and a
+    flag that could contradict the reviewed file is what `mcp.writes` refused to be. What the
+    command line carries is which file, and three operator decisions."""
+    args = vars(_parsed(["ingest", "customers", "b.ndjson", "ontology"], "cmd_ingest"))
+    assert set(args) - {"command", "func"} == {
+        "entry", "source", "path", "dry_run", "load_id", "reject_to", "yes",
+    }
+    for forbidden in ("mode", "format", "table", "columns", "objectType", "object_type"):
+        assert forbidden not in args
+
+
+def test_ingest_dry_run_writes_nothing_and_reports_what_would_land(tmp_path, capsys):
+    ontology = _seeded(tmp_path, INGEST_CONFIG)
+    (tmp_path / "batch.ndjson").write_text(BATCH)
+
+    assert main(["ingest", "customers", str(tmp_path / "batch.ndjson"), str(ontology),
+                 "--dry-run"]) == 0
+    out = capsys.readouterr()
+    assert '"status": "previewed"' in out.out
+    assert '"rowsWritten": 1' in out.out
+    assert "Loom ingest — customers" in out.err
+    assert "+ append 1 row(s) into Customer" in out.err
+
+
+def test_ingest_loads_and_names_the_record(tmp_path, capsys):
+    ontology = _seeded(tmp_path, INGEST_CONFIG)
+    (tmp_path / "batch.ndjson").write_text(BATCH)
+
+    assert main(["ingest", "customers", str(tmp_path / "batch.ndjson"), str(ontology), "--yes"]) == 0
+    out = capsys.readouterr()
+    assert '"status": "applied"' in out.out
+    assert "recorded in _loom_meta.loads as" in out.err
+    assert "applied · 1 row(s) into crm.customers" in out.err
+
+
+def test_ingest_refuses_the_second_run_of_one_file(tmp_path, capsys):
+    ontology = _seeded(tmp_path, INGEST_CONFIG)
+    batch = tmp_path / "batch.ndjson"
+    batch.write_text(BATCH)
+
+    assert main(["ingest", "customers", str(batch), str(ontology), "--yes"]) == 0
+    assert main(["ingest", "customers", str(batch), str(ontology), "--yes"]) == 1
+    assert "duplicate_load" in capsys.readouterr().err
+
+
+def test_ingest_names_the_actor_itself_rather_than_letting_the_runtime_guess(
+    tmp_path, capsys, monkeypatch
+):
+    """`default_actor()` lives at this call site and nowhere below it, so a future surface passing
+    its own attested identity does not have to un-inherit one."""
+    monkeypatch.setenv("LOOM_ACTOR", "ci:nightly")
+    ontology = _seeded(tmp_path, INGEST_CONFIG)
+    (tmp_path / "batch.ndjson").write_text(BATCH)
+    main(["ingest", "customers", str(tmp_path / "batch.ndjson"), str(ontology), "--yes"])
+
+    from loom.catalog import open_catalogs
+    from loom.config import find_config, load_config
+    from loom.errors import Diagnostics
+    from loom.ingest import LoadLog
+
+    diag = Diagnostics()
+    config = load_config(find_config(ontology), diag)
+    history = LoadLog(catalog=open_catalogs(config)["rest_main"]).history()
+    assert [r["actor"] for r in history] == ["ci:nightly"]
+
+
+def test_ingest_on_a_deployment_that_refuses_says_so_and_exits_nonzero(tmp_path, capsys):
+    ontology = _seeded(tmp_path, INGEST_CONFIG.replace("ingest: allowed", "ingest: refused"))
+    (tmp_path / "batch.ndjson").write_text(BATCH)
+
+    assert main(["ingest", "customers", str(tmp_path / "batch.ndjson"), str(ontology)]) == 1
+    assert "deployment_refused" in capsys.readouterr().err
+
+
+def test_ingest_warns_in_words_before_a_replace(tmp_path, capsys):
+    """The one mode whose whole effect is on rows nobody named, and no other command in Loom
+    destroys data it never read — so the prompt says it in words rather than in a mode name."""
+    ontology = _seeded(tmp_path, INGEST_CONFIG.replace("mode: append", "mode: replace"))
+    (tmp_path / "batch.ndjson").write_text(BATCH)
+
+    main(["ingest", "customers", str(tmp_path / "batch.ndjson"), str(ontology), "--dry-run"])
+    err = capsys.readouterr().err
+    assert "replace empties this table first" in err
+    assert "every row not in the batch is gone" in err
+
+
+def test_ingest_reports_an_unknown_entry_without_touching_a_catalog(tmp_path, capsys):
+    ontology = _project(tmp_path, INGEST_CONFIG)
+    (tmp_path / "batch.ndjson").write_text(BATCH)
+
+    assert main(["ingest", "nope", str(tmp_path / "batch.ndjson"), str(ontology)]) == 1
+    assert "unknown ingest entry 'nope'" in capsys.readouterr().err
+
+
+def test_ingest_reject_to_survives_the_preview_and_loads_the_good_rows(tmp_path, capsys):
+    """`--reject-to` used to be dead on the only surface that exposes it: the mandatory preview ran
+    without it, refused the batch over the bad row, and the command exited before the real load. The
+    flag now reaches both calls."""
+    ontology = _seeded(tmp_path, INGEST_CONFIG)
+    batch = tmp_path / "batch.ndjson"
+    batch.write_text(
+        BATCH + '{"customerId": "c10", "name": "K J", "tier": "platinum", "ltv": 1.0}\n'
+    )
+    rejects = tmp_path / "rejects.ndjson"
+
+    assert main(["ingest", "customers", str(batch), str(ontology),
+                 "--reject-to", str(rejects), "--yes"]) == 0
+    out = capsys.readouterr()
+    assert '"status": "applied"' in out.out
+    assert '"rowsWritten": 1' in out.out and '"rowsRejected": 1' in out.out
+    assert "platinum" in rejects.read_text()
+    assert "were rejected and written to" in out.err
+
+
+def test_ingest_records_a_refusal_the_operator_actually_hit(tmp_path, capsys):
+    """The command previews first and a preview records nothing, so a refused preview used to leave
+    no trace at all — *who tried to replace this table* answerable only for loads that worked. When
+    `--dry-run` was not asked for, the refusal is run for real so the log gets it."""
+    ontology = _seeded(tmp_path, INGEST_CONFIG)
+    batch = tmp_path / "batch.ndjson"
+    batch.write_text('{"customerId": "c9", "name": "K", "tier": "bronze", "nope": 1}\n')
+
+    assert main(["ingest", "customers", str(batch), str(ontology), "--yes"]) == 1
+    assert "unmapped_column" in capsys.readouterr().err
+
+    from loom.catalog import open_catalogs
+    from loom.config import find_config, load_config
+    from loom.errors import Diagnostics
+    from loom.ingest import LoadLog
+
+    diag = Diagnostics()
+    config = load_config(find_config(ontology), diag)
+    history = LoadLog(catalog=open_catalogs(config)["rest_main"]).history()
+    assert [r["status"] for r in history] == ["refused"]
+    assert history[0]["rows_written"] == 0
+
+
+def test_ingest_dry_run_leaves_no_record_of_a_refusal(tmp_path, capsys):
+    """...and the other side of it: asking whether a load would work must not write to the lake."""
+    ontology = _seeded(tmp_path, INGEST_CONFIG)
+    batch = tmp_path / "batch.ndjson"
+    batch.write_text('{"customerId": "c9", "name": "K", "tier": "bronze", "nope": 1}\n')
+
+    assert main(["ingest", "customers", str(batch), str(ontology), "--dry-run"]) == 1
+
+    from loom.catalog import LOAD_LOG_TABLE, open_catalogs
+    from loom.config import find_config, load_config
+    from loom.errors import Diagnostics
+
+    diag = Diagnostics()
+    config = load_config(find_config(ontology), diag)
+    assert not open_catalogs(config)["rest_main"].table_exists(LOAD_LOG_TABLE)
+
+
+def test_ingest_names_the_actor_on_a_refusal_too(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("LOOM_ACTOR", "ci:nightly")
+    ontology = _seeded(tmp_path, INGEST_CONFIG)
+    batch = tmp_path / "batch.ndjson"
+    batch.write_text('{"customerId": "c9", "name": "K", "tier": "bronze", "nope": 1}\n')
+    main(["ingest", "customers", str(batch), str(ontology), "--yes"])
+
+    from loom.catalog import open_catalogs
+    from loom.config import find_config, load_config
+    from loom.errors import Diagnostics
+    from loom.ingest import LoadLog
+
+    diag = Diagnostics()
+    config = load_config(find_config(ontology), diag)
+    history = LoadLog(catalog=open_catalogs(config)["rest_main"]).history()
+    assert [r["actor"] for r in history] == ["ci:nightly"]
