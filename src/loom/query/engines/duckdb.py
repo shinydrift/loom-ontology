@@ -23,6 +23,7 @@ from ..ir import (
     Const,
     Contains,
     GetByKey,
+    In,
     Not,
     Or,
     Predicate,
@@ -137,6 +138,9 @@ class DuckDBEngine:
                 referenced.add(f.column)
                 clauses.append(f"{_ref(f.alias, f.column)} ILIKE ? ESCAPE '{_LIKE_ESCAPE}'")
                 params.append(f"%{_escape_like(f.value)}%")
+            elif isinstance(f, In):
+                referenced.add(f.column)
+                clauses.append(self._in(f, params))
             elif isinstance(f, Compare):
                 # The same lowering a governance predicate gets, because it is the same node: one
                 # meaning per operator in this dialect, so `eq` on a null column cannot answer one
@@ -274,6 +278,29 @@ class DuckDBEngine:
             distinct = "IS NOT DISTINCT FROM" if cmp.op == "==" else "IS DISTINCT FROM"
             return f"{self._operand(left, params)} {distinct} {self._operand(right, params)}"
         return f"{self._operand(left, params)} {cmp.op} {self._operand(right, params)}"
+
+    @staticmethod
+    def _in(node: In, params: list[Any]) -> str:
+        """Null-safe membership: `IN` for the values that have a spelling there, `IS NULL` for the
+        one that does not.
+
+        SQL's `IN` is a disjunction over `=`, so it never matches a null in the list and answers
+        unknown for a null column — neither is what `ir.In` means. Lifting the null out into its own
+        disjunct is what makes `{"in": [null]}` select the rows `{"eq": null}` selects, which
+        `_compare` lowers to `IS NULL` by the same argument: `IS NULL` says in SQL what
+        `IS NOT DISTINCT FROM NULL` says, without a parameter for a value that has no type.
+
+        The list is never empty — `filters._membership` refuses that before the node exists — so
+        this never has to decide what `IN ()` means, which DuckDB rejects as a syntax error."""
+        ref = _ref(node.alias, node.column)
+        values = [v for v in node.values if v is not None]
+        terms = []
+        if values:
+            params.extend(values)
+            terms.append(f"{ref} IN ({', '.join(['?'] * len(values))})")
+        if len(values) != len(node.values):
+            terms.append(f"{ref} IS NULL")
+        return terms[0] if len(terms) == 1 else "(" + " OR ".join(terms) + ")"
 
     @staticmethod
     def _operand(operand: Any, params: list[Any]) -> str:

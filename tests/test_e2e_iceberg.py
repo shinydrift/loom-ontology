@@ -203,6 +203,27 @@ def test_an_ordering_comparison_does_not_return_a_null_row(resolver):
     assert [c["customerId"] for c in resolver.search("Customer", {"ltv": {"eq": None}})] == ["c3"]
 
 
+def test_membership_selects_the_union_of_its_values(resolver):
+    """The query that cost N calls before: one filter, several values, over real data."""
+    rows = resolver.search("Customer", {"tier": {"in": ["gold", "silver"]}})
+    assert [c["customerId"] for c in rows] == ["c1", "c2"]
+
+
+def test_membership_of_one_value_is_the_equality_it_abbreviates(resolver):
+    """Asserted over the warehouse as well as in the grammar, because the null is the case where
+    SQL's own `IN` would disagree — and c3 is the row that shows it."""
+    for value in ("gold", None):
+        assert resolver.search("Customer", {"tier": {"in": [value]}}) == resolver.search(
+            "Customer", {"tier": {"eq": value}}
+        )
+    assert [c["customerId"] for c in resolver.search("Customer", {"ltv": {"in": [None]}})] == ["c3"]
+
+
+def test_membership_and_another_filter_are_still_anded(resolver):
+    rows = resolver.search("Customer", {"tier": {"in": ["gold", "silver"]}, "name": "ace"})
+    assert [c["customerId"] for c in rows] == ["c1", "c2"]
+
+
 def test_nullable_property_comes_back_as_none(resolver):
     assert resolver.get("Customer", "c3")["ltv"] is None
 
@@ -282,7 +303,7 @@ def test_the_date_range_answers_through_the_generated_tool(project, catalogs):
     server, _ = build_server(project[0], project[1], catalogs)
     schema = server.tools["search_daily_sales_performance"].input_schema
     operators = schema["properties"]["filter"]["properties"]["salesDate"]["anyOf"][1]["properties"]
-    assert set(operators) == {"eq", "ne", "gt", "gte", "lt", "lte"}
+    assert set(operators) == {"eq", "ne", "in", "gt", "gte", "lt", "lte"}
 
     text, is_error = server.call(
         "search_daily_sales_performance",
@@ -310,6 +331,36 @@ def test_loom_query_takes_the_same_range_the_tool_takes(project, capsys):
     assert main(argv) == 0
     rows = json.loads(capsys.readouterr().out)
     assert [row["salesDate"] for row in rows] == ["2026-02-11", "2026-02-14"]
+
+
+def test_loom_query_builds_a_membership_list_by_repeating_the_flag(project, capsys):
+    """No separator, because a comma is a legal character in a string value — splitting on one
+    would either forbid it or turn a single value into two wrong ones, silently."""
+    from loom.cli import main
+
+    argv = [
+        "query",
+        "Customer",
+        str(project[2] / "ontology"),
+        "--filter",
+        "tier.in=gold",
+        "--filter",
+        "tier.in=silver",
+    ]
+    assert main(argv) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [row["customerId"] for row in rows] == ["c1", "c2"]
+
+
+def test_an_empty_membership_list_is_refused_through_the_tool(project, catalogs):
+    """The second refusal this grammar makes, as an `isError` an agent can act on rather than as
+    an empty page it cannot tell from a search that found nothing."""
+    from loom.mcp.server import build_server
+
+    server, _ = build_server(project[0], project[1], catalogs)
+    text, is_error = server.call("search_customer", {"filter": {"tier": {"in": []}}})
+    assert is_error is True
+    assert "matches no row" in text
 
 
 def test_a_bare_null_filter_is_refused_through_the_tool(project, catalogs):
