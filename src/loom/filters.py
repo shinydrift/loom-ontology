@@ -16,6 +16,7 @@ lowering are generated from the same one.
     {"tier": "gold"}                         the v0 spelling — a bare value
     {"salesDate": {"gte": "2026-01-01",      operators, ANDed
                    "lt":  "2026-02-01"}}
+    {"tier": {"in": ["gold", "platinum"]}}   membership — a disjunction of values
 
 A bare value is **type-directed sugar**: `contains` on a searchable string property, `eq` on
 everything else. That is exactly what v0 meant by it, and preserving it is not politeness — making
@@ -24,11 +25,19 @@ searchable string, returning fewer rows with no error. Loom refuses rather than 
 silent narrowing is the degradation `negotiate.py` argues is worse than failing.
 
 **Composition is AND, at both levels** — several operators on one property, several properties in one
-filter — because `ir.Search.filters` is a flat ANDed tuple and AND therefore costs no new node. `or`,
-`in` and `not` are named in the ROADMAP and not built: each needs an IR shape, an engine story and a
-transport story of its own, and `in` in particular is sugar over an OR that does not exist yet.
+filter — because `ir.Search.filters` is a flat ANDed tuple and AND therefore costs no new node.
 
-**Null, and the one refusal this grammar makes.** A bare `{"ltv": null}` is refused, permanently.
+**`in` is the one disjunction here, and admitting it corrects a claim this module used to make.**
+The sentence that stood here said `in` was "sugar over an OR that does not exist yet" and therefore
+had to wait for one. It does not. An `or` composes *predicates* and needs the tuple to become a tree;
+`in` disjoins *values*, against one column, all of them constants — one node, `ir.In`, sitting in the
+flat tuple exactly where `Contains` sits. What it does inherit from the `eq` it abbreviates is
+**null-safety**: an abbreviation that selected different rows than the thing it abbreviates would be
+a trap, and an invisible one, since the two spellings agree on every table with no nulls in the
+filtered column. `or` and `not` stay deferred — and `not` is the one that costs, because it reopens
+the no-negation argument below rather than sidestepping it.
+
+**Null, and the two refusals this grammar makes.** A bare `{"ltv": null}` is refused, permanently.
 JSON cannot tell a key a caller left blank from one they meant as null — and an agent emitting null
 for *a value it did not have* is the likeliest way this argument is ever malformed. v0 answered it as
 `ltv IS NULL`, which returns a plausible, wrong, non-empty result set: the same failure mode
@@ -36,6 +45,13 @@ for *a value it did not have* is the likeliest way this argument is ever malform
 where the caller also wrote the operator — `{"ltv": {"eq": null}}` — which cannot be a blank field.
 §5's *null is a value you can test with `==`/`!=`, not one you can order* then becomes visible in the
 generated schema itself: the two equality operators accept null and the four ordering ones do not.
+`in` accepts one for the same reason `eq` does, and is the third place that fact is written down.
+
+The second refusal is **`{"in": []}`**, and it is the same argument reached from the other end. An
+empty list has an honest answer — no rows — and returning it is what makes it a refusal: a caller
+cannot tell "your list was empty" from "nothing matched", so an agent whose candidate set collapsed
+to nothing gets told, in the vocabulary of a result, that its question was answered. `minItems: 1`
+in the generated schema is that refusal announced rather than only enforced.
 
 Everything else about null follows `predicate.py` without needing a second rule: an ordering
 comparison against a null column is **undecided**, and an undecided row is not returned. For a
@@ -52,7 +68,7 @@ from typing import Any
 
 from ._shape import suggest
 from .model import ObjectType, Property, coerce_value
-from .query.ir import ColumnRef, Compare, Comparison, Const, Contains
+from .query.ir import ColumnRef, Compare, Comparison, Const, Contains, In
 
 FILTER_OPS: Mapping[str, str] = {
     "eq": "==",
@@ -78,8 +94,19 @@ being taught, and the ontology-facing meaning of §5's `contains` is unreachable
 properties land. When they do, an array property's membership operator needs a name of its own; this
 word is spent."""
 
-NULLABLE_OPS = frozenset({"eq", "ne"})
-"""The two operators §5 answers for a null, and therefore the two whose schema admits one."""
+MEMBERSHIP = "in"
+"""Equality against any of a list of values — the equality family's third spelling.
+
+Offered wherever `eq` is, and gated by nothing, because it *is* `eq`: whatever an engine can compare
+for equality it can compare against two values. That is also why it demands no new negotiated
+capability — `negotiate.py`'s rule is that a requirement is something a spec can demand and an engine
+can fail, and no dialect that can say `WHERE c = ?` cannot say `WHERE c IN (?, ?)`."""
+
+NULLABLE_OPS = frozenset({"eq", "ne", MEMBERSHIP})
+"""The operators §5 answers for a null, and therefore the ones whose schema admits one.
+
+`in` belongs here as a container: the *list* is never null (that is `{"in": null}`, refused), but an
+element may be, and it means there what it means to `eq`."""
 
 ORDERINGS = tuple(op for op in FILTER_OPS if op not in NULLABLE_OPS)
 
@@ -112,7 +139,9 @@ def operators(prop: Property, searchable: bool) -> tuple[str, ...]:
     fact that has to be true here too: `negotiate.py` demands `case_insensitive_like` of an engine
     for exactly the *searchable string* properties, so emitting a `Contains` for any other property
     would ask an engine for something no requirement checked it could do."""
-    ops = ["eq", "ne"]
+    # `in` sits with the equality family and ahead of the orderings, because it *is* equality —
+    # and this order is the one a schema lists operators in and the one `lower()` emits nodes in.
+    ops = ["eq", "ne", MEMBERSHIP]
     if prop.type.kind in ORDERABLE_KINDS:
         ops.extend(ORDERINGS)
     if prop.type.kind == "string" and searchable:
@@ -132,8 +161,15 @@ def property_schema(prop: Property, searchable: bool) -> dict:
     props: dict[str, dict] = {
         op: (dict(nullable) if op in NULLABLE_OPS else dict(value))
         for op in admits
-        if op != CONTAINS
+        if op not in (CONTAINS, MEMBERSHIP)
     }
+    if MEMBERSHIP in admits:
+        props[MEMBERSHIP] = {
+            "type": "array",
+            "items": dict(nullable),
+            "minItems": 1,
+            "description": f"{prop.name} equals any of these",
+        }
     if CONTAINS in admits:
         props[CONTAINS] = {"type": "string", "description": "case-insensitive substring"}
     return {
@@ -240,6 +276,8 @@ def _comparison(
     alias: str,
     objects: Mapping[str, ObjectType],
 ) -> Comparison:
+    if op == MEMBERSHIP:
+        return _membership(obj, prop, value, alias, objects)
     column = ColumnRef(alias=alias, column=prop.column)
     if op == CONTAINS:
         # Coerced like every other value rather than type-checked here: `contains` is only offered
@@ -258,6 +296,42 @@ def _comparison(
         op=FILTER_OPS[op],
         left=column,
         right=Const(_coerced(prop, value, objects, f"filter '{prop.name}.{op}'")),
+    )
+
+
+def _membership(
+    obj: ObjectType,
+    prop: Property,
+    value: Any,
+    alias: str,
+    objects: Mapping[str, ObjectType],
+) -> In:
+    """`{"in": [...]}` as one `ir.In`, or the two refusals that keep it meaning what it says.
+
+    Every element is coerced exactly as the `eq` it stands for would be, including a null, which
+    `coerce_value` passes through — so a list of one is the same node's worth of meaning as the
+    `eq` spelling, which is the property the adapter's lowering then has to preserve in SQL."""
+    where = f"'{obj.api_name}.{prop.name}'"
+    if not isinstance(value, list):
+        got = "null" if value is None else type(value).__name__
+        raise FilterError(
+            f"{where}: 'in' takes a list of values, got {got} — write "
+            f'{{"{prop.name}": {{"in": ["a", "b"]}}}}, or use "eq" for a single value'
+        )
+    if not value:
+        # The refusal's whole content is that the honest answer is indistinguishable from a
+        # different question's honest answer — see the module docstring.
+        raise FilterError(
+            f"{where}: 'in' [] matches no row, and no caller can tell that from a search that "
+            "found nothing. Name the values you meant, or drop the filter to match every row"
+        )
+    return In(
+        alias=alias,
+        column=prop.column,
+        values=tuple(
+            _coerced(prop, item, objects, f"filter '{prop.name}.{MEMBERSHIP}[{i}]'")
+            for i, item in enumerate(value)
+        ),
     )
 
 

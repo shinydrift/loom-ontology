@@ -12,6 +12,7 @@ from loom.query.ir import (
     Contains,
     Eq,
     GetByKey,
+    In,
     Project,
     Search,
     TableRef,
@@ -164,6 +165,52 @@ def test_null_equality_becomes_is_null(engine):
     q = engine.compile(plan)
     assert '"t0"."lifetime_value" IS NULL' in q.sql
     assert q.params == (5,)  # no bind param for the null
+
+
+def _search(*filters, columns=COLUMNS):
+    return Project(
+        source=Search(table=CUST, filters=filters, order_by=("id",), limit=5), columns=columns
+    )
+
+
+def test_membership_binds_every_value(engine):
+    q = engine.compile(_search(In("t0", "tier", ("gold", "platinum"))))
+    assert '"t0"."tier" IN (?, ?)' in q.sql
+    assert q.params == ("gold", "platinum", 5)
+
+
+def test_membership_of_only_a_null_is_the_same_sql_as_an_equality_null(engine):
+    """`{"in": [null]}` abbreviates `{"eq": null}`, so it had better compile to what that does.
+
+    SQL's `IN` would never match here — the list's null is compared with `=` — which is the whole
+    reason `_in` lifts a null out rather than binding it as a parameter."""
+    membership = engine.compile(_search(In("t0", "lifetime_value", (None,))))
+    equality = engine.compile(_search(_eq("lifetime_value", None)))
+    assert '"t0"."lifetime_value" IS NULL' in membership.sql
+    assert membership.sql == equality.sql
+    assert membership.params == equality.params == (5,)
+
+
+def test_membership_with_a_null_among_values_is_a_disjunction(engine):
+    """The null cannot ride in the `IN` list, so the clause is the two halves ORed."""
+    q = engine.compile(_search(In("t0", "tier", ("gold", None))))
+    assert '("t0"."tier" IN (?) OR "t0"."tier" IS NULL)' in q.sql
+    assert q.params == ("gold", 5)
+
+
+def test_membership_is_not_pushed_down(engine):
+    """Not a channel too narrow to carry it — `ScanRequest.predicates` is ANDed, so one hint per
+    value would prune to the rows matching *every* value: an empty scan, silently."""
+    q = engine.compile(_search(In("t0", "tier", ("gold", "platinum"))))
+    assert q.scans[0].predicates == ()
+    assert "tier" in q.scans[0].columns  # still scanned, since the WHERE reads it
+
+
+def test_membership_on_an_unprojected_column_is_still_scanned(engine):
+    q = engine.compile(
+        _search(In("t0", "lifetime_value", (1.0,)), columns=(Column("t0", "id", "customerId"),))
+    )
+    assert "lifetime_value" in q.scans[0].columns
 
 
 def test_traverse_joins_and_anchors_on_the_source_key(engine):
