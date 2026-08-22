@@ -166,9 +166,9 @@ def test_input_schemas_come_from_the_type_system(ontology):
 def test_the_operators_a_property_advertises_are_a_function_of_its_type(ontology):
     """An enum is a declared set, so it is testable and not orderable; a string adds substring."""
     props = _tools(ontology)["search_customer"].input_schema["properties"]["filter"]["properties"]
-    assert set(props["tier"]["anyOf"][1]["properties"]) == {"eq", "ne"}
+    assert set(props["tier"]["anyOf"][1]["properties"]) == {"eq", "ne", "in"}
     assert set(props["name"]["anyOf"][1]["properties"]) == {
-        "eq", "ne", "gt", "gte", "lt", "lte", "contains",
+        "eq", "ne", "in", "gt", "gte", "lt", "lte", "contains",
     }
 
 

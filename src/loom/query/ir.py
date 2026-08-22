@@ -62,14 +62,15 @@ class Column:
 # then arrived a **second** time, in a caller's hands, which is where that correction turned out to
 # have over-generalised from the one node it was true of. What the two grammars actually are:
 #
-#   - the filter grammar has `Contains` (ILIKE) and no negation and no composition;
+#   - the filter grammar has `Contains` (ILIKE) and `In`, and no negation and no composition *of
+#     predicates* — `In` disjoins values, which is why it is a node here rather than a tree;
 #   - the policy grammar has `&& || !` and no ILIKE;
 #   - they overlap **exactly on the six comparisons**, where they already agreed node for node —
 #     v0's `Eq(col, None)` compiled to `IS NULL`, which is what `Compare('==', col, null)` compiles
 #     to, and for a bound non-null parameter `=` and `IS NOT DISTINCT FROM` select the same rows.
 #
-# So the merge is the overlap, and the difference stays: `Contains` is filter-only, `And`/`Or`/`Not`
-# are policy-only. What made a governance predicate un-advisory was never the node *type* — it is
+# So the merge is the overlap, and the difference stays: `Contains` and `In` are filter-only,
+# `And`/`Or`/`Not` are policy-only. What made a governance predicate un-advisory was never the node *type* — it is
 # the **field**: a predicate hangs on `TableRef.predicate`, which an adapter compiles into `WHERE`,
 # and only `Search.filters` yields `ScanRequest` hints. `pushdown_hints()` below is the one place
 # that decides what may become one, and it cannot be handed a `TableRef`.
@@ -133,7 +134,31 @@ class Contains:
     value: str
 
 
-Comparison = Compare | Contains
+@dataclass(frozen=True)
+class In:
+    """Membership in a caller's list of values — filter-only, and **null-safe**.
+
+    This node is the reason `in` shipped before the `or` it is usually described as sugar for. A
+    disjunction of *predicates* needs a tree; this disjoins *values*, against one column, all of
+    them constants — so it is one element of `Search.filters`' flat conjunction, exactly where
+    `Contains` sits, and the tuple stays a tuple.
+
+    **Not SQL's `IN`.** `x IN (a, b)` is `x = a OR x = b` over SQL's `=`, which answers unknown for
+    a null `x` and can never match a null in the list. `Compare('==')` here is null-safe because §5
+    says null is a value, so `{"in": [null]}` selects the rows `{"eq": null}` selects and a
+    one-element list selects the rows the `eq` it abbreviates would. The alternative makes this the
+    one place in the grammar where an abbreviation is not one, and it would be invisible: the two
+    spellings agree on every row of any table with no nulls in the filtered column.
+
+    Never empty — `filters.lower` refuses `[]` before this node is built, so no adapter has to
+    decide what `IN ()` means."""
+
+    alias: str
+    column: str
+    values: tuple[object, ...]
+
+
+Comparison = Compare | Contains | In
 
 
 @dataclass(frozen=True)
@@ -162,7 +187,13 @@ def pushdown_hints(filters: Sequence[Comparison]) -> tuple[tuple[str, object], .
     Equality only, because the channel is a `(column, value)` pair by shape — a range has no
     spelling in it. That costs an Iceberg scan some pruning it could do and costs correctness
     nothing, since every filter is in the `WHERE` clause regardless. A null is included: the
-    catalog's `_row_filter` maps it to `IsNull`, which is what `Compare('==', col, null)` means."""
+    catalog's `_row_filter` maps it to `IsNull`, which is what `Compare('==', col, null)` means.
+
+    An `In` yields nothing, and that one is a *correctness* requirement rather than a channel too
+    narrow to carry it: the pairs are **ANDed** (`_row_filter` folds them with `And`), so emitting
+    one per value would prune a membership test to the rows matching every value at once — an empty
+    scan, and a silently wrong answer rather than a slow one. A disjunction has no spelling here for
+    the same reason a range has none, and the `WHERE` clause is what answers both."""
     return tuple(
         (f.left.column, f.right.value)
         for f in filters

@@ -86,6 +86,15 @@ def test_a_property_given_both_spellings_at_once_is_refused(tmp_path, capsys):
     assert "both a bare value and operators" in capsys.readouterr().err
 
 
+def test_an_operator_other_than_in_given_twice_is_refused(tmp_path, capsys):
+    """Only `in` accumulates. Keeping the last value silently answers a filter nobody wrote —
+    and now that one operator builds a list, the difference has to be said rather than guessed."""
+    ontology = _project(tmp_path, config=UNREACHABLE_CONFIG)
+    argv = ["query", "Customer", str(ontology), "--filter", "ltv.gte=1", "--filter", "ltv.gte=2"]
+    assert main(argv) == 1
+    assert "gives 'ltv.gte' twice" in capsys.readouterr().err
+
+
 def test_link_without_a_key_is_refused_before_any_catalog_is_opened(tmp_path, capsys):
     ontology = _project(tmp_path, config=UNREACHABLE_CONFIG)
     assert main(["query", "Customer", str(ontology), "--link", "orders"]) == 1

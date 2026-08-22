@@ -208,6 +208,23 @@ hint. Two refusals: a bare `{"ltv": null}` filter, because JSON cannot tell a fi
 blank from one it meant as null and the old answer was a plausible non-empty result set; and a
 capability flag for ranges, because no adapter could ever fail it.
 
+**M8 opens with `in` — the query that cost N calls.**
+
+```jsonc
+{"filter": {"tier": {"in": ["gold", "platinum"]}}}
+```
+
+It shipped ahead of `or` because it is not one. This roadmap had all three of `or` / `in` / `not`
+waiting on the same thing — a filter list that becomes a tree — and that is true of a disjunction of
+*predicates*, not of a disjunction of *values*: `in` is one node in the conjunction that was already
+there. It abbreviates `eq` and therefore inherits `eq`'s null, which SQL's own `IN` does not — that
+one never matches a null element and answers unknown for a null column, so a one-element list and the
+`eq` it stands for would select different rows on exactly the tables where it matters and no others.
+`{"in": []}` is refused for M7's reason read backwards: the empty list's honest answer is
+indistinguishable from a search that found nothing. It demands no new engine capability, and it is
+the one filter that yields no pushdown hint on *correctness* grounds rather than for want of a
+spelling — the hints are ANDed, so one per value would prune to the rows matching every value at once.
+
 | Component | State |
 |-----------|-------|
 | Canonical type system (`types.py`) | ✅ |
@@ -238,6 +255,7 @@ capability flag for ranges, because no adapter could ever fail it.
 | Attested identity over MCP | ✅ `mcp.auth` — a bearer token this deployment checked |
 | Governance — policies that name the caller | ✅ `when:` and `principal.<claim>`, rows only |
 | Fully typed object filters | ✅ `filter: {salesDate: {gte: …, lt: …}}`, scalars, ANDed |
+| Membership filters | ✅ `filter: {tier: {in: [...]}}` — null-safe, empty list refused |
 | Bulk ingest — a declared load, checked and recorded | ✅ `loom ingest`, `_loom_meta.loads` |
 
 `docs/spec-v0.md` is the full grammar — the framework's public contract.

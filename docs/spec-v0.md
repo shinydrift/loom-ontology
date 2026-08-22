@@ -1059,15 +1059,21 @@ deployment's declared intent about its own data.
 filter:
   tier: gold                                    # a bare value — the v0 spelling
   salesDate: { gte: '2026-01-01', lt: '2026-02-01' }   # comparisons, ANDed
+  status: { in: [open, pending] }               # membership — a disjunction of values
 ```
 
 Operators are generated from the **property type** and nothing else:
 
 | type | operators |
 |---|---|
-| `string` | `eq` `ne` `gt` `gte` `lt` `lte`, and `contains` when the property is `searchable` |
-| `int` `long` `double` `decimal` `date` `timestamp` | `eq` `ne` `gt` `gte` `lt` `lte` |
-| `enum` `boolean` `objectRef` | `eq` `ne` |
+| `string` | `eq` `ne` `in` `gt` `gte` `lt` `lte`, and `contains` when the property is `searchable` |
+| `int` `long` `double` `decimal` `date` `timestamp` | `eq` `ne` `in` `gt` `gte` `lt` `lte` |
+| `enum` `boolean` `objectRef` | `eq` `ne` `in` |
+
+`in` is offered wherever `eq` is, and gated by nothing, because it **is** `eq`: whatever a type can
+be compared to for equality it can be compared to twice. It demands no engine capability for the
+same reason — §6's rule is that a requirement is something a spec can demand and an engine can fail,
+and no dialect that can say `WHERE c = ?` cannot say `WHERE c IN (?, ?)`.
 
 An `enum` is not ordered: its `values` are a declared set and their order in the file is a list, so
 `tier > 'bronze'` would answer with the engine's collation rather than with anything the spec said.
@@ -1078,9 +1084,14 @@ else — which is exactly what it meant in v0. It is kept because rewriting it a
 return *fewer* rows to every filter already written against a searchable string, with nothing
 raising: a silent narrowing, which §6 already calls worse than a refusal.
 
-**Composition is `AND`**, between operators on one property and between properties. `or`, `in` and
-`not` are deferred: each needs an IR shape, an engine lowering and a transport story of its own, and
-`in` is sugar over an `or` that does not exist yet.
+**Composition is `AND`**, between operators on one property and between properties.
+
+**`in` is the one disjunction, and it is not the `or` this grammar still lacks.** An earlier draft
+of this section said `in` was "sugar over an `or` that does not exist yet" and therefore had to wait
+for one; that was wrong, and the difference is what a disjunction is *over*. An `or` composes
+**predicates** and needs the filter list to become a tree. `in` disjoins **values**, against one
+column, all of them constants — one node in a list that is already a conjunction. `or` and `not`
+stay deferred, and `not` is the one that costs, because it reopens the no-negation argument below.
 
 **Null is a value you can test and not one you can order, and a bare `null` is refused.** `{"ltv":
 {"eq": null}}` selects the rows where `ltv` is null (§5.2, unchanged, and the same
@@ -1089,7 +1100,21 @@ it is undecided for every row. And `{"ltv": null}` — a bare null — is **refu
 cannot distinguish a field a caller left blank from one it meant as null, and an agent emitting null
 for a value it did not have is the likeliest way this argument is ever malformed. v0 answered it as
 `IS NULL`, which is a plausible non-empty result set for a question nobody asked. The generated
-schema says all of this: the two equality operators admit a `null` and the four ordering ones do not.
+schema says all of this: the equality operators admit a `null` and the four ordering ones do not.
+
+**`in` inherits every one of those answers, because it abbreviates `eq`.** An element may be null
+and means there what it means to `eq`, so `{"tier": {"in": [null]}}` selects the rows
+`{"tier": {"eq": null}}` selects — *not* what SQL's own `IN` would say, which never matches a null
+element and answers unknown for a null column. An abbreviation that selected different rows than the
+thing it abbreviates would be a trap, and an invisible one: the two agree on every table with no
+nulls in the filtered column.
+
+**`{"in": []}` is refused**, which is the same argument as the bare null reached from the other end.
+An empty list has an honest answer — no rows — and returning it is precisely what makes it a
+refusal: a caller cannot tell "your list was empty" from "nothing matched", so an agent whose
+candidate set collapsed to nothing would be told, in the vocabulary of a result, that its question
+was answered. `minItems: 1` in the generated schema is that refusal announced rather than only
+enforced. The list itself is never null — `{"in": null}` is refused as a shape, not as a value.
 
 **An ordering comparison over a null column does not return the row.** SQL's three-valued answer and
 §6.1's *admitted only on true* agree here rather than by coincidence: this grammar has no negation,

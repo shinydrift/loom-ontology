@@ -106,6 +106,7 @@ def cmd_query(args) -> int:
         return 1
 
     from .catalog import CatalogError
+    from .filters import MEMBERSHIP
     from .governance import PolicyError
     from .mcp.registry import json_safe
     from .negotiate import CapabilityError
@@ -119,6 +120,12 @@ def cmd_query(args) -> int:
     # `PROP=VALUE` and `PROP.OP=VALUE` — the two spellings the generated tool takes, in the one
     # encoding a shell has. A property name cannot contain a dot, so the split is unambiguous; a
     # null filter is the one thing not expressible here, because every CLI value is a string.
+    #
+    # `in` takes a list, and the list is built by **repeating the flag** — `tier.in=gold
+    # --filter tier.in=platinum` — rather than by splitting one value on a separator. A comma is a
+    # legal character inside a string value, so `tier.in=a,b` would have to either forbid it or
+    # silently split a single value into two wrong ones, and this command's whole job is to mirror
+    # what the generated tool would do with the same filter.
     filters: dict[str, Any] = {}
     for pair in args.filter or []:
         if "=" not in pair:
@@ -132,7 +139,16 @@ def cmd_query(args) -> int:
                 return 1
             filters[name] = value
         elif isinstance(filters.setdefault(name, {}), dict):
-            filters[name][op] = value
+            ops = filters[name]
+            if op == MEMBERSHIP:
+                ops.setdefault(op, []).append(value)
+            elif op in ops:
+                # Only `in` accumulates. Repeating any other operator used to keep the last value
+                # silently, which is a filter the caller did not write being answered as if they had.
+                print(f"error: --filter gives '{name}.{op}' twice", file=sys.stderr)
+                return 1
+            else:
+                ops[op] = value
         else:
             print(f"error: --filter gives '{name}' both a bare value and operators", file=sys.stderr)
             return 1
@@ -870,7 +886,10 @@ def main(argv: list[str] | None = None) -> int:
         "--filter",
         action="append",
         metavar="PROP[.OP]=VALUE",
-        help="repeatable search filter, ANDed — e.g. tier=gold, salesDate.gte=2026-01-01",
+        help=(
+            "repeatable search filter, ANDed — e.g. tier=gold, salesDate.gte=2026-01-01; "
+            "repeat PROP.in=VALUE to build a membership list"
+        ),
     )
     q.add_argument("--limit", type=int, default=None)
     q.set_defaults(func=cmd_query)
