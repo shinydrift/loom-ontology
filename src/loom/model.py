@@ -41,6 +41,11 @@ class ObjectType:
     backing_table: str
     properties: dict[str, Property]  # keyed by name, insertion-ordered
     searchable: tuple[str, ...] = ()
+    # The one property this type may be searched by *meaning* rather than by value. A scalar
+    # because it names one, the way `primaryKey` and `title` do and unlike `searchable` — see
+    # spec-v0 §2. Declaring it demands `vector_search` of the engine; whether a tool appears for
+    # it is a question about the deployment, not this.
+    semantic: str | None = None
     display_name: str = ""
     description: str | None = None
     status: str = "active"
@@ -49,6 +54,15 @@ class ObjectType:
     @property
     def pk_property(self) -> Property:
         return self.properties[self.primary_key]
+
+    @property
+    def semantic_property(self) -> Property | None:
+        """The declared semantic property, or None. Resolved rather than looked up at each use, so
+        the two places that ask (negotiation and, later, the sidecar) cannot disagree about what a
+        spec that names an undeclared property means — the validator has already refused it."""
+        if self.semantic is None:
+            return None
+        return self.properties.get(self.semantic)
 
 
 @dataclass(frozen=True)

@@ -36,7 +36,7 @@ from .types import ALL_KINDS, PropType
 
 KINDS = ("objectType", "linkType", "action")
 
-_OBJECT_KEYS = {"apiName", "displayName", "description", "primaryKey", "title", "status", "backing", "properties", "searchable"}
+_OBJECT_KEYS = {"apiName", "displayName", "description", "primaryKey", "title", "status", "backing", "properties", "searchable", "semantic"}
 _BACKING_KEYS = {"catalog", "table"}
 _PROPERTY_KEYS = {"name", "type", "column", "renamedFrom", "nullable", "unique", "values", "precision", "scale", "description"}
 _LINK_KEYS = {"apiName", "displayName", "description", "cardinality", "from", "to", "reverseName", "through", "status"}
@@ -225,6 +225,20 @@ def _parse_object(raw: dict, rel: str, diag: Diagnostics) -> ObjectType | None:
         diag.error("'searchable' must be a list", loc)
         searchable = ()
 
+    # A scalar, not a list, and the shape *is* the decision: this names one property, so the
+    # grammar says one rather than accepting a list and refusing its second element. `primaryKey`
+    # and `title` are the precedent — a list is what `searchable` is because it is genuinely many.
+    # Going plural later widens this key to accept both, which is additive; refusing a two-element
+    # list today would be a rule somebody has to be told, for a spec nobody can write yet.
+    semantic = raw.get("semantic")
+    if semantic is not None and (not isinstance(semantic, str) or not semantic.strip()):
+        diag.error(
+            f"'semantic' must be the name of one string property, got {semantic!r}"
+            + (" — one property, so this key is a name and not a list" if isinstance(semantic, list) else ""),
+            loc,
+        )
+        semantic = None
+
     if name is None or catalog is None or table is None or primary_key is None:
         return None
     title = raw.get("title") or primary_key
@@ -236,6 +250,7 @@ def _parse_object(raw: dict, rel: str, diag: Diagnostics) -> ObjectType | None:
         backing_table=table,
         properties=properties,
         searchable=searchable,
+        semantic=semantic.strip() if isinstance(semantic, str) else None,
         display_name=raw.get("displayName") or name,
         description=raw.get("description"),
         status=status,

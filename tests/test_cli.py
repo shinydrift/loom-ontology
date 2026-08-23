@@ -455,6 +455,39 @@ def test_the_serve_banner_says_whether_this_server_can_write(tmp_path):
     assert "actor 'unknown'" in anonymous and "set mcp.actor" in anonymous
 
 
+def test_the_serve_banner_says_where_vectors_come_from(tmp_path):
+    """The same gap `_write_mode` exists to explain, for the other half of M10's first slice.
+
+    A spec can declare `semantic:` and a deployment can configure no provider, and the tool count
+    alone cannot tell that apart from a spec declaring none. This is also the line that keeps
+    `mcp.embedding` from being a key nothing reads until slice 3 — the `loom.managed` shape, where a
+    field is written and never looked at, which this codebase has already been caught by once."""
+    import dataclasses
+
+    from loom.cli import _semantic_mode
+    from loom.config import EmbeddingConfig, LoomConfig, McpConfig
+
+    ontology, _ = build(VALID)
+    assert _semantic_mode(LoomConfig(), ontology) == []  # nothing declared, nothing said
+
+    customer = dataclasses.replace(ontology.object_types["Customer"], semantic="name")
+    declared = dataclasses.replace(
+        ontology, object_types={**ontology.object_types, "Customer": customer}
+    )
+
+    off = "\n".join(_semantic_mode(LoomConfig(), declared))
+    assert "semantic search off" in off and "Customer.name" in off and "mcp.embedding" in off
+
+    on = "\n".join(
+        _semantic_mode(
+            LoomConfig(mcp=McpConfig(embedding=EmbeddingConfig(model="bge-small"))), declared
+        )
+    )
+    # The model, not just the provider: it is folded into every stored vector's hash, so two
+    # servers on one spec with different models do not share a warehouse's vectors.
+    assert "Customer.name" in on and "local/bge-small" in on
+
+
 # ---- ingest --------------------------------------------------------------------
 
 

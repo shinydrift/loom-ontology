@@ -68,6 +68,11 @@ class DuckDBEngine:
             joins=True,
             offset=True,
             case_insensitive_like=True,
+            # `array_cosine_similarity` over `FLOAT[n]` is core DuckDB — no extension, so this is
+            # a claim about the dependency already declared rather than about one an operator has
+            # to install. The `vss` extension buys an HNSW index, which is an optimisation this
+            # engine does not need to make the claim true.
+            vector_search=True,
             native_merge=False,  # writes go through the Iceberg catalog, not DuckDB
         )
 

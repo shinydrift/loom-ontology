@@ -32,6 +32,15 @@ that survived a second transport intact and should not be spent on a config mism
 worse than either, and worse than failing: an exact match where the spec promised substring returns
 rows, so nothing errors, and the agent believes an answer that is wrong.
 
+**The fourth flag is `vector_search`, and it is the first one this module's rule has let through.**
+The three refused so far were refused for one reason — nothing could fail them — and this one is not
+like them. `range_comparisons` was a floor because every dialect that can say `WHERE c = ?` can say
+`WHERE c >= ?`; there is no comparable implication for vector distance. Ranking by similarity needs a
+fixed-width array type and arithmetic over it, which a dialect can perfectly well be a complete SQL
+engine without. So both halves of the test hold: a spec demands it by declaring `semantic:` on an
+object type, and an adapter fails it by not having array math. It is negotiated, and `Capabilities`
+defaults it *false* for the same reason — see the note there on what a default asserts.
+
 **A fourth flag was considered for typed filters and refused, by this module's own rule.** M7 put
 range comparisons in a caller's hands, and the question was whether `>=` is a floor every engine
 meets or a `NEGOTIATED` capability. It is a floor: every dialect that can say `WHERE c = ?` can say
@@ -58,7 +67,7 @@ from dataclasses import dataclass, fields
 from .model import Ontology
 from .query.engine import Capabilities
 
-NEGOTIATED = frozenset({"joins", "offset", "case_insensitive_like"})
+NEGOTIATED = frozenset({"joins", "offset", "case_insensitive_like", "vector_search"})
 """Capability flags a `Requirement` can name, and therefore that an ontology can fail an engine on."""
 
 NOT_NEGOTIATED = frozenset({"name", "native_merge"})
@@ -162,6 +171,27 @@ def requirements(ontology: Ontology) -> tuple[Requirement, ...]:
                 because=(
                     "a searchable string property matches on case-insensitive substring, which "
                     "compiles to a LIKE over lowered values"
+                ),
+            )
+        )
+
+    # Demanded by the *spec*, not by the deployment that configures a provider. A spec declaring
+    # `semantic:` against an engine with no array math describes a surface that engine could never
+    # serve, and finding that out only in the deployments that switch embedding on would make the
+    # refusal a property of a config file rather than of the pairing this module exists to check.
+    semantic = tuple(
+        f"{obj.api_name}.{obj.semantic}"
+        for obj in ontology.object_types.values()
+        if obj.semantic is not None
+    )
+    if semantic:
+        out.append(
+            Requirement(
+                capability="vector_search",
+                demanded_by=tuple(sorted(semantic)),
+                because=(
+                    "a semantic property is ranked by distance between fixed-width float arrays, "
+                    "which needs an array type and arithmetic over it"
                 ),
             )
         )

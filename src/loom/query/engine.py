@@ -47,6 +47,14 @@ class Capabilities:
     joins: bool = True
     offset: bool = True
     case_insensitive_like: bool = True
+    # **Defaults false, unlike the three above, and the difference is what a default asserts.**
+    # Those three are floors: a dialect that can filter can join, offset and lower a string, so
+    # defaulting them true says something almost every adapter would say anyway. Vector distance
+    # over a fixed-width float array is not implied by being able to say `WHERE c = ?` — it needs
+    # an array type and arithmetic over it, which plenty of dialects have neither of. So an
+    # adapter claims this or it does not have it, and a new adapter that says nothing is described
+    # correctly rather than optimistically.
+    vector_search: bool = False
     native_merge: bool = False  # routing hint, never negotiated — see above
 
 

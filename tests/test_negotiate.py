@@ -36,16 +36,57 @@ def ontology():
     return ont
 
 
+@pytest.fixture
+def semantic_ontology(ontology):
+    """The fixture, with `Customer.name` declared semantic.
+
+    Built here rather than in `fixtures/valid` on purpose. That directory is read by sixteen test
+    modules, and a `semantic:` there would change what those assert for reasons unrelated to what
+    they are about — the governance suite masks `Customer.name`, which this milestone made a
+    refusal. What every negotiated flag needs is an ontology that demands it, not the *same*
+    ontology, so the coverage assertions get one built for them and the shared fixture keeps
+    demanding exactly the three it demanded before."""
+    customer = dataclasses.replace(ontology.object_types["Customer"], semantic="name")
+    return dataclasses.replace(
+        ontology, object_types={**ontology.object_types, "Customer": customer}
+    )
+
+
 def _by_capability(reqs) -> dict[str, Requirement]:
     return {r.capability: r for r in reqs}
+
+
+def _fully_capable(name: str) -> Capabilities:
+    """Every negotiated flag on. Not `Capabilities(name)` — see
+    `test_a_default_capabilities_is_not_a_fully_capable_one` for why the default is not this."""
+    return Capabilities(name=name, **{flag: True for flag in NEGOTIATED})
 
 
 # ---- what a spec demands ---------------------------------------------------------
 
 
-def test_the_fixture_demands_all_three_negotiated_capabilities(ontology):
-    """Customer/Order + placedBy: a link, a searchable string, and the page arguments."""
+def test_the_fixture_demands_three_of_the_four_negotiated_capabilities(ontology):
+    """Customer/Order + placedBy: a link, a searchable string, and the page arguments.
+
+    Three rather than four because nothing here declares `semantic:` — which is the point of the
+    fourth: a link or a searchable string is ordinary and demands its capability by existing, and
+    an embedding is asked for or it is not."""
     assert [r.capability for r in requirements(ontology)] == ["joins", "offset", "case_insensitive_like"]
+
+
+def test_a_semantic_property_is_what_demands_vector_search(semantic_ontology):
+    req = _by_capability(requirements(semantic_ontology))["vector_search"]
+    assert req.demanded_by == ("Customer.name",)
+    assert "array" in req.because
+
+
+def test_nothing_but_a_semantic_declaration_demands_vector_search(ontology):
+    """A searchable string demands `case_insensitive_like` and not this one.
+
+    The two are easy to conflate — both are about text — and they are demanded by different
+    declarations: `searchable` asks for substring matching, `semantic` asks for distance between
+    vectors, and a spec may ask for either without the other."""
+    assert "vector_search" not in _by_capability(requirements(ontology))
 
 
 def test_a_link_is_what_demands_joins_and_the_requirement_names_it(ontology):
@@ -157,24 +198,35 @@ def test_a_capable_engine_is_simply_wired(ontology):
 
 
 @pytest.mark.parametrize("flag", sorted(NEGOTIATED))
-def test_every_negotiated_flag_can_refuse_on_its_own(ontology, flag):
-    caps = dataclasses.replace(Capabilities(name="partial"), **{flag: False})
+def test_every_negotiated_flag_can_refuse_on_its_own(semantic_ontology, flag):
+    caps = dataclasses.replace(_fully_capable("partial"), **{flag: False})
     with pytest.raises(CapabilityError) as excinfo:
-        check_capabilities(ontology, caps)
+        check_capabilities(semantic_ontology, caps)
     assert flag in str(excinfo.value)
     assert "partial" in str(excinfo.value)
 
 
-def test_the_refusal_lists_every_unmet_requirement_at_once(ontology):
+def test_the_refusal_lists_every_unmet_requirement_at_once(semantic_ontology):
     """Not the first one. An operator swapping an adapter should learn what it has to support in
     one reading — the same reason `Diagnostics` collects spec errors instead of raising on the
     first."""
     caps = Capabilities(name="minimal", joins=False, offset=False, case_insensitive_like=False)
     with pytest.raises(CapabilityError) as excinfo:
-        check_capabilities(ontology, caps)
+        check_capabilities(semantic_ontology, caps)
     message = str(excinfo.value)
     for flag in NEGOTIATED:
         assert flag in message
+
+
+def test_a_default_capabilities_is_not_a_fully_capable_one(semantic_ontology):
+    """`Capabilities(name=...)` is three yeses and one no, and that asymmetry is deliberate.
+
+    `joins` / `offset` / `case_insensitive_like` default true because they are floors almost every
+    dialect meets; `vector_search` defaults false because array arithmetic is not implied by being
+    able to filter. Asserted here so the day a fourth adapter appears and says nothing, what it is
+    described as is a decision somebody reads rather than a default nobody noticed."""
+    with pytest.raises(CapabilityError):
+        check_capabilities(semantic_ontology, Capabilities(name="silent"))
 
 
 def test_the_refusal_names_the_declaration_to_go_and_change(ontology):
