@@ -72,7 +72,10 @@ _PAGE_SCHEMA = {
         "type": "integer",
         "minimum": 1,
         "maximum": MAX_PAGE_SIZE,
-        "description": f"max rows to return (default {DEFAULT_PAGE_SIZE}, hard cap {MAX_PAGE_SIZE})",
+        # `maximum` is enforced by `Resolver._page_size` and not only advertised here — a larger
+        # number is refused rather than quietly clamped, so the `limit` in a page envelope below is
+        # always the page size the caller actually got.
+        "description": f"max rows to return (default {DEFAULT_PAGE_SIZE}, maximum {MAX_PAGE_SIZE})",
     },
     "offset": {"type": "integer", "minimum": 0, "description": "rows to skip, for paging"},
 }
@@ -368,8 +371,11 @@ def _page(obj: ObjectType, rows: list[dict], args: dict, masked: Sequence[str] =
         "count": len(rows),
         "limit": limit,
         "offset": offset,
-        # An agent has no other way to tell "that's everything" from "the page filled up".
-        "hasMore": len(rows) == min(limit, MAX_PAGE_SIZE),
+        # An agent has no other way to tell "that's everything" from "the page filled up". Compared
+        # against the caller's own number, which `Resolver._page_size` has already either accepted
+        # as the page size or refused — this used to be `min(limit, MAX_PAGE_SIZE)`, the shape that
+        # betrayed that `limit` above was not necessarily the page that was served.
+        "hasMore": len(rows) == limit,
         # Always present, empty when nothing is withheld. A key that appears only under a policy
         # would make "this deployment governs nothing" and "this Loom is too old to say"
         # indistinguishable, which is the one thing an envelope reporting a mask must not do.
@@ -457,7 +463,7 @@ def _traverse_tool(resolver: Resolver, program: PolicyProgram | None = None) -> 
             "count": len(rows),
             "limit": limit,
             "offset": args.get("offset", 0),
-            "hasMore": len(rows) == min(limit, MAX_PAGE_SIZE),
+            "hasMore": len(rows) == limit,
             # The target's mask, not the source's: a traverse projects the objects at the other end,
             # so what is withheld here is a fact about where you landed. Read per call rather than
             # bound at build like the per-object tools', because this one tool spans every route.

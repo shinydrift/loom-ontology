@@ -40,7 +40,7 @@ heavily annotated — most of the file is prose explaining what each key would d
 
 ### What's in the spec
 
-- **`Customer`** · `customerId` / `name` / `tier` (enum) / `ltv` (nullable) — searchable by name and tier
+- **`Customer`** · `customerId` / `name` / `tier` (enum) / `ltv` (nullable) — searchable by name, tier and ltv
 - **`Order`** · `orderId` / `customerId` / `total` (decimal) / `placedAt`
 - **`DailySalesPerformance`** · a precomputed daily rollup with refresh and source provenance, keyed by date
 - **`placedBy`** · `Order → Customer`, many-to-one, with the reverse hop named `orders`

@@ -125,12 +125,17 @@ def test_an_added_property_migrates_the_live_table_in_place(project):
     before = catalogs["local"].describe("crm.customers")
 
     customer = target / "ontology" / "customer.yaml"
-    customer.write_text(
-        customer.read_text().replace(
-            "  searchable: [name, tier]",
-            "    - { name: region, type: string, column: region, nullable: true }\n  searchable: [name, tier]",
-        )
+    # Anchored on the `searchable:` *key* rather than on the list it holds: this edit used to name
+    # `[name, tier]` in full, so adding a property to that list in the example turned the whole
+    # rewrite into a no-op and the assertions below read "up-to-date" instead of a missing column.
+    text = customer.read_text()
+    edited_text = text.replace(
+        "\n  searchable:",
+        "\n    - { name: region, type: string, column: region, nullable: true }\n  searchable:",
+        1,
     )
+    assert edited_text != text, "the anchor this edit hangs on has moved"
+    customer.write_text(edited_text)
     edited, _ = build(target / "ontology")
     result = _apply(target, edited, catalogs)
 

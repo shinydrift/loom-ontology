@@ -116,6 +116,10 @@ def session(served_ontology):
                 {"filter": {"salesDate": {"gte": "2026-02-01", "lt": "2026-03-01"}}},
             ),
             ("search_customer", {"filter": {"name": None}}),
+            # The two a live client found: a property the `filter` schema does not advertise, and a
+            # page larger than the one it advertises a maximum for. Both used to answer.
+            ("search_customer", {"filter": {"customerId": {"eq": "c1"}}}),
+            ("search_customer", {"filter": {"tier": "gold"}, "limit": 99999}),
         ],
     )
 
@@ -202,6 +206,34 @@ def test_a_bare_null_filter_is_refused_over_the_wire(session):
     _, _, results = session
     assert results[10].is_error is True
     assert "a bare null is not a filter value" in results[10].content[0].text
+
+
+def test_the_filter_schema_is_the_whole_of_what_a_client_may_filter_on(session):
+    """A property the advertised schema omits is refused rather than answered.
+
+    `customerId` is a declared property and not a searchable one, so it is absent from the `filter`
+    schema this same session listed above. Enforcement of that used to live only in the schema —
+    which is advice — so a client that sent it anyway got rows back, and `additionalProperties:
+    false` described a surface nothing checked. Asserted over the wire because the wire is where a
+    client that never read the schema actually arrives."""
+    _, listing, results = session
+    tool = next(t for t in listing.tools if t.name == "search_customer")
+    assert "customerId" not in tool.input_schema["properties"]["filter"]["properties"]
+    assert results[11].is_error is True
+    assert "'Customer.customerId' is not declared searchable" in results[11].content[0].text
+
+
+def test_a_page_larger_than_the_advertised_maximum_is_refused_over_the_wire(session):
+    """The envelope can only report a page size that was served, and this is why.
+
+    A limit above the cap used to be clamped to it while the response echoed the caller's number,
+    so an agent paging with `offset += limit` skipped every row between the two. The schema already
+    advertised `maximum`; now the server answers the same way."""
+    _, listing, results = session
+    tool = next(t for t in listing.tools if t.name == "search_customer")
+    assert tool.input_schema["properties"]["limit"]["maximum"] == 500
+    assert results[12].is_error is True
+    assert "limit must be <= 500, got 99999" in results[12].content[0].text
 
 
 def test_traverse_over_the_wire_pages(session):

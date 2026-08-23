@@ -1168,6 +1168,19 @@ enforced. The list itself is never null — `{"in": null}` is refused as a shape
 §6.1's *admitted only on true* agree here rather than by coincidence: this grammar has no negation,
 which is the only place the two can differ.
 
+**The advertised `filter` properties are exactly the ones accepted**, and that is enforcement rather
+than presentation. The schema lists `searchable` minus whatever a policy withholds (§7); a filter on
+any other property is refused — a declared-but-not-searchable one by §2 rule 6, a withheld one as
+the oracle §6.1 refuses. This is written down because it was once only advertised: the surface built
+its schema from `searchable` while the resolver accepted any declared property, so `filter`'s
+`additionalProperties: false` was a claim nothing made true, and a caller who ignored the schema
+could range-query a column the deployment never offered.
+
+**`limit` above the maximum is refused, not clamped.** Both bounds are enforced the same way, so the
+`limit` a page envelope reports is always the page that was served. Clamping reads as generosity and
+is a silent narrowing: the caller gets `MAX` rows, the envelope echoes the number it asked for, and
+a client paging with `offset += limit` steps past everything it was not given.
+
 ---
 
 ## 8. Worked example — a complete, valid mini-ontology
