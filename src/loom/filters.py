@@ -53,6 +53,13 @@ cannot tell "your list was empty" from "nothing matched", so an agent whose cand
 to nothing gets told, in the vocabulary of a result, that its question was answered. `minItems: 1`
 in the generated schema is that refusal announced rather than only enforced.
 
+The third is a **JSON object or array where a value goes** — `{"name": {"eq": {"deep": 1}}}`, or a
+bare `{"name": ["a"]}`. It belongs with the other two rather than with the type errors: a container
+is not mistyped, it is unreadable, and `str()` obliged anyway with a Python repr no row can hold. So
+the malformed argument came back as `0 rows` — the same trade as the bare null, arrived at from the
+empty side. Scalars are still coerced and not type-checked, which is what `42` for a substring match
+depends on; see `_coerced`.
+
 Everything else about null follows `predicate.py` without needing a second rule: an ordering
 comparison against a null column is **undecided**, and an undecided row is not returned. For a
 policy that is *admitted only on true*; for a filter it is the flatter statement that a filter
@@ -336,6 +343,30 @@ def _membership(
 
 
 def _coerced(prop: Property, value: Any, objects: Mapping[str, ObjectType], ctx: str) -> Any:
+    """One value, read as the property's declared type — or the refusal a container earns.
+
+    Scalars are *coerced* rather than type-checked, and that is deliberate and unchanged: an agent
+    sends `"100"` for a double and `42` for a substring match, and `coerce_value` reads both as what
+    the spec declared. A JSON object or array has no such reading. Every scalar kind bottoms out in
+    `str(value)` for a string property, so a container reached the engine as its **Python repr** —
+    `{"name": {"eq": {"deep": 1}}}` compared `full_name` against `"{'deep': 1}"`, and a list against
+    `"['a']"`. No row holds either, so a malformed argument came back as `0 rows` with no error: the
+    plausible-empty twin of the plausible-non-empty answer the bare null is refused for. Third
+    refusal, same rule — an honest-looking answer to a question nobody asked."""
+    # Worded as `coerce_value`'s own refusals are — "cannot read X as <kind>" — because that is the
+    # sentence an agent already gets for a value of the wrong type, and this is the same question
+    # answered for the one shape no coercion exists for.
+    if isinstance(value, Mapping):
+        raise FilterError(
+            f"{ctx}: cannot read an object as {prop.type.kind} — operator keys nest one level, "
+            f'under the property name, so write {{"{prop.name}": {{"eq": ...}}}} with a single '
+            "value where the operator's value goes"
+        )
+    if isinstance(value, list):
+        raise FilterError(
+            f"{ctx}: cannot read a list as {prop.type.kind} — write a single value, or "
+            f'{{"{prop.name}": {{"in": [...]}}}} to match any of several'
+        )
     try:
         return coerce_value(prop.type, value, objects, ctx)
     except ValueError as e:

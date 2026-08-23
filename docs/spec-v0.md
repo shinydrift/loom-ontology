@@ -1168,6 +1168,13 @@ enforced. The list itself is never null — `{"in": null}` is refused as a shape
 §6.1's *admitted only on true* agree here rather than by coincidence: this grammar has no negation,
 which is the only place the two can differ.
 
+**A JSON object or array where a value goes is refused**, which is the third refusal and the one
+that arrives from the empty side. A scalar is *coerced* rather than type-checked — `"100"` reads as
+a double, `42` reads as `"42"` for a substring match — and the bottom of that path is `str(value)`,
+which obliges a container with a language-level repr like `"{'deep': 1}"`. No row holds one, so
+`{"name": {"eq": {"deep": 1}}}` answered `0 rows` with no error: a malformed argument dressed as a
+result, exactly what the bare null is refused for.
+
 **The advertised `filter` properties are exactly the ones accepted**, and that is enforcement rather
 than presentation. The schema lists `searchable` minus whatever a policy withholds (§7); a filter on
 any other property is refused — a declared-but-not-searchable one by §2 rule 6, a withheld one as
