@@ -8,7 +8,11 @@ tools. `plan` dry-runs the migration engine, `apply` executes exactly what `plan
 M4's `run_<action>` tool will call. `ingest` is `run` at batch scale and the one command with no
 tool behind it: a declared load, from a file, checked against the ontology and written as one commit
 — deliberately reachable only from here, because a verb that writes an arbitrary batch is not
-something any agent surface should be able to name.
+something any agent surface should be able to name. `sequence` is `ingest` in an order: several
+declared loads from one manifest, stopping at the first refusal and reporting what landed, because
+Iceberg's unit is the table and there is no cross-table transaction to pretend to. `infer` runs
+before any of them and is the only command that reads a schema instead of being told one: it drafts
+a spec from a file and prints it, touching no catalog and writing nothing.
 """
 
 from __future__ import annotations
@@ -23,6 +27,11 @@ from typing import Any
 
 from .config import CONFIG_FILENAME, find_config, load_config
 from .errors import Diagnostics, SourceLoc, SpecError, SpecErrors
+
+# Module-level, unlike every other command's imports, because `main()` builds the parser before it
+# knows which command is running — and `infer`'s `--format` choices are the refusal list itself.
+# Cheap enough to be unremarkable: `infer` imports pyarrow inside the function that needs it.
+from .infer import INFER_FORMATS, UNREADABLE_FORMATS
 from .model import Ontology
 from .ontology import build
 
@@ -54,6 +63,48 @@ def _load_project(path: str, diag: Diagnostics):
     diag.warnings.extend(ont_diag.warnings)
     diag.raise_if_errors()
     return ontology, config
+
+
+def cmd_infer(args) -> int:
+    """Draft an objectType from a file and print it. The only command that loads no project.
+
+    Note what it does not take: an ontology directory. There is nothing to read one for — the draft
+    is a new type, and a command that opened `loom.yaml` here would be a command that could be made
+    to consult a catalog later. The path it does not take is the reason it can never migrate
+    anything, which is stronger than the same claim made in a docstring.
+
+    Everything goes to stdout so it can be redirected into a file. That is two deliberate steps —
+    redirect, then edit — and the draft's placeholders are what make the second one unavoidable."""
+    from .infer import InferError, infer_draft, render_draft
+
+    try:
+        draft = infer_draft(
+            args.source,
+            args.api_name,
+            fmt=args.format,
+            catalog=args.catalog,
+            table=args.table,
+            key=args.key,
+            entry=args.entry,
+        )
+    except InferError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    print(render_draft(draft), end="")
+    unmapped = draft.unmapped
+    if unmapped:
+        names = ", ".join(c.name for c in unmapped)
+        print(
+            f"note: {len(unmapped)} column(s) have no property — {names}. They are unmanaged, not "
+            f"lost: see the comments above each one.",
+            file=sys.stderr,
+        )
+    print(
+        "note: this draft does not validate yet — fill in the TODOs, then run 'loom validate'.",
+        file=sys.stderr,
+    )
+    return 0
 
 
 def cmd_validate(args) -> int:
@@ -541,6 +592,120 @@ def _render_load(result, title: str) -> str:
             lines.append(f"    hint: {hint}")
     if result.failures:
         lines.append("  nothing was written.")
+    return "\n".join(lines)
+
+
+def cmd_sequence(args) -> int:
+    """Run one declared sequence of loads, in order, and record that they were one run.
+
+    It takes a **sequence name and a manifest**, mirroring `loom ingest`'s entry-and-file exactly:
+    the declared thing, and the file that varies per run. A sequence needs several data files, so
+    the file it takes is the one that names them — which keeps the principle rather than bending it.
+
+    **There is no `--from` or `--only`.** Resuming a partial run and loading a subset are both
+    `loom ingest` per entry, which already exists and already refuses a file it has seen. A flag
+    here would be a second, less careful way to run part of a sequence, and the reported
+    `stoppedAt` is the whole of what an operator needs to pick up by hand."""
+    diag = Diagnostics()
+    try:
+        ontology, config = _load_project(args.path, diag)
+    except SpecErrors as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    from .catalog import SEQUENCE_LOG_TABLE, CatalogError, open_catalogs
+    from .governance import PolicyError
+    from .ingest import IngestError, SequenceError, build_sequences
+    from .mcp.registry import json_safe
+    from .migrate.meta import default_actor
+
+    try:
+        runtime = build_sequences(ontology, config, open_catalogs(config))
+        preview = runtime.run(args.sequence, args.manifest, dry_run=True)
+    except (IngestError, SequenceError, PolicyError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except CatalogError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    print(_render_sequence(preview, str(args.path)), file=sys.stderr)
+    if args.dry_run:
+        print(json.dumps(json_safe(preview.as_json()), indent=2, default=str))
+        return 0 if preview.ok else 1
+
+    # Unlike `cmd_ingest`, a refused preview does **not** run for real. That command runs a refusal
+    # so the log records who tried; here the individual loads still do exactly that, each recording
+    # its own refusal in `_loom_meta.loads`. What running anyway would add is a sequence row for a
+    # run whose first load is already known to refuse — a record of an order that was never
+    # attempted, which is the intention-shaped record `_record` writes after the fact to avoid.
+    if not preview.ok:
+        print("nothing was loaded — the sequence would stop before the end.", file=sys.stderr)
+        return 1
+    if not _confirmed(args.yes, "run"):
+        print("aborted — nothing was written", file=sys.stderr)
+        return 1
+
+    try:
+        result = runtime.run(args.sequence, args.manifest, actor=default_actor())
+    except (IngestError, SequenceError) as e:  # pragma: no cover - the preview met these already
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    print(json.dumps(json_safe(result.as_json()), indent=2, default=str))
+    for step in result.steps:
+        if step.result is None:
+            print(f"error: {step.entry}: the load could not be attempted", file=sys.stderr)
+            continue
+        for failure in step.result.failures:
+            print(f"error: {step.entry}: {failure.code}: {failure.message}", file=sys.stderr)
+    if result.recorded:
+        print(
+            f"note: recorded in {SEQUENCE_LOG_TABLE} as {result.sequence_id}.", file=sys.stderr
+        )
+    elif result.sequence_id:
+        # The loads recorded themselves either way; what is missing is only the grouping.
+        print(
+            "note: the sequence log did not record this run — each load is still in "
+            "_loom_meta.loads under its own id.",
+            file=sys.stderr,
+        )
+    return 0 if result.ok else 1
+
+
+def _render_sequence(result, title: str) -> str:
+    """The order, before the prompt, with what each step would do to its table.
+
+    `render_apply`'s shape rather than `_render_load`'s, because the thing being previewed is a list
+    that stops somewhere — and the sentence at the bottom is the one `apply` already had to write:
+    this is an order, not a transaction."""
+    marks = {"append": "+", "merge": "~", "replace": "-"}
+    lines = [f"Loom sequence — {result.sequence} on {title}", ""]
+    for step in result.steps:
+        load = step.result
+        if load is None:
+            lines.append(f"  ! {step.entry} — the load could not be attempted")
+            continue
+        lines.append(
+            f"  {marks.get(load.mode, '?')} {step.entry}: {load.mode} {load.rows_read} row(s) "
+            f"into {load.object_type} ({load.table})"
+        )
+        lines.append(f"      from  {step.source}")
+        for failure in load.failures:
+            lines.append(f"      ! {failure.code}: {failure.message}")
+    if result.stopped_at is not None:
+        lines.append(f"\n  ! stops at '{result.stopped_at}'.")
+        if result.landed:
+            lines.append(
+                f"    {len(result.landed)} load(s) before it would have landed and would stay "
+                f"landed:"
+            )
+            lines.append(f"    {', '.join(s.entry for s in result.landed)}")
+    lines.append(
+        "\n  Iceberg's unit is the table, so there is no cross-table transaction to be had:"
+        "\n  this sequences the loads, stops at the first refusal, and reports exactly which"
+        "\n  ones landed rather than pretending the run was atomic."
+    )
     return "\n".join(lines)
 
 
@@ -1097,6 +1262,29 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="loom", description="Loom ontology framework")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    n = sub.add_parser("infer", help="draft an objectType from a data file (writes nothing)")
+    n.add_argument("source", help="path to the file to read the schema of")
+    # Required, and not derived from the filename. `customers.parquet` -> `Customer` needs a
+    # singulariser, which is a guess about English rather than about data, and it would be the one
+    # guess this command makes that no comment in the output could justify.
+    n.add_argument("--as", dest="api_name", required=True, metavar="NAME", help="apiName for the drafted objectType")
+    n.add_argument(
+        "--format",
+        default="parquet",
+        choices=list(INFER_FORMATS) + sorted(UNREADABLE_FORMATS),
+        help="source format; only parquet is readable — the others are listed so the refusal names them",
+    )
+    n.add_argument("--catalog", default=None, metavar="NAME", help="backing catalog, as named in loom.yaml")
+    n.add_argument("--table", default=None, metavar="NS.TABLE", help="backing table for this type")
+    n.add_argument(
+        "--key",
+        default=None,
+        metavar="COLUMN",
+        help="source column to use as the primary key — named as a column, since the property does not exist yet",
+    )
+    n.add_argument("--entry", default=None, metavar="NAME", help="name for the drafted ingest entry")
+    n.set_defaults(func=cmd_infer)
+
     v = sub.add_parser("validate", help="load and validate an ontology directory")
     v.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")
     v.add_argument(
@@ -1160,6 +1348,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     i.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     i.set_defaults(func=cmd_ingest)
+
+    sq = sub.add_parser("sequence", help="run a declared order of bulk loads from a manifest")
+    sq.add_argument("sequence", help="the sequence declared in loom.yaml, e.g. nightly")
+    sq.add_argument("manifest", help="path to a YAML mapping of entry name to file path")
+    sq.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")
+    sq.add_argument("--dry-run", action="store_true", help="check every load, but write nothing")
+    sq.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    sq.set_defaults(func=cmd_sequence)
 
     e = sub.add_parser("embed", help="bring the vector sidecars level with the text they describe")
     e.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")

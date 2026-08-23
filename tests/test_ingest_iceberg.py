@@ -20,16 +20,13 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import json
-import shutil
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-from loom import build
 from loom.catalog.base import LOAD_LOG_TABLE
-from loom.config import IngestEntry, find_config, load_config
-from loom.errors import Diagnostics
+from loom.config import IngestEntry
 from loom.governance import EDIT_LOG_REQUIRED, INGEST_ALLOWED, INGEST_REFUSED
 from loom.ingest import LoadLog, build_ingest
 from loom.ingest.result import APPLIED, CONFLICT, DUPLICATE_LOAD, REFUSED
@@ -38,23 +35,6 @@ pytest.importorskip("pyiceberg", reason="needs the [iceberg] extra")
 pa = pytest.importorskip("pyarrow", reason="needs the [iceberg] extra")
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "retail"
-
-
-@pytest.fixture
-def seeded(tmp_path):
-    """A seeded copy of the example: real Iceberg tables with rows in them, no `loom apply`."""
-    target = tmp_path / "retail"
-    shutil.copytree(EXAMPLE, target, ignore=shutil.ignore_patterns(".warehouse"))
-    spec = importlib.util.spec_from_file_location("ingest_seed", target / "seed.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    module.seed(target)
-
-    diag = Diagnostics()
-    config = load_config(find_config(target / "ontology"), diag)
-    ontology, _ = build(target / "ontology")
-    diag.raise_if_errors()
-    return target, ontology, config
 
 
 def entry(mode="append", fmt="ndjson", object_type="Customer", name="customers", columns=None):
@@ -356,14 +336,18 @@ def test_an_append_is_not_refused_by_a_concurrent_write(seeded, tmp_path):
 # ---- the record ----------------------------------------------------------------
 
 
-def test_the_load_log_is_created_by_the_load_that_needs_it(seeded, tmp_path):
-    """No `loom apply` in this lake's history at all, so `_loom_meta` does not exist until now —
-    which is the whole argument for the first append owning the create."""
-    assert not catalog_of(seeded).table_exists(LOAD_LOG_TABLE)
-    result = runtime(seeded).load("customers", ndjson(tmp_path, NEW_CUSTOMERS), actor="ci")
+def test_the_load_log_is_created_by_the_load_that_needs_it(guest, tmp_path):
+    """No Loom verb in this lake's history at all, so `_loom_meta` does not exist until now — which
+    is the whole argument for the first append owning the create.
 
-    assert catalog_of(seeded).table_exists(LOAD_LOG_TABLE)
-    history = LoadLog(catalog=catalog_of(seeded)).history()
+    `guest` rather than `seeded` since M11's third slice: the shipped example now bootstraps with
+    `loom apply` and loads through a declared sequence, so a seeded warehouse arrives with all three
+    `_loom_meta` tables in it. A test about who creates the log needs a lake that has none."""
+    assert not catalog_of(guest).table_exists(LOAD_LOG_TABLE)
+    result = runtime(guest).load("customers", ndjson(tmp_path, NEW_CUSTOMERS), actor="ci")
+
+    assert catalog_of(guest).table_exists(LOAD_LOG_TABLE)
+    history = LoadLog(catalog=catalog_of(guest)).history()
     assert len(history) == 1
     assert history[0]["load_id"] == result.load_id
     assert history[0]["actor"] == "ci"
@@ -384,19 +368,19 @@ def test_the_second_run_of_one_file_is_refused_against_a_real_log(seeded, tmp_pa
     assert len(rows_of(seeded)) == 6  # not 8
 
 
-def test_edit_log_required_creates_the_load_log_before_anything_is_written(seeded):
+def test_edit_log_required_creates_the_load_log_before_anything_is_written(guest):
     """The posture is spent at startup, and it creates the table rather than probing for it: an
     empty log is a permission, not a table of intentions."""
-    assert not catalog_of(seeded).table_exists(LOAD_LOG_TABLE)
-    runtime(seeded, edit_log=EDIT_LOG_REQUIRED)
+    assert not catalog_of(guest).table_exists(LOAD_LOG_TABLE)
+    runtime(guest, edit_log=EDIT_LOG_REQUIRED)
 
-    assert catalog_of(seeded).table_exists(LOAD_LOG_TABLE)
-    assert LoadLog(catalog=catalog_of(seeded)).history() == ()
+    assert catalog_of(guest).table_exists(LOAD_LOG_TABLE)
+    assert LoadLog(catalog=catalog_of(guest)).history() == ()
 
 
-def test_a_refused_deployment_creates_no_load_log(seeded):
-    runtime(seeded, posture=INGEST_REFUSED, edit_log=EDIT_LOG_REQUIRED)
-    assert not catalog_of(seeded).table_exists(LOAD_LOG_TABLE)
+def test_a_refused_deployment_creates_no_load_log(guest):
+    runtime(guest, posture=INGEST_REFUSED, edit_log=EDIT_LOG_REQUIRED)
+    assert not catalog_of(guest).table_exists(LOAD_LOG_TABLE)
 
 
 # ---- types, through real storage ------------------------------------------------
@@ -467,7 +451,6 @@ def test_the_declared_load_lands_exactly_what_the_hand_rolled_write_does(seeded,
     so what the declared entry adds is not different rows, it is the two things the hand-rolled path
     has no way to produce: values checked against the ontology's declared types before they land, and
     a row in `_loom_meta.loads` saying which file became which commit."""
-    import importlib.util
 
     target, _, config = seeded
     spec = importlib.util.spec_from_file_location("perf", target / "sales_performance.py")
@@ -494,11 +477,13 @@ def test_the_declared_load_lands_exactly_what_the_hand_rolled_write_does(seeded,
     assert declared == by_hand
 
     # ...and the difference: one of them is in the lake's own record, and one never was.
+    # The seed's own two loads are already in this log — the example loads itself through Loom
+    # since M11's third slice — so what is asserted is the entry this test added to it.
     history = LoadLog(catalog=catalog_of(seeded)).history()
-    assert [r["entry"] for r in history] == ["daily-sales"]
-    assert history[0]["rows_written"] == len(declared)
-    assert history[0]["source"].endswith("daily.parquet")
-    assert history[0]["source_fingerprint"]
+    assert [r["entry"] for r in history][-1:] == ["daily-sales"]
+    assert history[-1]["rows_written"] == len(declared)
+    assert history[-1]["source"].endswith("daily.parquet")
+    assert history[-1]["source_fingerprint"]
     summary = snapshot_summary(seeded, "sales.daily_sales_performance")
     assert summary["loom.load_id"] == result.load_id
 
@@ -506,10 +491,13 @@ def test_the_declared_load_lands_exactly_what_the_hand_rolled_write_does(seeded,
 def test_the_shipped_example_declares_a_load_the_deployment_permits(seeded, tmp_path):
     """The entry in `examples/retail/loom.yaml` is real rather than illustrative: it resolves
     against the shipped ontology, and the shipped `governance.ingest` permits it."""
-    import importlib.util
 
     target, ontology, config = seeded
-    assert [e.name for e in config.ingest] == ["daily-sales"]
+    assert [e.name for e in config.ingest] == ["customers", "orders", "daily-sales"]
+    # The first two are how the example seeds itself since M11's third slice; `daily-sales` is the
+    # one nothing shipped runs yet, which is what makes loading it here worth asserting.
+    assert [s.name for s in config.sequences] == ["seed"]
+    assert config.sequences[0].loads == ("customers", "orders")
     assert config.ingest_posture == INGEST_ALLOWED
 
     spec = importlib.util.spec_from_file_location("perf2", target / "sales_performance.py")

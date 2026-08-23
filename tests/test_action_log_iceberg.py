@@ -11,41 +11,18 @@ the case that would have been impossible if `apply` were the one to create the l
 
 from __future__ import annotations
 
-import importlib.util
 import json
-import shutil
 from pathlib import Path
 
 import pytest
 
-from loom import build
 from loom.action import APPLIED, MAX_ATTEMPTS, REFUSED, ActionRuntime, EditLog
 from loom.catalog.base import EDIT_LOG_TABLE
-from loom.config import find_config, load_config
-from loom.errors import Diagnostics
 from test_action_iceberg import Interloper
 
 pytest.importorskip("pyiceberg", reason="needs the [iceberg] extra")
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "retail"
-
-
-@pytest.fixture
-def seeded(tmp_path):
-    """A seeded copy of the example: real Iceberg tables with rows in them, and no `loom apply` in
-    its history at all."""
-    target = tmp_path / "retail"
-    shutil.copytree(EXAMPLE, target, ignore=shutil.ignore_patterns(".warehouse"))
-    spec = importlib.util.spec_from_file_location("edit_log_seed", target / "seed.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    module.seed(target)
-
-    diag = Diagnostics()
-    config = load_config(find_config(target / "ontology"), diag)
-    ontology, _ = build(target / "ontology")
-    diag.raise_if_errors()
-    return target, ontology, config
 
 
 @pytest.fixture

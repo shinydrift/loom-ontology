@@ -21,6 +21,7 @@ from typing import Any
 from .base import (
     EDIT_LOG_TABLE,
     LOAD_LOG_TABLE,
+    SEQUENCE_LOG_TABLE,
     VECTOR_KEY_COLUMN,
     CatalogError,
     Column,
@@ -109,10 +110,11 @@ def _namespace_of(table: str) -> str:
 class PyIcebergCatalog:
     """Adapts a constructed pyiceberg catalog to every port in `base.py`.
 
-    One class implements all seven because pyiceberg can do all seven; that is not the same as the
+    One class implements all eight because pyiceberg can do all eight; that is not the same as the
     ports being one port. What each *caller* is handed is decided by which of `writer_for` /
     `row_writer_for` / `bulk_writer_for` / `edit_log_writer_for` / `load_log_writer_for` /
-    `vector_writer_for` it asked, and the type it holds is what bounds what it can do."""
+    `sequence_log_writer_for` / `vector_writer_for` it asked, and the type it holds is what bounds
+    what it can do."""
 
     name: str
     _impl: Any
@@ -585,6 +587,18 @@ class PyIcebergCatalog:
         routing it through `_guarded` would let the log table's own traffic refuse the record of a
         load that already committed."""
         self._append_meta_row(LOAD_LOG_TABLE, columns, row, "record a load in")
+
+    # --- SequenceLogWriter ---------------------------------------------------------------
+
+    def ensure_sequence_log(self, columns: Sequence[Column]) -> None:
+        """`ensure_load_log` for the third log. Bounded by the port, not by a check in here."""
+        self._ensure_meta_table(SEQUENCE_LOG_TABLE, columns)
+
+    def append_sequence(self, columns: Sequence[Column], row: Mapping[str, Any]) -> None:
+        """One record into `SEQUENCE_LOG_TABLE`, which this method creates if it is not there.
+
+        Unguarded for `append_load`'s reason: nothing was read and nothing is being written over."""
+        self._append_meta_row(SEQUENCE_LOG_TABLE, columns, row, "record a sequence in")
 
     # --- VectorWriter --------------------------------------------------------------------
     # Many rows, keyed, in a table this class derives from an object type name. The only section

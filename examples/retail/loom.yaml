@@ -87,6 +87,29 @@ mcp:
 # Ingest **never migrates**. A batch that does not fit the table is refused naming the column, and
 # the fix is `loom plan` / `loom apply` — the `BulkWriter` port has no DDL verb at all.
 ingest:
+  # The two base tables, as `seed.py` fills them. `append` because the warehouse they land in was
+  # created empty by `loom apply` a moment before: there is nothing to merge with and nothing to
+  # replace, and an append is the only one of the three that asserts no snapshot.
+  #
+  # `format: ndjson` and the aggregate below is `parquet`, in one file, on purpose — the format is
+  # declared per entry because it is never guessed. A drop of hand-written seed rows wants to be
+  # readable in a diff; a computed aggregate wants its types carried rather than re-parsed.
+  #
+  # Note what these entries load and what they do not. `Customer` declares four properties, so four
+  # columns arrive here. `crm.customers` ends up with six — `region` and `segments` are added
+  # afterwards by something that is not Loom, which is what makes them unmanaged rather than
+  # merely undeclared. A source column no property claims is refused at load time, so those two
+  # cannot be in `customers.ndjson` at all.
+  - name: customers
+    objectType: Customer
+    mode: append
+    format: ndjson
+
+  - name: orders
+    objectType: Order
+    mode: append
+    format: ndjson
+
   # The materialization `sales_performance.py` computes. `mode: replace` because a daily aggregate
   # is a whole answer rather than a set of edits: recomputing it and appending would leave two rows
   # per day, and merging would leave yesterday's answer for a day the source no longer has.
@@ -98,6 +121,19 @@ ingest:
     objectType: DailySalesPerformance
     mode: replace
     format: parquet
+
+# An order over those loads, and the file that supplies them is `data/manifest.yaml`. Customers
+# before orders because the result reads better that way — not because Loom checks it. Nothing here
+# enforces referential integrity: a sequence is a schedule, and reading it as a guarantee is the one
+# misreading available. `daily-sales` is deliberately *not* in it — it is computed from the orders
+# this sequence lands, so it cannot be part of the same run as its own input.
+#
+# It stops at the first refusal and reports which loads landed, because Iceberg's unit is the table
+# and there is no cross-table transaction to be had. `loom apply` says the same sentence one level
+# up, about tables.
+sequences:
+  - name: seed
+    loads: [customers, orders]
 
 # What this deployment withholds, and what it permits. Uncomment `policies:` and `loom query`,
 # `loom run` and every generated tool

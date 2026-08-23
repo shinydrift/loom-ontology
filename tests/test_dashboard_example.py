@@ -145,3 +145,68 @@ def test_the_page_names_no_endpoint_the_app_does_not_serve(app_module):
     referenced = set(re.findall(r'fetch\(\s*"(/[^"]*)"', page))
     assert referenced
     assert referenced <= EXPECTED_ROUTES
+
+
+# ---- the one route that is not a tool call ---------------------------------------
+
+
+def test_the_refresh_route_lands_the_aggregate_through_a_declared_load(app_module):
+    """Still not a tool, and no longer outside Loom either.
+
+    The route used to compute the rollup *and* write it with pyiceberg in one breath, so "not a
+    tool" and "not through Loom at all" were running together — and only the first was ever true.
+    Now the computation stops at a Parquet file and the `daily-sales` entry lands it, which is what
+    lets the button name the load it became."""
+    from loom.catalog import LOAD_LOG_TABLE, open_catalogs
+
+    module, target = app_module
+    _, config = module.load_project(target / "dashboard" / "loom.yaml")
+
+    result = module._refresh_aggregate(config)
+    assert result["status"] == "applied"
+    assert result["load"]
+    assert result["rows"] > 0
+
+    catalog = open_catalogs(config)["local"]
+    logged = [r for r in catalog.scan(LOAD_LOG_TABLE).to_pylist() if r["load_id"] == result["load"]]
+    assert len(logged) == 1
+    # Recorded as the deployment `mcp.actor` names — declared, never inferred, exactly as a served
+    # run is.
+    assert logged[0]["entry"] == "daily-sales"
+    assert logged[0]["actor"] == config.mcp.actor
+
+
+def test_a_second_refresh_is_a_second_load_rather_than_a_duplicate(app_module):
+    """Every recompute stamps a fresh `refreshedAt`, so the bytes differ and the derived id differs.
+
+    The far side of `derive_load_id`: the checked-in seed drops have fixed bytes and re-loading them
+    *is* refused, and this one must not be — a button that worked once and then reported a duplicate
+    forever would be the identity rule misapplied."""
+    module, target = app_module
+    _, config = module.load_project(target / "dashboard" / "loom.yaml")
+
+    first = module._refresh_aggregate(config)
+    second = module._refresh_aggregate(config)
+    assert second["status"] == "applied"
+    assert second["load"] != first["load"]
+
+
+def test_the_dashboard_declares_the_load_and_permits_it(app_module):
+    """And declares only that one: `customers` and `orders` are how `seed.py` fills an empty
+    warehouse, and a running dashboard has no business holding a way to append to either."""
+    module, target = app_module
+    _, config = module.load_project(target / "dashboard" / "loom.yaml")
+
+    assert [e.name for e in config.ingest] == ["daily-sales"]
+    assert config.ingest_posture == "allowed"
+    assert config.sequences == ()
+
+
+def test_no_ingest_tool_appears_on_the_surface(app_module):
+    """§7: the tool set is a function of the *spec*, and an ingest entry is config. So declaring one
+    cannot add a verb an agent could call — structurally, rather than by a rule someone remembers."""
+    module, target = app_module
+    ontology, config = module.load_project(target / "dashboard" / "loom.yaml")
+    server, _ = module.build_loom_server(ontology, config)
+
+    assert not [name for name in server.tools if "ingest" in name or "load" in name]

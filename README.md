@@ -261,6 +261,8 @@ spelling — the hints are ANDed, so one per value would prune to the rows match
 | Semantic search — the vectors | ✅ `loom embed`, a sidecar per type in `_loom_meta` |
 | Semantic search — a tool that ranks | ✅ `match_<object>(text, filter, page)`, brute force, filtered first |
 | Semantic search — ranking across a link (`via`) | 🔨 M10 slice 4 |
+| Drafting a spec from a file | ✅ `loom infer` — parquet, writes nothing, does not validate |
+| Ordered loads | ✅ `sequences:` + `loom sequence` — stops at the first refusal, `_loom_meta.sequences` |
 
 `docs/spec-v0.md` is the full grammar — the framework's public contract.
 `docs/ROADMAP.md` tracks what's next, milestone by milestone.
@@ -271,7 +273,7 @@ spelling — the hints are ANDed, so one per value would prune to the rows match
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 829 tests
+pytest                              # 1091 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 3 action(s)
 ```
 
@@ -280,7 +282,8 @@ plus a seed script that builds a local Iceberg warehouse — SQLite metastore, f
 no services to start:
 
 ```bash
-python examples/retail/seed.py                        # create + populate the Iceberg tables
+python examples/retail/seed.py                        # loom apply, then loom sequence, then two
+                                                      # columns added by something that isn't Loom
 loom validate --physical examples/retail/ontology     # check the spec against live metadata
 loom query Customer examples/retail/ontology --key c1 # → one row, through DuckDB
 loom query Customer examples/retail/ontology --key c2 --link orders   # → a link traversal
@@ -297,23 +300,29 @@ Loom exposes it as the ordinary typed `DailySalesPerformance` object (including
 `list_daily_sales_performance`). Revenue, order count, and unique-customer count are therefore
 computed once during refresh, not on every agent request. Every materialized row carries
 `refreshedAt`, `sourceTable`, and `sourceSnapshotId`, so a retrieved answer says exactly when and
-from which source snapshot it was derived. To refresh after loading orders, call
-`refresh_daily_sales_performance(catalog)` from `examples/retail/sales_performance.py`; rerunning
-`seed.py` performs the same full refresh for the local demonstration warehouse.
+from which source snapshot it was derived.
 
-That same file also shows the other way to land it, and the comparison is the point:
-`write_daily_sales_performance(catalog, path)` stops at a Parquet file, and the `daily-sales` entry
-in `loom.yaml` is what turns it into rows —
+**It lands through the `daily-sales` entry**, in both places that produce it — `seed.py`'s
+`materialize` and the dashboard's `POST /api/refresh`. `write_daily_sales_performance(catalog, path)`
+computes the rollup and stops at a Parquet file; the declared entry does the rest. Loom does not
+compute this, and the file is where that boundary sits —
 
 ```bash
 loom ingest daily-sales daily.parquet examples/retail/ontology   # → checked, one commit, recorded
 ```
 
-Same rows, and a test asserts it. What the declared load adds is the two things the hand-rolled
-`txn.overwrite` beside it has no way to produce: every value checked against the ontology's declared
-types before it lands, and a row in `_loom_meta.loads` saying which file became which commit. Loom
-does not compute the aggregate in either case — a pipeline hands it a file, which is exactly where
-the claim stops.
+`refresh_daily_sales_performance` in the same file is the hand-rolled comparison — a schema kept in
+lockstep by hand, a `txn.overwrite`, and a write nothing in the lake records. Nothing ships calling
+it any more, and it is kept because the comparison is *checkable*: an acceptance test runs both
+against one orders snapshot and asserts the same table comes out. Same rows. What the declared load
+adds is the two things the overwrite has no way to produce — every value checked against the
+ontology's declared types before it lands, and a row in `_loom_meta.loads` saying which file became
+which commit.
+
+Note the identity rule cutting both ways here. The seed drops under `data/` are checked in, so their
+bytes are fixed and re-loading one is refused as the same load twice. The aggregate stamps a fresh
+`refreshedAt` on every recompute, so its bytes differ and a second refresh is a second load. Same
+`derive_load_id`, opposite answers, both correct.
 
 That run also created `_loom_meta.edits` and appended to it — no `loom apply` in this lake's history
 at all, because the log is created by whatever run needs it first rather than by a migration:
@@ -504,6 +513,45 @@ dashboard change** either time, because both policies apply below the tool layer
 One thing it cannot be is a page talking to Loom directly. `serve_http` sets `allowed_origins=[]`
 ("no browser is a legitimate client of this endpoint"), so `app.py` holds the MCP session and the
 page talks to `app.py`. See [`examples/README.md`](examples/README.md).
+
+## Drafting a spec from a file
+
+Everything above starts from a spec somebody wrote. `loom infer` is the one command that goes the
+other way — it reads a parquet file's declared schema and prints a draft objectType, plus the
+`ingest:` entry that would fill the table:
+
+```
+$ loom infer daily.parquet --as DailySalesPerformance --key sales_date \
+    --catalog local --table sales.daily_sales_performance
+objectType:
+  apiName: DailySalesPerformance
+  displayName: DailySalesPerformance
+  primaryKey: salesDate
+  backing: { catalog: local, table: sales.daily_sales_performance }
+  properties:
+    - { name: salesDate, type: date, column: sales_date, unique: true }
+    - { name: grossSales, type: decimal, precision: 14, scale: 2, column: gross_sales }
+    ...
+```
+
+It **opens no catalog and writes no file**, which is what keeps it clear of the rule it looks like
+it bends: `BulkWriter` has no DDL verb because a *load* must never infer a *migration* from the
+shape of somebody's file. This runs before there is a table, produces text, and stops.
+
+And the draft **does not validate** until a person has been through it — `primaryKey` and `backing`
+come out as placeholders no property matches, so `loom validate` fails on them by name. A scaffold
+that emitted something immediately servable is a scaffold that gets committed unread.
+
+Parquet only. A CSV declares no types at all, so every type would be sniffed from a sample — and
+decimal-versus-double on a money column is the sniff that loses fractions of a cent silently. JSON
+has no decimal and no date. Both are refused by name, with that reason.
+
+Three things it will not guess, in any format: `enum` values (a file shows the values it happens to
+hold, not the domain's set — the retail example's `closed` tier is in its enum for a reason no
+sample reveals), `unique`, and **which columns to leave out**. A column whose type the spec has no
+name for — an `array`, a `struct`, a tz-naive timestamp — is rendered as a comment saying it is
+unmanaged rather than missing: `loom plan` reports it, nothing drops it, and every write carries it
+across untouched (§2 rule 7).
 
 ## Planning a schema change
 
@@ -867,6 +915,58 @@ Five things shape it, and the first is what the rest are for:
 
 Loom does not connect to Kafka, crawl an object store, or open a JDBC connection. A pipeline hands it
 a file; Loom decides whether that file may become rows.
+
+## Loading several, in order
+
+A warehouse that needs three tables filled needs three loads, and something has to say which order
+they go in. `sequences:` names an order over the entries already declared; `loom sequence` runs it
+from a manifest — the file that varies per run, which for a sequence is the one that names the
+others:
+
+```yaml
+# loom.yaml
+sequences:
+  - { name: nightly, loads: [customers, orders, daily-sales] }
+```
+```yaml
+# drop/manifest.yaml — paths resolve against this file, not the cwd
+customers: customers.parquet
+orders:    orders.parquet
+daily-sales: daily.parquet
+```
+```
+$ loom sequence nightly drop/manifest.yaml examples/retail/ontology
+Loom sequence — nightly on examples/retail/ontology
+
+  + customers: append 4 row(s) into Customer (crm.customers)
+  + orders: append 6 row(s) into Order (sales.orders)
+  - daily-sales: replace 31 row(s) into DailySalesPerformance (sales.daily_sales_performance)
+
+  Iceberg's unit is the table, so there is no cross-table transaction to be had:
+  this sequences the loads, stops at the first refusal, and reports exactly which
+  ones landed rather than pretending the run was atomic.
+```
+
+That last paragraph is the whole design, and it is `loom apply`'s own sentence one level up — apply
+met this first for tables and answered it the same way. **A sequence is an order, not an atom.** When
+one stops, the loads before it are landed and stay landed; the result names them and names where it
+stopped, because there is nothing else honest to do.
+
+Three consequences worth knowing:
+
+- **The order is the list, not the order of `ingest:`.** Declaration order could have been given
+  meaning for free and deliberately was not — an entry moved during review would silently change
+  what runs when.
+- **A manifest that supplies some of the entries is refused before anything opens.** Loading two of
+  three tables and reporting success is the failure this exists to prevent; a partial run is what
+  `loom ingest` per entry already is.
+- **It records the run, in a third table.** `_loom_meta.sequences` — which loads were one run, in
+  what order, and where it stopped. A `sequence_id` column beside `load_id` would have been cheaper
+  and is the one thing `_loom_meta.loads` forbids: that table is only ever *created*, so a column
+  added today could never reach a log that already exists.
+
+It checks no referential integrity, and says so: ordering customers before orders makes the *result*
+coherent, but Loom has no cross-table constraint and this does not add one.
 
 The validator accumulates every problem and reports them in one pass with source locations:
 

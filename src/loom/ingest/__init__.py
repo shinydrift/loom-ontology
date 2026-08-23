@@ -31,6 +31,17 @@ from .result import (
     IngestResult,
 )
 from .runtime import IngestError, IngestRuntime, build_ingest
+from .sequence import (
+    PARTIAL,
+    SEQUENCE_COLUMNS,
+    SequenceError,
+    SequenceResult,
+    SequenceRuntime,
+    Step,
+    build_sequences,
+    derive_sequence_id,
+    read_manifest,
+)
 from .source import Batch, SourceError, read_batch
 
 __all__ = [
@@ -47,6 +58,15 @@ __all__ = [
     "IngestRuntime",
     "LoadLog",
     "LoadRecord",
+    "PARTIAL",
+    "SEQUENCE_COLUMNS",
+    "SequenceError",
+    "SequenceResult",
+    "SequenceRuntime",
+    "Step",
+    "build_sequences",
+    "derive_sequence_id",
+    "read_manifest",
     "SourceError",
     "build_ingest",
     "derive_load_id",

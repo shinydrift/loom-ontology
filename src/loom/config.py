@@ -64,8 +64,9 @@ does not connect to Kafka, crawl an object store, or open a JDBC connection — 
 batch and Loom decides whether that batch may become rows. Widening this set is a decision about
 formats; adding a *source* would be a decision about what Loom is."""
 
-_TOP_KEYS = {"version", "catalogs", "engine", "mcp", "governance", "ingest"}
+_TOP_KEYS = {"version", "catalogs", "engine", "mcp", "governance", "ingest", "sequences"}
 _INGEST_KEYS = {"name", "objectType", "mode", "format", "columns"}
+_SEQUENCE_KEYS = {"name", "loads"}
 _CATALOG_KEYS = {"type", "uri", "warehouse", "auth", "properties"}
 _ENGINE_KEYS = {"type", "options"}
 _MCP_KEYS = {"name", "transport", "writes", "actor", "host", "port", "path", "allowed_hosts", "auth", "embedding"}
@@ -343,6 +344,31 @@ class IngestEntry:
 
 
 @dataclass(frozen=True)
+class IngestSequence:
+    """One entry under `sequences:` — an ordered set of declared loads, run as one command.
+
+    **It is an order, not an atom, and the grammar is shaped so nobody can read it as the second.**
+    Iceberg's unit is the table and there is no cross-table transaction to be had, which `apply`
+    already met and answered the same way: it "sequences tables, stops at the first failure, and
+    reports exactly which ones landed rather than pretending the run was atomic". A sequence of loads
+    inherits that verbatim, because the thing that makes it true — one commit per table — is the same
+    thing one level up.
+
+    **An explicit list rather than the order of `ingest:`.** `ingest:` is already a YAML list, so
+    declaration order exists and could have been given meaning for free. It is deliberately not: an
+    entry moved during review would silently change what runs when, and "these three, in this order"
+    is a different statement from "these are the loads this deployment declares" — one deployment can
+    hold several sequences over overlapping entries, and an entry belonging to none is ordinary.
+
+    **`loads` names entries and never files.** The manifest supplies the files, for the reason
+    `loom ingest` takes one on the command line: the file is what varies per run, and everything that
+    does not vary belongs in the file an operator reviews."""
+
+    name: str
+    loads: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class LoomConfig:
     catalogs: Mapping[str, CatalogConfig] = field(default_factory=dict)
     engine: EngineConfig = field(default_factory=EngineConfig)
@@ -366,6 +392,10 @@ class LoomConfig:
     ingest: tuple[IngestEntry, ...] = ()
     """The declared loads, as written. Unresolved here for `policies`' reason: nothing in this
     module has an ontology to check an `objectType` against."""
+    sequences: tuple[IngestSequence, ...] = ()
+    """The declared orders over those loads. Resolved *here*, unlike `ingest` and `policies`, and
+    the difference is what each one references: a sequence names entries in this same file, so
+    checking that they exist needs nothing but the file. An `objectType` needs an ontology."""
     ingest_posture: str = INGEST_REFUSED
     """Whether this deployment performs the loads it declares. Default-refused — see
     `governance.INGEST_POSTURES` for why this default points the opposite way to `edit_log`'s."""
@@ -417,6 +447,7 @@ def load_config(path: str | Path, diag: Diagnostics) -> LoomConfig | None:
     mcp = _parse_mcp(doc.get("mcp"), loc, diag)
     policies, edit_log, ingest_posture = _parse_governance(doc.get("governance"), loc, diag)
     ingest = _parse_ingest(doc.get("ingest"), loc, diag)
+    sequences = _parse_sequences(doc.get("sequences"), ingest, loc, diag)
 
     return LoomConfig(
         catalogs=catalogs,
@@ -425,6 +456,7 @@ def load_config(path: str | Path, diag: Diagnostics) -> LoomConfig | None:
         policies=policies,
         edit_log=edit_log,
         ingest=ingest,
+        sequences=sequences,
         ingest_posture=ingest_posture,
         version=SPEC_VERSION,
         source=str(path),
@@ -884,6 +916,96 @@ def _parse_ingest(raw: object, loc: SourceLoc, diag: Diagnostics) -> tuple[Inges
                 columns=columns,
             )
         )
+    return tuple(out)
+
+
+def _parse_sequences(
+    raw: object, entries: tuple[IngestEntry, ...], loc: SourceLoc, diag: Diagnostics
+) -> tuple[IngestSequence, ...]:
+    """`sequences:` — named orders over the entries declared above.
+
+    Checked against `ingest:` **here**, unlike everything else in this module, and the reason is the
+    scope of the reference rather than a change of policy: `objectType` and a policy's subject name
+    things in an ontology this module has never seen, so they wait for a pairing. A sequence names
+    entries in the file being parsed. Deferring that check would mean the one error a reader can fix
+    without leaving the file arrives from somewhere else entirely.
+
+    An entry may appear in several sequences and in none — a sequence is a run somebody schedules,
+    not a category the entry belongs to. What is refused is an entry twice in *one* sequence, which
+    is either a typo or an operator meaning to load a file twice in one run: the first would land and
+    the second would be refused as a duplicate load, so the whole run would stop at a line that reads
+    as deliberate."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        diag.error("'sequences' must be a list of named orders over 'ingest' entries", loc)
+        return ()
+
+    declared = {entry.name for entry in entries}
+    out: list[IngestSequence] = []
+    seen: set[str] = set()
+    for index, body in enumerate(raw):
+        ctx = f"sequences[{index}]"
+        if not isinstance(body, dict):
+            diag.error(f"{ctx} must be a mapping", loc)
+            continue
+        check_keys(body, _SEQUENCE_KEYS, loc, diag, ctx)
+
+        name = require(body, "name", loc, diag, ctx)
+        if name is not None and (not isinstance(name, str) or not name.strip()):
+            diag.error(f"{ctx}: 'name' must be a non-empty string, got {name!r}", loc)
+            name = None
+        if isinstance(name, str):
+            name = name.strip()
+            ctx = f"sequence '{name}'"
+            if name in seen:
+                diag.error(f"two sequences are both named '{name}'", loc)
+                name = None
+            else:
+                seen.add(name)
+
+        loads = require(body, "loads", loc, diag, ctx)
+        if loads is not None and (not isinstance(loads, Sequence) or isinstance(loads, (str, bytes))):
+            diag.error(
+                f"{ctx}: 'loads' must be a list of ingest entry names in the order they run, "
+                f"got {loads!r}",
+                loc,
+            )
+            loads = None
+        elif isinstance(loads, Sequence) and not loads:
+            # An empty sequence is expressible, runs nothing, and would report success. Refused for
+            # `{"in": []}`'s reason: the config says something, and the something it says is a
+            # question about zero things that can only be answered vacuously.
+            diag.error(f"{ctx}: 'loads' is empty — a sequence that runs nothing is not a sequence", loc)
+            loads = None
+
+        names: list[str] = []
+        if isinstance(loads, Sequence) and not isinstance(loads, (str, bytes)):
+            for load in loads:
+                if not isinstance(load, str) or not load.strip():
+                    diag.error(f"{ctx}: 'loads' has an entry name that is not a string: {load!r}", loc)
+                    continue
+                load = load.strip()
+                if load in names:
+                    diag.error(
+                        f"{ctx}: entry '{load}' appears twice",
+                        loc,
+                        "an entry runs once per sequence — the second run would be refused as a "
+                        "duplicate load and stop the sequence at a line that reads as deliberate",
+                    )
+                    continue
+                if load not in declared:
+                    diag.error(
+                        f"{ctx}: no ingest entry named '{load}'",
+                        loc,
+                        suggest(load, declared) if declared else "declare it under 'ingest:' first",
+                    )
+                    continue
+                names.append(load)
+
+        if name is None or loads is None or len(names) != len(loads):
+            continue
+        out.append(IngestSequence(name=name, loads=tuple(names)))
     return tuple(out)
 
 

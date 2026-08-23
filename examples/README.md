@@ -17,13 +17,25 @@ python examples/retail/seed.py
 ```
 
 That creates `examples/retail/.warehouse` — a pyiceberg SQL catalog over SQLite with table data on
-local disk, so a real Iceberg lake needs nothing installed and nothing running. It seeds three
-customers, five orders, and the precomputed daily rollup.
+local disk, so a real Iceberg lake needs nothing installed and nothing running.
 
-`seed.py` talks to pyiceberg directly rather than through Loom, on purpose: Loom writes one row at
-a time through a declared action, and bulk loading is the user's concern. It also plants two columns
-the ontology never mentions (`region`, and a `list<string>` Loom has no type name for) so the
-carry-across behaviour has something real to carry.
+`seed.py` runs in **three stages, and only the last one is outside Loom**:
+
+1. **`bootstrap`** — `loom apply`, from nothing but the spec. Every column the ontology declares,
+   created by Loom's own migration engine, and not one more.
+2. **`load`** — `loom sequence seed`, which runs the declared `customers` and `orders` loads from
+   `data/manifest.yaml`. Checked against the declared types, one commit each, and a row apiece in
+   `_loom_meta.loads`.
+3. **`arrive`** — pyiceberg directly, adding `region` and a `list<string>` Loom has no type name for
+   to `crm.customers`, and filling them.
+
+Stage 3 is the demonstration, and the **order** is what makes it one. Those two columns used to be
+born in the same `pa.schema(...)` as the declared ones, which made them read like a Loom decision —
+when the whole reason they exist is that they are not. §2 rule 7 says a column no property maps is
+somebody else's data: reported by `plan`, never dropped, carried across untouched by every write. A
+column that arrives *afterwards*, from a writer that is not Loom, is what that rule is actually
+about. And an all-Loom bootstrap could not produce one if it tried: `apply` creates what the spec
+declares, and a load is refused if its file carries a column no property claims.
 
 Then:
 
@@ -144,9 +156,17 @@ The dashboard does, and shows you both.
 is an **ingestion-time** aggregate — so record an order and the chart does not move.
 
 The dashboard says so rather than hiding it, and the recompute button is deliberately *not* a tool:
-it posts to `/api/refresh`, appears in the rail in a different colour labelled **not a tool**, and
-runs `sales_performance.py` with pyiceberg. That is the tradeoff a precomputed rollup *is*, and a
-tool-shaped button would be the dashboard telling a more comfortable story than the lake supports.
+it posts to `/api/refresh` and appears in the rail in a different colour labelled **not a tool**.
+That is the tradeoff a precomputed rollup *is*, and a tool-shaped button would be the dashboard
+telling a more comfortable story than the lake supports.
+
+It is not a tool, and it is no longer *outside Loom* either — those were being run together, and
+only the first was ever true. The route computes the rollup, stops at a Parquet file, and lands it
+through the `daily-sales` entry declared in `dashboard/loom.yaml`; the response carries the load id,
+so the button can name what it became. Which is also why that file declares only that one entry:
+`customers` and `orders` are how `seed.py` fills an empty warehouse, and a running dashboard has no
+business holding a way to append to either. And no `ingest_` tool appears on the surface — §7 makes
+the tool set a function of the *spec*, and an entry is config.
 
 ### Turning governance on — the two-line edit
 
