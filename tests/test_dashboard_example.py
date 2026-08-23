@@ -9,7 +9,7 @@ ontology edit. That is a claim about a pairing, and a pairing is exactly what `b
 — so the test is to build the served surface from *that* config and the *shared* ontology and find
 the same object types with the action tools added.
 
-**Its browser-facing data plane is one passthrough.** The README's stronger claim is that the
+**Its browser-facing data plane is one passthrough.** The docs' stronger claim is that the
 dashboard has no privileged access: every number on the page comes through a tool call, because
 there is nowhere else for one to come from. That is a property of the route table, and it stops
 being true the moment somebody adds `/api/customers` for convenience. So it is asserted here, where

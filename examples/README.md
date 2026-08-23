@@ -4,7 +4,7 @@ One worked example, `retail/`, in two parts.
 
 | | What it is |
 |---|---|
-| [`retail/`](retail/) | The ontology itself — three object types, one link, three actions — plus a seed script that builds a real local Iceberg warehouse to run it against. This is what the root README's walkthrough uses. |
+| [`retail/`](retail/) | The ontology itself — three object types, one link, three actions — plus a seed script that builds a real local Iceberg warehouse to run it against. This is what the [guide](../docs/guide/) walks through. |
 | [`retail/dashboard/`](retail/dashboard/) | An app on top of it. A dashboard whose entire data plane is Loom's MCP tool surface, and which shows you every call it makes. |
 
 ---
