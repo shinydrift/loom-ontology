@@ -1974,7 +1974,7 @@ what it reaches is `_loom_meta.vectors__<type>` for the type the action already 
 
 ---
 
-## 🔨 M11: The on-ramp — a spec drafted from a file, and loads that run in order
+## ✅ Done — M11: The on-ramp — a spec drafted from a file, and loads that run in order
 
 M9 made a batch become rows. What it did not touch is everything *before* the first load: somebody
 still writes the spec by hand against a file they are looking at, and a warehouse that needs three
@@ -1983,7 +1983,7 @@ that on-ramp. It runs beside M10's open fourth slice rather than after it — th
 
 Four slices, in order:
 
-1. `loom infer` — draft an objectType from a file (this PR)
+1. `loom infer` — draft an objectType from a file
 2. `sequences:` — an ordered set of declared loads, run as one command
 3. Restage `crm.customers` in the example so its unmanaged columns arrive the way unmanaged columns
    really do
@@ -2164,6 +2164,56 @@ So the script is three stages now, and the order is the demonstration:
 - **Re-running the seed is refused, and the example is better for it.** The data files are checked
   in, so their bytes are fixed, so `derive_load_id` gives the same id every time — the second run of
   `seed(fresh=False)` is one load happening twice and is told so by name. A test asserts it.
+
+### Fourth slice — the materialization lands through the entry that was written for it
+
+`daily-sales` had been declared in `examples/retail/loom.yaml` since M9 and **nothing shipped ever
+ran it**. Both places that produce the aggregate — `seed.py` and the dashboard's `/api/refresh` —
+called `refresh_daily_sales_performance`, which is the hand-rolled `txn.overwrite` the entry exists
+to replace. So the declared load was exercised only by tests and by an operator typing the CLI by
+hand, which is a strange thing for a milestone's headline feature to be.
+
+- **The dashboard route was making two claims and only one of them was true.** Its docstring said
+  *not a Loom tool*, correctly — `DailySalesPerformance` is an ingestion-time aggregate, and a
+  tool-shaped button would be the dashboard telling a more comfortable story than the lake supports.
+  But it was also, silently, *not through Loom at all*. Those were running together. Now the
+  computation stops at a Parquet file and the declared entry lands it, so the route is a
+  demonstration rather than an apology — and the response carries the load id, which is something a
+  hand-rolled overwrite could not have said.
+
+- **The dashboard declares that entry and only that entry.** `customers` and `orders` are how
+  `seed.py` fills an empty warehouse; a running dashboard has no business holding a way to append to
+  either, and an entry a deployment does not declare is one nothing in it can name. `governance.
+  ingest: allowed` is set there too, because the posture is per deployment and this is a second one.
+
+- **`refresh_daily_sales_performance` is kept, and its job changed rather than ended.** It was the
+  shipped path and is now the comparison — what every lake already does and the record cannot see.
+  Deleting it would make *the declared load adds a contract and a record rather than different rows*
+  a claim the README asserts and nothing verifies; the acceptance test that runs both halves against
+  one orders snapshot is what makes it checkable.
+
+- **The identity rule cuts both ways, and the example now shows both.** The seed drops under `data/`
+  are checked in, so their bytes are fixed and re-loading one is refused as the same load twice. The
+  aggregate stamps a fresh `refreshedAt` on every recompute, so its bytes differ and a second refresh
+  is a second load. Same `derive_load_id`, opposite answers, both correct — and a test for each,
+  because a button that worked once and reported a duplicate forever would be the same rule
+  misapplied.
+
+- **The Parquet file is a handover, not an artifact**, so both callers write it to a temporary
+  directory rather than beside the checked-in drops. The distinction is worth drawing in the example:
+  `customers.ndjson` is data somebody wrote and can read in a diff; `daily.parquet` is the output of
+  a computation that will run again tomorrow with different numbers in it.
+
+### What M11 leaves owing
+
+- **No referential check on a load whose object type has links.** A sequence orders loads; it does
+  not verify that every order's customer arrived. Loom has no cross-table constraint, and adding one
+  is a spec question rather than an ingest question.
+- **`loom infer` reads parquet only.** CSV and NDJSON are refused by name with the reason. Adding
+  either means deciding what a sniffed type is allowed to claim, which is a decision worth its own
+  slice rather than a flag.
+- **Nothing infers a *link*.** `loom infer` drafts one object type from one file; two files with a
+  shared key are a `linkType` nobody drafts, and the shape of that guess is unexplored.
 
 ---
 

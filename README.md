@@ -273,7 +273,7 @@ spelling — the hints are ANDed, so one per value would prune to the rows match
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 1083 tests
+pytest                              # 1091 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 3 action(s)
 ```
 
@@ -300,23 +300,29 @@ Loom exposes it as the ordinary typed `DailySalesPerformance` object (including
 `list_daily_sales_performance`). Revenue, order count, and unique-customer count are therefore
 computed once during refresh, not on every agent request. Every materialized row carries
 `refreshedAt`, `sourceTable`, and `sourceSnapshotId`, so a retrieved answer says exactly when and
-from which source snapshot it was derived. To refresh after loading orders, call
-`refresh_daily_sales_performance(catalog)` from `examples/retail/sales_performance.py`; rerunning
-`seed.py` performs the same full refresh for the local demonstration warehouse.
+from which source snapshot it was derived.
 
-That same file also shows the other way to land it, and the comparison is the point:
-`write_daily_sales_performance(catalog, path)` stops at a Parquet file, and the `daily-sales` entry
-in `loom.yaml` is what turns it into rows —
+**It lands through the `daily-sales` entry**, in both places that produce it — `seed.py`'s
+`materialize` and the dashboard's `POST /api/refresh`. `write_daily_sales_performance(catalog, path)`
+computes the rollup and stops at a Parquet file; the declared entry does the rest. Loom does not
+compute this, and the file is where that boundary sits —
 
 ```bash
 loom ingest daily-sales daily.parquet examples/retail/ontology   # → checked, one commit, recorded
 ```
 
-Same rows, and a test asserts it. What the declared load adds is the two things the hand-rolled
-`txn.overwrite` beside it has no way to produce: every value checked against the ontology's declared
-types before it lands, and a row in `_loom_meta.loads` saying which file became which commit. Loom
-does not compute the aggregate in either case — a pipeline hands it a file, which is exactly where
-the claim stops.
+`refresh_daily_sales_performance` in the same file is the hand-rolled comparison — a schema kept in
+lockstep by hand, a `txn.overwrite`, and a write nothing in the lake records. Nothing ships calling
+it any more, and it is kept because the comparison is *checkable*: an acceptance test runs both
+against one orders snapshot and asserts the same table comes out. Same rows. What the declared load
+adds is the two things the overwrite has no way to produce — every value checked against the
+ontology's declared types before it lands, and a row in `_loom_meta.loads` saying which file became
+which commit.
+
+Note the identity rule cutting both ways here. The seed drops under `data/` are checked in, so their
+bytes are fixed and re-loading one is refused as the same load twice. The aggregate stamps a fresh
+`refreshedAt` on every recompute, so its bytes differ and a second refresh is a second load. Same
+`derive_load_id`, opposite answers, both correct.
 
 That run also created `_loom_meta.edits` and appended to it — no `loom apply` in this lake's history
 at all, because the log is created by whatever run needs it first rather than by a migration:

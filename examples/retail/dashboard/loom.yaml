@@ -84,3 +84,25 @@ mcp:
 #     - name: current-customers-only
 #       objectType: Customer
 #       rows: "object.tier != 'closed'"
+
+# The one write on this deployment that is not a tool call, declared where every load is declared.
+#
+# `POST /api/refresh` recomputes the daily rollup and lands it through this entry. Only this one —
+# the `customers` and `orders` entries in `../loom.yaml` are how `seed.py` fills an empty warehouse,
+# and a running dashboard has no business holding a way to append to either. An entry a deployment
+# does not declare is one nothing in it can name.
+#
+# It cannot become a tool. §7 says the tool set is a function of the *spec*, and this is config — so
+# no `ingest_<type>` appears on the surface `app.py` renders its rail from, structurally rather than
+# by a rule someone remembers.
+ingest:
+  - name: daily-sales
+    objectType: DailySalesPerformance
+    mode: replace
+    format: parquet
+
+governance:
+  # Declaring the load above says what one would be; this says this deployment performs them.
+  # Default-refused, so the refresh button would return a `deployment_refused` failure without it —
+  # which is the posture doing its job rather than an oversight to route around.
+  ingest: allowed

@@ -185,3 +185,57 @@ def test_the_whole_seed_leaves_the_spec_physically_valid(example):
     diag.raise_if_errors()
     check_physical(loaded, open_catalogs(config), diag)
     diag.raise_if_errors()
+
+
+# ---- the materialization, on its own declared load -------------------------------
+
+
+def test_the_aggregate_arrives_through_the_declared_entry(example):
+    """Nothing in the shipped example ran `daily-sales` before M11's fourth slice — it was exercised
+    only by tests and by an operator typing the CLI by hand."""
+    target, seed, _, config = example
+    seed.seed(target)
+
+    loads = catalog(config).scan(LOAD_LOG_TABLE).to_pylist()
+    daily = [r for r in loads if r["entry"] == "daily-sales"]
+    assert len(daily) == 1
+    assert daily[0]["actor"] == "seed.py"
+    assert daily[0]["rows_written"] == len(catalog(config).scan("sales.daily_sales_performance").to_pylist())
+    assert daily[0]["mode"] == "replace"
+
+
+def test_it_is_not_in_the_sequence_because_it_reads_what_the_sequence_writes(example):
+    """A sequence is an order over loads, not a dependency graph over data — and the aggregate is
+    computed from the orders the sequence lands, so it cannot be in the same run as its own input."""
+    _, _, _, config = example
+    (sequence,) = config.sequences
+    assert "daily-sales" not in sequence.loads
+    assert [e.name for e in config.ingest] == ["customers", "orders", "daily-sales"]
+
+
+def test_the_handover_file_is_not_left_behind(example):
+    """It is a handover, not an artifact: the checked-in drops under `data/` are data somebody
+    wrote, and this is the output of a computation that runs again tomorrow."""
+    target, seed, _, config = example
+    seed.seed(target)
+
+    assert not list((target / "data").glob("*.parquet"))
+    assert sorted(p.name for p in (target / "data").iterdir()) == [
+        "customers.ndjson",
+        "manifest.yaml",
+        "orders.ndjson",
+    ]
+
+
+def test_recomputing_is_a_second_load_rather_than_a_duplicate(example):
+    """Every recompute stamps a fresh `refreshedAt`, so the bytes differ and the derived id differs.
+
+    The mirror of `test_loading_the_same_drop_twice_is_refused`: the seed drops have fixed bytes and
+    re-loading them is one load happening twice, and this one genuinely is not."""
+    target, seed, ontology, config = example
+    seed.seed(target)
+    seed.materialize(ontology, config, open_catalogs(config))
+
+    daily = [r for r in catalog(config).scan(LOAD_LOG_TABLE).to_pylist() if r["entry"] == "daily-sales"]
+    assert len(daily) == 2
+    assert len({r["load_id"] for r in daily}) == 2

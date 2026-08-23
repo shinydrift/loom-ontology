@@ -156,9 +156,17 @@ The dashboard does, and shows you both.
 is an **ingestion-time** aggregate — so record an order and the chart does not move.
 
 The dashboard says so rather than hiding it, and the recompute button is deliberately *not* a tool:
-it posts to `/api/refresh`, appears in the rail in a different colour labelled **not a tool**, and
-runs `sales_performance.py` with pyiceberg. That is the tradeoff a precomputed rollup *is*, and a
-tool-shaped button would be the dashboard telling a more comfortable story than the lake supports.
+it posts to `/api/refresh` and appears in the rail in a different colour labelled **not a tool**.
+That is the tradeoff a precomputed rollup *is*, and a tool-shaped button would be the dashboard
+telling a more comfortable story than the lake supports.
+
+It is not a tool, and it is no longer *outside Loom* either — those were being run together, and
+only the first was ever true. The route computes the rollup, stops at a Parquet file, and lands it
+through the `daily-sales` entry declared in `dashboard/loom.yaml`; the response carries the load id,
+so the button can name what it became. Which is also why that file declares only that one entry:
+`customers` and `orders` are how `seed.py` fills an empty warehouse, and a running dashboard has no
+business holding a way to append to either. And no `ingest_` tool appears on the surface — §7 makes
+the tool set a function of the *spec*, and an entry is config.
 
 ### Turning governance on — the two-line edit
 

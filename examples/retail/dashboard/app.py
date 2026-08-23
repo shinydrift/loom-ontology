@@ -197,24 +197,51 @@ class LoomClient:
 
 
 def _refresh_aggregate(config) -> dict:
-    """Rebuild `sales.daily_sales_performance` from `sales.orders`.
+    """Recompute `sales.daily_sales_performance` from `sales.orders`, and land it as a declared load.
 
-    **Not a Loom tool, and the UI says so where it is offered.** `DailySalesPerformance` is an
-    ingestion-time aggregate — `sales_performance.py` builds it with pyiceberg and calls itself "not
-    a new Loom query primitive" — so `run_record_order` writes a row to `sales.orders` and the sales
-    chart does not move until something recomputes the rollup. That gap is the tradeoff a
-    precomputed aggregate *is*, and hiding it behind a tool-shaped button would be the dashboard
-    telling a more comfortable story than the lake supports. So it sits here, on its own route, in
-    its own colour, labelled as the ingestion side.
+    **Still not a Loom tool, and the UI still says so where it is offered.**
+    `DailySalesPerformance` is an ingestion-time aggregate, so `run_record_order` writes a row to
+    `sales.orders` and the sales chart does not move until something recomputes the rollup. That gap
+    is the tradeoff a precomputed aggregate *is*, and hiding it behind a tool-shaped button would be
+    the dashboard telling a more comfortable story than the lake supports. So it sits here, on its
+    own route, in its own colour, labelled as the ingestion side.
 
-    Blocking pyiceberg work; the caller runs it off the event loop."""
-    from sales_performance import refresh_daily_sales_performance
+    **What changed is which side of the boundary each half sits on.** This used to compute the
+    aggregate and write it with pyiceberg, in one breath — so the button was outside Loom twice
+    over. Now the computation stops at a Parquet file and the `daily-sales` entry in this
+    deployment's own `loom.yaml` lands it: checked against the declared types, one commit, and a row
+    in `_loom_meta.loads` naming the file. Which makes the route an honest demonstration rather than
+    an apology — *not a tool* and *not through Loom at all* were being run together, and only the
+    first one was ever true.
+
+    The returned `load` is what the UI shows to make that visible: a button that recomputes a table
+    and can name the load it became is saying something a hand-rolled overwrite could not.
+
+    Blocking work; the caller runs it off the event loop."""
+    import tempfile
+    from pathlib import Path
+
+    from sales_performance import write_daily_sales_performance
     from seed import open_sql_catalog
 
+    from loom.catalog import open_catalogs
+    from loom.ingest import build_ingest
+    from loom.ontology import build
+
     catalog = open_sql_catalog(config)
-    refresh_daily_sales_performance(catalog)
+    ontology, _ = build(Path(__file__).resolve().parents[1] / "ontology")
+    runtime = build_ingest(ontology, config, open_catalogs(config))
+    with tempfile.TemporaryDirectory(prefix="loom-daily-") as tmp:
+        path = Path(tmp) / "daily.parquet"
+        write_daily_sales_performance(catalog, path)
+        result = runtime.load("daily-sales", path, actor=config.mcp.actor)
+
     table = catalog.load_table("sales.daily_sales_performance")
-    return {"rows": table.scan().to_arrow().num_rows}
+    return {
+        "rows": table.scan().to_arrow().num_rows,
+        "status": result.status,
+        "load": result.load_id,
+    }
 
 
 # ---- the web app -----------------------------------------------------------------

@@ -6,14 +6,20 @@ retrieves the small, typed Iceberg table; the business calculation stays explici
 **Two ways to land it, and the difference is the point.** `refresh_daily_sales_performance` writes
 the table through pyiceberg directly — a hand-built Arrow schema kept in lockstep with the spec by
 hand, a `txn.overwrite`, and a write nothing in the lake records. `write_daily_sales_performance`
-stops at a Parquet file and lets `loom ingest daily-sales` do the rest: the same rows, checked
+stops at a Parquet file and lets the declared `daily-sales` entry do the rest: the same rows, checked
 against the ontology's declared types, written as one commit stamped with its own load id, and one
 row in `_loom_meta.loads` saying what happened.
 
-Both are kept, because the comparison is the example. The first is what every lake already does and
-what the edit log cannot see; the second is the same work with the contract and the record put back.
-Neither computes the aggregate inside Loom — that is the boundary this milestone draws, and it is
-why the second one still hands over a file.
+**Since M11's fourth slice, the second one is what the example actually runs** — `seed.py` and the
+dashboard's refresh route both go through the declared load, and neither had before. The first is
+kept anyway, and its job changed rather than ended: it used to be the shipped path and is now the
+*comparison*, the thing every lake already does and the record cannot see. An acceptance test runs
+both against one orders snapshot and asserts they produce the same table, which is what makes the
+claim checkable instead of rhetorical — what the declared entry adds is not different rows, it is a
+contract and a record.
+
+Neither computes the aggregate inside Loom. That is the boundary this milestone draws, and it is why
+the second one still hands over a file.
 """
 
 from __future__ import annotations
@@ -112,16 +118,25 @@ def write_daily_sales_performance(
 ) -> pa.Table:
     """Recompute the materialization and write it to `path` as Parquet, touching no table.
 
-    The pipeline half of the declared load. It reads `sales.orders` — which is the aggregate's
-    input, not Loom's business — and stops at a file, because everything after the file is what the
-    `daily-sales` entry in `loom.yaml` describes:
+    The pipeline half of the declared load, and the one the example runs. It reads `sales.orders` —
+    which is the aggregate's input, not Loom's business — and stops at a file, because everything
+    after the file is what the `daily-sales` entry in `loom.yaml` describes:
 
-        python -c 'from examples.retail.sales_performance import *' ...   # produce the file
-        loom ingest daily-sales daily.parquet examples/retail/ontology     # land it
+        loom ingest daily-sales daily.parquet examples/retail/ontology
 
-    `mode: replace` there rather than `append`, for the reason this function recomputes every day
-    rather than the new one: a daily aggregate is a whole answer, so appending would leave two rows
-    per day and merging would leave yesterday's answer for a day the source no longer has."""
+    Both callers in this repo do that in-process rather than over the command line — `seed.py`'s
+    `materialize` and the dashboard's `/api/refresh` — and both write the file to a temporary
+    directory, because it is a **handover and not an artifact**. The checked-in drops under `data/`
+    are the other kind: data somebody wrote, readable in a diff, with fixed bytes. This one is the
+    output of a computation that runs again tomorrow with different numbers in it.
+
+    Which is also why re-running it is never a duplicate load: every recompute stamps a fresh
+    `refreshedAt`, so the bytes differ and the derived load id differs. A second refresh is a second
+    load rather than the same one twice — `derive_load_id`'s distinction, reached from the far side.
+
+    `mode: replace` rather than `append`, for the reason this function recomputes every day rather
+    than the new one: a daily aggregate is a whole answer, so appending would leave two rows per day
+    and merging would leave yesterday's answer for a day the source no longer has."""
     import pyarrow.parquet as pq
 
     rows = _compute(catalog, refreshed_at)
@@ -133,9 +148,16 @@ def write_daily_sales_performance(
 def refresh_daily_sales_performance(catalog, *, refreshed_at: dt.datetime | None = None) -> pa.Table:
     """Recompute and atomically replace the materialization from the current orders snapshot.
 
-    The hand-rolled half, kept as the comparison: it creates the table if it is missing, writes it
-    with a schema this file maintains by hand, and leaves nothing in `_loom_meta` behind it. That
-    last part is what `loom ingest` exists to change."""
+    **The hand-rolled half, and since M11's fourth slice nothing shipped calls it.** It creates the
+    table if it is missing, writes it with a schema this file maintains by hand, and leaves nothing
+    in `_loom_meta` behind it — which is what `loom ingest` exists to change, and what `seed.py` and
+    the dashboard both used to do.
+
+    Kept rather than deleted, because it is the comparison and the comparison is checkable: an
+    acceptance test runs this and `write_daily_sales_performance` against one orders snapshot and
+    asserts the same table comes out either way. Delete this and the claim *the declared load adds a
+    contract and a record rather than different rows* becomes something the README asserts and
+    nothing verifies."""
     rows = _compute(catalog, refreshed_at)
 
     namespace = MATERIALIZATION_TABLE.split(".")[0]

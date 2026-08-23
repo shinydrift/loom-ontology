@@ -28,6 +28,10 @@ So the three stages are separate now, and only the last one is outside the frame
    for a reason the ontology never hears about, and everything Loom does afterwards has to leave
    them alone.
 
+Then `materialize`, which is stage 2 again on a delay: the daily aggregate is computed *from* the
+orders stage 2 landed, so it cannot be part of the same run as its own input. It is a fourth call
+rather than a fourth stage.
+
 What has not changed is the claim M9 narrowed: **Loom is not the way data is produced or moved, but
 it is the way a batch becomes rows in a table the ontology describes.** Stage 3 produces data and
 alters a schema, so it is not Loom's. Stages 1 and 2 are entirely Loom's — and until this rewrite
@@ -50,12 +54,12 @@ import pyarrow as pa
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from sales_performance import refresh_daily_sales_performance  # noqa: E402
+from sales_performance import write_daily_sales_performance  # noqa: E402
 
 from loom.catalog import open_catalogs  # noqa: E402
 from loom.config import find_config, load_config  # noqa: E402
 from loom.errors import Diagnostics  # noqa: E402
-from loom.ingest import build_sequences  # noqa: E402
+from loom.ingest import build_ingest, build_sequences  # noqa: E402
 from loom.migrate import apply_plan, diff_ontology, snapshot_spec  # noqa: E402
 from loom.ontology import build  # noqa: E402
 
@@ -150,6 +154,37 @@ def arrive(catalog) -> None:
         txn.overwrite(rows)
 
 
+def materialize(ontology, config, catalogs) -> None:
+    """The daily aggregate, computed outside Loom and landed through the `daily-sales` entry.
+
+    **Loom does not compute this, and the file is where the boundary is.**
+    `write_daily_sales_performance` reads the orders snapshot and stops at a Parquet file; the
+    declared entry does the rest. That split is the milestone's whole claim: Loom is not the way data
+    is produced or moved, but it is the way a batch becomes rows in a table the ontology describes.
+
+    The file is a **handover and not an artifact**, so it goes to a temporary directory rather than
+    beside the checked-in seed drops. Which is the difference between this entry and the other two —
+    `customers.ndjson` is data somebody wrote and can read in a diff, and this is the output of a
+    computation that will run again tomorrow with different numbers in it.
+
+    That also settles the duplicate question the checked-in drops raise: every recompute stamps a new
+    `refreshedAt`, so the bytes differ, so the derived load id differs and a second refresh is a
+    second load rather than the same one twice. Exactly the distinction `derive_load_id` exists to
+    draw, arrived at from the other side."""
+    import tempfile
+
+    runtime = build_ingest(ontology, config, catalogs)
+    with tempfile.TemporaryDirectory(prefix="loom-daily-") as tmp:
+        path = Path(tmp) / "daily.parquet"
+        write_daily_sales_performance(open_sql_catalog(config), path)
+        result = runtime.load("daily-sales", path, actor="seed.py")
+    if not result.ok:
+        raise RuntimeError(
+            f"the daily-sales load was refused: "
+            f"{'; '.join(f.message for f in result.failures) or result.status}"
+        )
+
+
 def seed(example_dir: Path = EXAMPLE_DIR, fresh: bool = True):
     """The three stages, in order. Idempotent when `fresh` is set, and refuses to double-load
     otherwise — which is `derive_load_id` doing exactly what it exists for."""
@@ -172,9 +207,7 @@ def seed(example_dir: Path = EXAMPLE_DIR, fresh: bool = True):
     load(ontology, config, catalogs)
     catalog = open_sql_catalog(config)
     arrive(catalog)
-    # The aggregate still lands the hand-rolled way, and that is the next slice's subject — see
-    # `sales_performance.py`, which holds both halves side by side.
-    refresh_daily_sales_performance(catalog)
+    materialize(ontology, config, catalogs)
     return config, catalog
 
 
