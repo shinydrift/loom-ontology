@@ -273,7 +273,7 @@ spelling — the hints are ANDed, so one per value would prune to the rows match
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 1074 tests
+pytest                              # 1083 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 3 action(s)
 ```
 
@@ -282,7 +282,8 @@ plus a seed script that builds a local Iceberg warehouse — SQLite metastore, f
 no services to start:
 
 ```bash
-python examples/retail/seed.py                        # create + populate the Iceberg tables
+python examples/retail/seed.py                        # loom apply, then loom sequence, then two
+                                                      # columns added by something that isn't Loom
 loom validate --physical examples/retail/ontology     # check the spec against live metadata
 loom query Customer examples/retail/ontology --key c1 # → one row, through DuckDB
 loom query Customer examples/retail/ontology --key c2 --link orders   # → a link traversal

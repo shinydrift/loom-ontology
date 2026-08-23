@@ -1,0 +1,6 @@
+{"orderId": "o1", "customerId": "c1", "total": "1299.99", "placedAt": "2026-01-04T12:00:00Z"}
+{"orderId": "o2", "customerId": "c1", "total": "450.00", "placedAt": "2026-02-11T12:00:00Z"}
+{"orderId": "o3", "customerId": "c2", "total": "89.95", "placedAt": "2026-02-14T12:00:00Z"}
+{"orderId": "o4", "customerId": "c2", "total": "2100.00", "placedAt": "2026-03-02T12:00:00Z"}
+{"orderId": "o5", "customerId": "c2", "total": "17.50", "placedAt": "2026-03-09T12:00:00Z"}
+{"orderId": "o6", "customerId": "c4", "total": "640.25", "placedAt": "2026-03-17T12:00:00Z"}

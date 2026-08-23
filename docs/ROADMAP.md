@@ -2113,6 +2113,58 @@ above the prompt rather than keeping it in a docstring.
   order's customer arrived. Reading a schedule as a guarantee is the misreading available here, so
   the module docstring closes it explicitly.
 
+### Third slice — the example stops pretending its unmanaged columns were always there
+
+`seed.py` built `crm.customers` in one `pa.schema(...)`: four columns the ontology declares and two
+it does not, born together. Every other part of the repo then leaned on those two to demonstrate §2
+rule 7 — *a column no property maps is somebody else's data, reported by `plan`, never dropped,
+carried across untouched by every write*. **A column born in the same breath as the managed ones
+cannot demonstrate that.** What the rule is about is a column that arrives from a writer that is not
+Loom, and the example never showed one arriving.
+
+So the script is three stages now, and the order is the demonstration:
+
+1. `bootstrap` — `loom apply`, from nothing but the spec.
+2. `load` — `loom sequence seed`, running the declared `customers` and `orders` entries from
+   `data/manifest.yaml`.
+3. `arrive` — pyiceberg directly, adding `region` and `segments` and filling them.
+
+- **Stages 1 and 2 were the gap this milestone actually found.** Nothing in the shipped example ever
+  ran a declared load: `daily-sales` existed in `loom.yaml` and was exercised only by tests and by an
+  operator typing the CLI by hand. The example now loads itself through Loom, which is the thing M9
+  claimed and the example did not do.
+
+- **An all-Loom bootstrap structurally cannot produce an unmanaged column**, and that is why stage 3
+  is outside the framework rather than merely conventional: `apply` creates the columns the spec
+  declares, and `_check_columns` refuses a source column no property claims. Both directions are
+  closed, so the only way to get one is a writer that is not Loom — which is what the word means.
+
+- **`region` is unmanaged by choice and `segments` could not be otherwise.** `region` is a plain
+  string and nothing stops it being a property, which is the more interesting half: the framework is
+  not the obstacle. `segments` is `list<string>`, and §1 defers `array<T>`, so it is the case where
+  there is no choice. Keeping both makes the example say which is which.
+
+- **Format is declared per entry, and the example now uses two.** `customers`/`orders` are ndjson
+  because a drop of hand-written seed rows should be readable in a diff; `daily-sales` stays parquet
+  because a computed aggregate should carry its types rather than have them re-parsed. One file, two
+  formats, neither guessed.
+
+- **`daily-sales` is deliberately not in the `seed` sequence.** It is computed *from* the orders that
+  sequence lands, so it cannot be part of the same run as its own input. Which is a useful thing for
+  the example to show about what a sequence is: an order over loads, not a dependency graph over
+  data.
+
+- **A test fixture had to split, and the split is the finding.** Four suites used a `seeded` fixture
+  whose premise was *a lake Loom is a guest in is exactly the one where the record matters* — and a
+  seeded warehouse now arrives with all three `_loom_meta` tables in it. So `conftest.guest` is new:
+  the same two tables built by pyiceberg alone. The old mechanism became test scaffolding, which is
+  the right place for it, because as scaffolding it no longer says anything about what Loom
+  recommends.
+
+- **Re-running the seed is refused, and the example is better for it.** The data files are checked
+  in, so their bytes are fixed, so `derive_load_id` gives the same id every time — the second run of
+  `seed(fresh=False)` is one load happening twice and is told so by name. A test asserts it.
+
 ---
 
 ## Backlog — spec edges (from spec-v0 §"Open edges")

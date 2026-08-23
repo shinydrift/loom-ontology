@@ -1,0 +1,10 @@
+# Which file each declared load reads, for one run of the `seed` sequence.
+#
+# The one file `loom sequence` takes on the command line, because it is the one thing that varies
+# per run — the same reason `loom ingest` takes a data file and nothing else. Which entries run, and
+# in what order, is in `loom.yaml` where it is reviewed.
+#
+# Paths resolve against *this file*, not the working directory: a manifest describes a drop, and a
+# drop is the files sitting beside it.
+customers: customers.ndjson
+orders: orders.ndjson

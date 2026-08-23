@@ -1,0 +1,4 @@
+{"customerId": "c1", "name": "Ada Lovelace", "tier": "gold", "ltv": 48210.50}
+{"customerId": "c2", "name": "Grace Hopper", "tier": "silver", "ltv": 12750.00}
+{"customerId": "c3", "name": "Alan Turing", "tier": "bronze", "ltv": null}
+{"customerId": "c4", "name": "Karen Spärck Jones", "tier": "closed", "ltv": 3120.00}
