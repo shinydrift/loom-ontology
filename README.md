@@ -258,7 +258,9 @@ spelling — the hints are ANDed, so one per value would prune to the rows match
 | Membership filters | ✅ `filter: {tier: {in: [...]}}` — null-safe, empty list refused |
 | Bulk ingest — a declared load, checked and recorded | ✅ `loom ingest`, `_loom_meta.loads` |
 | Semantic search — the grammar | ✅ `semantic:`, `mcp.embedding`, `vector_search` negotiated |
-| Semantic search — vectors, and a tool that ranks by them | 🔨 M10 slices 2–4 |
+| Semantic search — the vectors | ✅ `loom embed`, a sidecar per type in `_loom_meta` |
+| Semantic search — a tool that ranks | ✅ `match_<object>(text, filter, page)`, brute force, filtered first |
+| Semantic search — ranking across a link (`via`) | 🔨 M10 slice 4 |
 
 `docs/spec-v0.md` is the full grammar — the framework's public contract.
 `docs/ROADMAP.md` tracks what's next, milestone by milestone.

@@ -17,6 +17,7 @@ import argparse
 import json
 import sys
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -105,7 +106,8 @@ def cmd_query(args) -> int:
         print(str(e), file=sys.stderr)
         return 1
 
-    from .catalog import CatalogError
+    from .catalog import CatalogError, open_catalogs
+    from .embed import EmbeddingError
     from .filters import MEMBERSHIP
     from .governance import PolicyError
     from .mcp.registry import json_safe
@@ -116,6 +118,13 @@ def cmd_query(args) -> int:
     # reachable metastore to be reported.
     if args.link and not args.key:
         print("error: --link requires --key", file=sys.stderr)
+        return 1
+    # A ranked read and a keyed one are different verbs, not two halves of one. `--match --key` has
+    # no meaning to guess at: a similarity over the one row you already named is a number about
+    # nothing. Refused here rather than resolved by precedence, which would silently answer the
+    # question the caller did not ask.
+    if args.match is not None and (args.key or args.link):
+        print("error: --match cannot be combined with --key or --link", file=sys.stderr)
         return 1
     # `PROP=VALUE` and `PROP.OP=VALUE` — the two spellings the generated tool takes, in the one
     # encoding a shell has. A property name cannot contain a dot, so the split is unambiguous; a
@@ -153,20 +162,30 @@ def cmd_query(args) -> int:
             print(f"error: --filter gives '{name}' both a bare value and operators", file=sys.stderr)
             return 1
 
+    ranked = None
     try:
-        resolver = build_resolver(ontology, config)
-        if args.key and args.link:
+        # Opened once and handed to both, so a `--match` does not build a second connection to the
+        # same lake and get a second opinion about what is in it.
+        open_cats = open_catalogs(config)
+        resolver = build_resolver(ontology, config, open_cats)
+        if args.match is not None:
+            ranked = _cli_match(ontology, config, open_cats, resolver, args, filters)
+            # The tool's shape, not a flattened one: `score` beside the object rather than merged
+            # into it, so this command shows what `match_<object>` shows. Merging would also
+            # reintroduce the collision `Resolver.match` exists to keep impossible.
+            rows = [{"score": m.score, "object": m.object} for m in ranked.matches]
+        elif args.key and args.link:
             rows = resolver.traverse(args.object_type, args.key, args.link, limit=args.limit)
         elif args.key:
             row = resolver.get(args.object_type, args.key)
             rows = [row] if row else []
         else:
             rows = resolver.search(args.object_type, filters, limit=args.limit)
-    except (ResolverError, CatalogError, CapabilityError, PolicyError) as e:
+    except (ResolverError, CatalogError, CapabilityError, PolicyError, EmbeddingError) as e:
         # A `CapabilityError` reaches here for the same reason `loom query` mirrors the generated
         # tools at all: if the dev command can read out of an engine the served surface refuses to
         # stand on, the ontology has a back door. A `PolicyError` is the same sentence about a
-        # deployment instead of an engine.
+        # deployment instead of an engine, and an `EmbeddingError` the same sentence about a model.
         print(f"error: {e}", file=sys.stderr)
         return 1
 
@@ -178,8 +197,54 @@ def cmd_query(args) -> int:
     masked = resolver.masked(read)
     if masked:
         print(f"({read}: {', '.join(masked)} withheld by governance policy)", file=sys.stderr)
+    if ranked is not None:
+        # The two facts the tool's envelope carries and a bare list of rows cannot: what model the
+        # ranking is relative to, and how current the oldest vector behind it is.
+        stamp = _zulu(ranked.embedded_as_of) if ranked.embedded_as_of else "never"
+        print(
+            f"(ranked by {ranked.object_type}.{ranked.property} against '{ranked.model}' · "
+            f"oldest vector here embedded {stamp})",
+            file=sys.stderr,
+        )
     print(f"({len(rows)} row(s))", file=sys.stderr)
     return 0
+
+
+def _zulu(when: datetime) -> str:
+    """An `embedded_at` as a UTC wall clock, because the `Z` on the end has to be earned.
+
+    Both commands that print one read it back through a different stack — `loom embed` off pyarrow,
+    `loom query --match` off DuckDB — and DuckDB converts a `timestamptz` to the *host's* zone, so a
+    vector embedded at 09:14Z printed as `05:14Z` on a machine in New York. One function so the two
+    cannot disagree about the same value, and a conversion rather than a relabelling so the letter
+    is true."""
+    return f"{when.astimezone(UTC):%Y-%m-%d %H:%M}Z"
+
+
+def _cli_match(ontology, config, catalogs, resolver, args, filters):
+    """`--match` through the same `Matcher` the tool uses, or the refusal a deployment has earned.
+
+    A separate function only because it has one refusal of its own: `bind_matching` answers `None`
+    for a deployment that cannot rank, which over MCP means *no tool was generated* and here has to
+    become a sentence. That is this command's rule read from an angle it had not been read at
+    before — it mirrors the generated tools, so where the surface exposes nothing it must not
+    quietly do something."""
+    from .embed.match import bind_matching
+    from .resolver import ResolverError
+
+    matcher = bind_matching(ontology, config, catalogs)
+    if matcher is None and config.mcp.embedding is None:
+        raise ResolverError(
+            "this deployment configures no 'mcp.embedding' provider, so nothing here ranks by "
+            "meaning — add it to loom.yaml. `loom serve` generates no match_ tool either, which is "
+            "the same answer said as an absence"
+        )
+    if matcher is None:
+        raise ResolverError(
+            "no objectType in this ontology declares a 'semantic:' property, so there is nothing "
+            "to rank by meaning"
+        )
+    return matcher.match(resolver, args.object_type, args.match, filters, limit=args.limit)
 
 
 def cmd_run(args) -> int:
@@ -584,7 +649,7 @@ def _render_embed(result, title: str) -> str:
         # The *oldest* stamp, which is the only one an operator can act on: it says every vector
         # here is at least this current. Absent for a sidecar that has never held a row.
         if t.embedded_as_of:
-            detail += f" · embedded as of {t.embedded_as_of:%Y-%m-%d %H:%M}Z"
+            detail += f" · embedded as of {_zulu(t.embedded_as_of)}"
         lines.append(detail)
     return "\n".join(lines)
 
@@ -710,6 +775,23 @@ def _semantic_mode(config, ontology) -> list[str]:
         ]
     return [
         f"semantic search · {', '.join(sorted(declared))} via {config.mcp.embedding.describe()}",
+        # The cost, beside the transport line's note that a slow call blocks the server, because
+        # this is the call most likely to be the slow one. There is no vector index and that is a
+        # decision rather than an omission: pre-filtering means brute-forcing the survivors anyway,
+        # and an HNSW index is an optimisation for the unfiltered case.
+        #
+        # **Both halves, because they are different sizes.** A `filter` narrows what has to be
+        # *measured* and cannot narrow what has to be *read*: the surviving keys are known only
+        # after the object side is scanned, and there is no pushdown spelling for a key set. So the
+        # sentence an operator can act on is "a filter helps, and the sidecar is still read".
+        "  (match_ ranks by brute force · the arithmetic is linear in the filtered set, so a "
+        "narrow filter is the lever)",
+        "  (no vector index · the whole sidecar is read on every call, filtered or not — that is "
+        "the I/O floor, and it grows with the embedded rows rather than with the answer)",
+        # Only `loom embed` can see this number, so the banner points at the command rather than
+        # guessing it: the ranked surface deliberately does not count unembedded rows per call.
+        "  (a row with no vector is absent from match_, silently — `loom embed` is what reports "
+        "how many, and how far behind)",
     ]
 
 
@@ -1029,6 +1111,14 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")
     q.add_argument("--key", help="primary key — fetch one object")
     q.add_argument("--link", help="with --key, follow this link instead")
+    q.add_argument(
+        "--match",
+        metavar="TEXT",
+        help=(
+            "rank by meaning against the objectType's 'semantic:' property, nearest first; "
+            "--filter narrows before the ranking"
+        ),
+    )
     q.add_argument(
         "--filter",
         action="append",

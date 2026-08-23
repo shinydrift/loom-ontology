@@ -1630,7 +1630,8 @@ about the word (*it filters the result set*), wrong about the shape.
 - [x] **2 — `EmbeddingProvider`, the sidecar, and `loom embed`.** Loom's first model dependency, and
       where staleness is defined. Also the seventh port, and the first `list<float>` column Loom has
       ever created.
-- [ ] **3 — `match_<object>`.** The tool, the brute-force lowering, the result envelope.
+- [x] **3 — `match_<object>`.** The tool, the brute-force lowering, the result envelope. Also the
+      **fourth source node** — the read IR was three shapes for nine milestones.
 - [ ] **4 — `via`.** Cross-object filtering, without which the interesting queries are not
       expressible. **M10 closes here, and there is no partial ship**: slices 1–3 generate a tool
       that can rank orders by meaning and cannot say *belonging to a gold-tier customer*, which is
@@ -1760,7 +1761,9 @@ gets re-litigated by whoever builds it.
   The cost belongs in the banner beside the existing note about a slow query blocking the server:
   `match_` is linear in the filtered set.
 
-- **The envelope carries `embeddedAsOf` and not a count of unembedded rows.** The count needs an
+- **The envelope carries `embeddedAsOf` and not a count of unembedded rows.** *(Built: the field is
+  there and the count is not, and what changed is which set the stamp is taken over — see "Decided
+  while slice 3 was built".)* The count needs an
   anti-join over the admitted set on every call, but the deciding reason is that an agent cannot
   *act* on it — it cannot wait and it cannot trigger a reconcile, and this surface says things a
   caller can do something about. What that gives up is real and stated: `match_` can silently omit a
@@ -1832,6 +1835,106 @@ recorded because it was a real choice rather than the only option:
 - **`provider: local` is fastembed**, which is a smaller model than the obvious alternative and the
   cost is stated: sentence-transformers is the quality baseline and arrives with torch, so the
   *default* provider would pull over a gigabyte. A default that expensive is one people route around.
+
+### Decided while slice 3 was built
+
+Everything above slice 2's section was decided before the code existed. These came out of writing the
+ranked read, and each is recorded because it was a real choice rather than the only option:
+
+- **`ir.Match` is the fourth source node, and the read IR had been three shapes since v0.** Worth
+  saying why it could not be anything smaller. A `Search` with one more filter was the tempting
+  version and it is the same mistake the milestone opened by refusing, one layer down: the other
+  three nodes *decide* rows, and this one imposes an ordering the caller did not give. A node is
+  what makes the choice structural — the filters stay the flat conjunction they always were, and the
+  ranking happens over what survives them, with no way to spell the other order.
+
+  The sidecar rides on the node as a `VectorRef` beside the governed `TableRef`, which is
+  `ThroughRef`'s shape and `ThroughRef`'s answer to governance: it stands for no object type, so no
+  policy names it, and there is no field on it to put one in.
+
+- **The comparability guard turned out to be load-bearing for *liveness*, not only for meaning.**
+  The plan said a vector from another model should not be ranked, which is true and sounded like a
+  quality argument. It is stronger than that: `array_cosine_similarity` over two different widths
+  **raises** in DuckDB rather than answering, so a sidecar caught part-way through a `--remodel`
+  would make every `match_` fail rather than rank the generation that is current. `WHERE model = ?
+  AND dims = ? AND property = ?` is therefore in the compiled query for correctness *and* in the
+  scan as the equality pairs that channel can carry.
+
+  **All three columns slice 2 wrote are read by it, and the third was found in review.** `property`
+  looked ornamental — slice 2 called it "single-valued today, and present anyway" — and it closes
+  the narrowest window in the milestone. Re-point `semantic:` from one column to another and every
+  `source_hash` changes, so a reconcile fixes it; between the deploy and the reconcile the sidecar
+  holds vectors of the *old* text, and without the clause they would be ranked, silently, under an
+  envelope naming the new property and a fresh `embeddedAsOf`. That is the shape `loom.managed` had
+  and this milestone avoided: a column written and never read is a check nobody is doing.
+
+  The consequence is named rather than hidden: after a model swap `match_` returns **nothing** until
+  `loom embed --remodel` runs. That is a loud failure rather than a quiet wrong one, and the envelope
+  names the model on every call so an empty page is diagnosable.
+
+- **`embeddedAsOf` is the oldest stamp among the rows returned, not across the whole sidecar — and
+  the plan was the weaker version.** `embed.store` predicted slice 3 would consume its sidecar-wide
+  reading. Three things are wrong with that: an envelope describes the answer it is attached to, and
+  the sidecar-wide number is a fact about rows the caller was never shown; computing it per call
+  needs a scan of a column nothing in the answer is keyed to, which is the same per-call extra read
+  this milestone refused for the count of unembedded rows; and getting it would put a catalog handle
+  in the layer that composes envelopes. The definition stays in one place — `store.oldest` — and each
+  caller hands it its own set. `loom embed` still reports the sidecar-wide reading, because that one
+  is the *operator's* question.
+
+- **`limit`/`offset`, not `k`.** A ranked page is still a page. The order is total — score
+  descending, then the primary key — which is `Search.order_by`'s argument arriving by a different
+  route: without the tie-break, two rows at the same distance would swap between calls and page 2
+  would be an unrelated draw rather than the continuation of page 1. With it, `offset` means what it
+  means everywhere else and `hasMore` is computed by the same function, so the surface has one
+  paging vocabulary rather than one plus an exception.
+
+- **The score sits beside the object, and the output names are made unique rather than reserved.**
+  §7's namespace rule reaching the result: the object is the spec's vocabulary and `score` is Loom's,
+  so one is never inside the other. Below that, in the one place they briefly share a namespace — the
+  engine hands rows back as a dict keyed by output name — a spec that declared a property called
+  `_loom_score` would not produce an error, it would produce two columns silently becoming one. The
+  resolver lengthens its own name until it is not one the projection uses, which is three lines and
+  removes the failure rather than documenting it.
+
+- **Both of the ranked plane's own refusals are refusals rather than empty results**, which is
+  `{"in": []}`'s argument met one plane over. Blank `text`, and a type whose sidecar has never been
+  written: in each case the honest empty answer is one a caller cannot tell from *nothing was
+  similar*, so it is a sentence naming what to do instead. The unembedded case is an ordinary state
+  of an ordinary deployment — a spec may declare `semantic:` and be served before any reconcile has
+  run — so it names `loom embed --type X` rather than surfacing a catalog error.
+
+- **`Matcher` is a third binding, beside reads and writes, and the resolver takes a vector.** The two
+  things a ranked read needs are the two things `Resolver` deliberately does not have: something that
+  can call a model, and a handle on the lake. Keeping `Resolver.match(vector, model, …)` a pure
+  function of the ontology and its arguments is what stops a plan from being built around a network
+  round trip, and a vector is a *value* — like a filter's literal — so nothing a caller sends becomes
+  a predicate, a column or a table.
+
+  It also pays off a sentence slice 2 wrote in advance: `bind_matching` builds each `VectorStore`
+  **without** a `VectorWriter`, so a serving process can rank a sidecar and cannot maintain one.
+  `vector_writer_for()` is never called on the read plane, which keeps `build_server`'s claim about
+  what a serving process holds true across the one port that can delete.
+
+- **"Linear in the filtered set" was true of the arithmetic and not of the I/O, and the banner said
+  the flattering half.** A filter narrows what has to be *measured*; it cannot narrow what has to be
+  *read*, because the surviving keys are known only after the object side is scanned and
+  `ScanRequest` carries a conjunction of equality pairs — a key set has no spelling in it, the way a
+  range has none. So the vector column is materialized whole on every call, filtered or not, and the
+  floor grows with the embedded rows rather than with the answer. Both halves are now said, in the
+  banner and in §7.2, because an operator sizing a deployment acts on the larger one.
+
+  What would fix it is not this slice's and is already named twice: the pushdown channel the
+  range-pushdown backlog entry describes, or partitioning the sidecar on the object's own property —
+  which is the move recorded when denormalised link columns were refused, and which optimises the
+  read without changing what a ranking means.
+
+- **`loom query --match` exists, and `--match --key` is refused.** The dev command mirrors the
+  generated tools or the ontology has a back door, and this is the first time that rule was read from
+  the other end: `bind_matching` answering `None` means *no tool was generated*, so the command has
+  to say so rather than quietly doing something the surface cannot. A ranked read and a keyed one are
+  different verbs — a similarity over the one row you already named is a number about nothing — so
+  the combination is refused rather than resolved by precedence.
 
 ### Refused, permanently
 

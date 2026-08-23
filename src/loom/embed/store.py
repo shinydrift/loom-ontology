@@ -46,7 +46,7 @@ discovering it.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -59,6 +59,8 @@ if TYPE_CHECKING:
 VECTOR_COLUMN = "vector"
 HASH_COLUMN = "source_hash"
 MODEL_COLUMN = "model"
+DIMS_COLUMN = "dims"
+PROPERTY_COLUMN = "property"
 EMBEDDED_AT_COLUMN = "embedded_at"
 
 
@@ -83,9 +85,9 @@ def vector_columns(key_type: str) -> tuple[Column, ...]:
         Column(VECTOR_KEY_COLUMN, key_type, required=True),
         # Single-valued today — one `semantic:` per type — and present anyway, under the rule above.
         # Going plural later widens a key in the loader; it must not need a table to grow a column.
-        Column("property", "string", required=True),
+        Column(PROPERTY_COLUMN, "string", required=True),
         Column(MODEL_COLUMN, "string", required=False),
-        Column("dims", "int", required=False),
+        Column(DIMS_COLUMN, "int", required=False),
         Column(VECTOR_COLUMN, "list<float>", required=False),
         Column(HASH_COLUMN, "string", required=False),
         Column(EMBEDDED_AT_COLUMN, "timestamptz", required=False),
@@ -144,9 +146,9 @@ class VectorRow:
     def row(self) -> dict[str, Any]:
         return {
             VECTOR_KEY_COLUMN: self.key,
-            "property": self.property,
+            PROPERTY_COLUMN: self.property,
             MODEL_COLUMN: self.model,
-            "dims": self.dims,
+            DIMS_COLUMN: self.dims,
             VECTOR_COLUMN: list(self.vector),
             HASH_COLUMN: self.source_hash,
             EMBEDDED_AT_COLUMN: self.embedded_at,
@@ -229,18 +231,32 @@ class VectorStore:
         return self.writer
 
 
-def embedded_as_of(rows: Mapping[Any, Mapping[str, Any]]) -> datetime | None:
-    """The **oldest** `embedded_at` in a sidecar, which is what an envelope can honestly claim.
+def oldest(stamps: Iterable[Any]) -> datetime | None:
+    """The oldest of these `embedded_at` values, or None if there are none.
 
-    The oldest rather than the newest, and that is the whole content of the field: *every vector here
-    is at least this current*. Reporting the newest would let one row embedded a second ago describe a
-    table last reconciled in March.
+    The oldest rather than the newest, and that is the whole content of every field computed from it:
+    *every vector counted here is at least this current*. Reporting the newest would let one row
+    embedded a second ago describe a set last reconciled in March.
 
-    Slice 3 consumes this. It is computed here because the definition of freshness lives here, and a
-    result envelope should not be the place a second one gets invented."""
-    stamps = [r.get(EMBEDDED_AT_COLUMN) for r in rows.values()]
+    **One definition, two readers, and slice 3 corrected which reader gets which set.** This module
+    predicted the ranked surface would consume `embedded_as_of` below — the oldest stamp in a whole
+    sidecar — and that is the *operator's* question, which is why `loom embed` still reports it. An
+    envelope answers the caller's, and a caller is holding one page of a ranking: the honest claim
+    there is about the rows that came back, not about rows they were never shown and cannot ask for.
+    Computing the sidecar-wide reading per call would also mean a scan of a column nobody in the
+    answer is keyed to, which is the same per-call extra read the milestone refused for the count of
+    unembedded rows. So the definition stays here, once, and each caller hands it its own set."""
     present = [s for s in stamps if isinstance(s, datetime)]
     return min(present) if present else None
+
+
+def embedded_as_of(rows: Mapping[Any, Mapping[str, Any]]) -> datetime | None:
+    """The oldest `embedded_at` across a whole sidecar — what `loom embed` reports.
+
+    Computed here because the definition of freshness lives here, and a result envelope should not
+    be the place a second one gets invented. See `oldest` for why the ranked surface reads it over a
+    different set."""
+    return oldest(r.get(EMBEDDED_AT_COLUMN) for r in rows.values())
 
 
 def now() -> datetime:

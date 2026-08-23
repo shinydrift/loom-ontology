@@ -120,10 +120,9 @@ objectType:
 
    Declaring it demands `vector_search` of the engine (§6.3), and it is the *spec* that demands it:
    an ontology whose engine has no array arithmetic describes a surface that engine could never
-   serve, whatever any deployment configures. What a declaration does **not** yet do is generate a
-   tool — the ranked surface it is the grammar for is not built, and §7's table is the complete
-   list of what a spec compiles to today. `semantic:` is accepted, validated and negotiated now so
-   that a spec can be written against a lake before the plane that reads it exists.
+   serve, whatever any deployment configures. It generates `match_<type>` (§7, §7.2) wherever the
+   deployment also configures `mcp.embedding` — the spec declares the intent, the deployment
+   declares the mechanism, and neither half alone is a ranked surface.
 8. **Physical check** (at `loom plan` / `loom serve`, against catalog introspection): every
    `backing.table` exists, every `column` exists on it, and every property type is compatible
    with its column's Iceberg type per §1. Missing table/column → error; incompatible type →
@@ -1018,6 +1017,7 @@ surface. Nothing here is hand-authored.
 | `objectType Customer`                | `get_customer(key)`                                     | PK type |
 |                                      | `search_customer(filter, page)`                         | `searchable` props + property types → §7.1 |
 |                                      | `list_customer(page)`                                   | pagination |
+|                                      | `match_customer(text, filter, page)` — only with `semantic:` **and** `mcp.embedding` | free text + the same `filter` → §7.2 |
 | `linkType placedBy` (+ `reverseName`)| contributes `order` / `customer` directions to `traverse(object, link, direction)` | link mapping |
 | `action upgradeTier`                 | `run_upgrade_tier(parameters, dryRun)`                  | `parameters` → JSON Schema; `description` → tool description |
 
@@ -1187,6 +1187,75 @@ could range-query a column the deployment never offered.
 `limit` a page envelope reports is always the page that was served. Clamping reads as generosity and
 is a silent narrowing: the caller gets `MAX` rows, the envelope echoes the number it asked for, and
 a client paging with `offset += limit` steps past everything it was not given.
+
+### 7.2 `match_<type>` — ranking, and why it is not an operator in §7.1
+
+```
+match_ticket(text: "the customer wanted their money back",
+             filter: { queue: logistics },     # the same grammar §7.1 defines
+             limit: 10, offset: 0)
+```
+
+`search_<type>` finds rows that **say** a word. An agent asking *which tickets were a payment
+dispute?* gets nothing for "sent the money back", "chargeback", "customer wanted out" — the answer is
+in the text and the caller's words are not the data's words.
+
+**It is a tool rather than an operator**, and the reason is the same one that makes `traverse`
+generic and `run_` per action: a rule about what the thing *is*, not about its name. Every filter in
+§7.1 is a **predicate** — it decides each row true or false, `order_by` stays pinned to the primary
+key, and composition is `AND`. A similarity clause decides nothing. It **ranks**. Putting one under
+`filter` would introduce `k` and an ordering into a grammar that has neither, and
+`{similar} AND {tier: gold}` would have two different answers — rank-then-filter and
+filter-then-rank — with nothing in the grammar to choose between them. `search` is also a word
+already spent on rows.
+
+**`filter` narrows before the ranking, always.** That is a rule and not a per-query decision:
+choosing by estimated selectivity is a query planner, and Loom does not have one. So a filtered call
+ranks fewer rows rather than re-ranking the ones a filter kept, and a governed row is not ranked low
+— under a §6.1 `rows:` predicate it *does not exist* for that caller, because the predicate rides on
+the table at the point a type becomes one.
+
+**The tool needs both halves.** The spec declares `semantic:` and the deployment configures
+`mcp.embedding` (§6.3); with no provider there is no tool, exactly as `mcp.writes: false` exposes no
+action. That is not a policy narrowing a surface: §6.1 refuses a `mask:` over a semantic property
+before the deployment starts, because no deployment gets to be the one that makes a tool disappear.
+
+**What comes back.**
+
+```json
+{ "objectType": "Ticket", "property": "body", "model": "BAAI/bge-small-en-v1.5",
+  "embeddedAsOf": "2026-08-23T09:14:02Z",
+  "count": 2, "limit": 10, "offset": 0, "hasMore": false, "masked": [],
+  "matches": [ { "score": 0.83, "object": { "ticketId": "t1", "…": "…" } } ] }
+```
+
+`matches` rather than `objects`, because the elements are not objects — each is a score paired with
+one. The score sits **beside** the object and never inside it, which is §7's namespace rule reaching
+the result: the object is the spec's vocabulary, `score` is Loom's, and an ontology may declare a
+property called `score`. It is a cosine similarity, comparable between rows and between calls of one
+deployment and meaningless against a different model — which is why `model` is in every envelope.
+
+Pages are pages: the order is total (score descending, then primary key), so `offset` means what it
+means everywhere else and `hasMore` is computed the same way.
+
+**Only embedded rows can be ranked, and the envelope does not count the ones that cannot.** A vector
+is derived by `loom embed` (§9) rather than at query time, so a row written since the last reconcile
+has none and is simply absent. The count of them needs an anti-join on every call, and the deciding
+reason not to report it is that an agent cannot *act* on it — it can neither wait nor trigger a
+reconcile, and this surface says things a caller can do something about. The cost is stated rather
+than hidden: **`match_` can silently omit a row that exists.** `embeddedAsOf` — the oldest stamp
+among the rows returned — is what the caller gets instead, and `loom embed` and the serve banner are
+where an operator gets the rest.
+
+**Cost, in two halves that are different sizes.** No vector index: pre-filtering means the distance
+is brute-forced over the survivors anyway, and an ANN index is an optimisation for the *unfiltered*
+case. So the **arithmetic** is linear in the filtered set, and `filter` is the lever.
+
+The **I/O** is not. The keys that survive a filter are known only after the object side is read, and
+the pushdown channel carries a conjunction of equality pairs — a key set has no spelling in it, the
+way a range has none — so the vector column is materialized whole on every call, filtered or not.
+That is the floor, it grows with the embedded rows rather than with the answer, and the serve banner
+says both halves rather than the flattering one.
 
 ---
 

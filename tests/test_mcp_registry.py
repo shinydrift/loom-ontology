@@ -25,7 +25,15 @@ from loom import build
 from loom.action import APPLIED, CONFLICT, PREVIEWED, REFUSED, UNKNOWN_ACTOR, ActionRuntime
 from loom.catalog.base import CatalogError, writer_for
 from loom.config import LoomConfig, McpConfig
-from loom.mcp.registry import DRY_RUN_ARG, PARAMETERS_ARG, RESERVED_RUN_ARGS, build_tools, json_safe, snake_case
+from loom.mcp.registry import (
+    DRY_RUN_ARG,
+    PARAMETERS_ARG,
+    RESERVED_RUN_ARGS,
+    TEXT_ARG,
+    build_tools,
+    json_safe,
+    snake_case,
+)
 from loom.mcp.server import LoomMCPServer, build_mcp_server, build_server
 from loom.query.engine import Capabilities, CompiledQuery
 from loom.resolver import MAX_PAGE_SIZE, Resolver, ResolverError
@@ -62,9 +70,42 @@ def ontology():
     return ont
 
 
-def _tools(ontology, rows=(), runtime=None, actor=None):
+def _tools(ontology, rows=(), runtime=None, actor=None, matcher=None):
     resolver = Resolver(ontology=ontology, engine=StubEngine(rows))
-    return {t.name: t for t in build_tools(resolver, runtime, actor)}
+    return {t.name: t for t in build_tools(resolver, runtime, actor, matcher=matcher)}
+
+
+class _ExistingSidecar:
+    """A catalog that answers the one question the ranked read plane asks one directly."""
+
+    name = "rest_main"
+
+    def table_exists(self, table):
+        return True
+
+
+def _everything(ontology):
+    """Every tool this codebase can generate, ranked half included.
+
+    The universal assertions below are the framework's central claims — no query surface, every
+    schema closed — so they have to walk `match_` too. It takes an injected `semantic:` because the
+    shared fixture declares none: a property declared for one module's benefit is one every other
+    module routes around."""
+    from dataclasses import replace
+
+    from loom.embed.match import Matcher
+    from loom.embed.store import VectorStore
+
+    obj = replace(ontology.object_types["Customer"], semantic="name")
+    ranked = replace(ontology, object_types={**ontology.object_types, "Customer": obj})
+    matcher = Matcher(
+        provider=type("P", (), {"model": "stub-v1", "dims": 2, "embed": lambda self, t: [(1.0, 0.0)] * len(t)})(),
+        stores={"Customer": VectorStore(catalog=_ExistingSidecar(), object_type="Customer", key_type="string")},
+    )
+    return {
+        **_tools(ontology, runtime=_runtime(ontology)),
+        **_tools(ranked, matcher=matcher),
+    }
 
 
 def _runtime(ontology, catalog=None):
@@ -119,10 +160,16 @@ def test_one_tool_per_action_named_from_the_api_name(ontology):
 
 def test_no_tool_can_take_a_query(ontology):
     """The framework's central claim, as an assertion — now over the write half too."""
-    for name, tool in _tools(ontology, runtime=_runtime(ontology)).items():
+    for name, tool in _everything(ontology).items():
         for schema in _objects(tool.input_schema):
             fields = set(schema.get("properties") or {})
             assert not (fields & FORBIDDEN_FIELDS), f"{name} exposes {fields & FORBIDDEN_FIELDS}"
+
+
+def test_the_ranked_tool_is_in_the_surface_these_assertions_walk(ontology):
+    """A guard on the guard: if `_everything` stopped building a `match_` tool, the two assertions
+    around it would keep passing while covering one tool less."""
+    assert "match_customer" in _everything(ontology)
 
 
 def test_a_run_tools_top_level_is_only_loom_s_own_argument_names(ontology):
@@ -140,7 +187,7 @@ def test_a_run_tools_top_level_is_only_loom_s_own_argument_names(ontology):
 
 def test_every_input_schema_is_closed(ontology):
     """additionalProperties: false, so an unexpected argument is rejected rather than ignored."""
-    for name, tool in _tools(ontology, runtime=_runtime(ontology)).items():
+    for name, tool in _everything(ontology).items():
         for schema in _objects(tool.input_schema):
             assert schema["additionalProperties"] is False, name
 
@@ -214,6 +261,19 @@ def test_the_advertised_filter_properties_are_exactly_the_ones_accepted(ontology
     for name in declared - advertised:
         with pytest.raises(ResolverError, match="is not declared searchable"):
             tool.handler({"filter": {name: "x"}})
+
+
+def test_the_ranked_read_is_held_to_the_same_agreement(ontology):
+    """`match_` is the fourth read shape and it advertises `filter` from the same `_filterable`, so
+    the pair that drifted for `search_` is a pair here too — and one door further from the schema,
+    since a ranking answers a withheld value with a gradient rather than a bit."""
+    tool = _everything(ontology)["match_customer"]
+    advertised = set(tool.input_schema["properties"]["filter"]["properties"])
+    assert advertised == set(_tools(ontology)["search_customer"].input_schema["properties"]["filter"]["properties"])
+
+    for name in set(ontology.object_types["Customer"].properties) - advertised:
+        with pytest.raises(ResolverError, match="is not declared searchable"):
+            tool.handler({TEXT_ARG: "a question", "filter": {name: "x"}})
 
 
 def test_descriptions_come_from_the_spec(ontology):

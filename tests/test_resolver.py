@@ -6,14 +6,16 @@ rows is test_e2e_iceberg.py's job.
 """
 
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from loom import build
+from loom.governance import Policy, bind_policies
 from loom.query.engine import Capabilities, CompiledQuery
-from loom.query.ir import ColumnRef, Compare, Const, Contains, Eq, GetByKey, Search, Traverse
+from loom.query.ir import ColumnRef, Compare, Const, Contains, Eq, GetByKey, Match, Search, Traverse
 from loom.resolver import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Resolver, ResolverError
 
 VALID = Path(__file__).parent / "fixtures" / "valid"
@@ -308,3 +310,141 @@ def test_links_of_reports_both_directions(ontology):
     assert [(d.name, d.target_object_type, d.forward) for d in r.links_of("Customer")] == [
         ("orders", "Order", False)
     ]
+
+
+# ---- match ---------------------------------------------------------------------
+
+
+def _semantic(ontology, name="Customer", prop="name"):
+    """The fixture with a `semantic:` property injected.
+
+    Injected rather than declared, for `test_embed.py`'s reason: this ontology is read by half the
+    suite, and a property declared for one module's benefit is one every other module routes
+    around."""
+    obj = replace(ontology.object_types[name], semantic=prop)
+    return replace(ontology, object_types={**ontology.object_types, name: obj})
+
+
+def test_match_builds_a_match_over_the_table_and_its_sidecar(ontology):
+    r = _resolver(_semantic(ontology))
+    r.match("Customer", [0.1, 0.2], "stub-v1")
+    src = r.engine.source
+    assert isinstance(src, Match)
+    assert src.table.table == "crm.customers"
+    assert src.key_column == "id"  # the physical column, as everywhere else in this layer
+    assert src.vectors.table.table == "_loom_meta.vectors__Customer"
+    # The object's own catalog: a vector is derived from the rows of one table and written beside
+    # them, which is `EmbedRuntime._store`'s choice seen from the read side.
+    assert src.vectors.table.catalog == "rest_main"
+    assert src.query == (0.1, 0.2)
+
+
+def test_the_sidecar_can_never_carry_a_policy(ontology):
+    """It stands for no object type, so no policy names it — `ThroughRef`'s answer, and there is no
+    field here to put a different one in."""
+    r = _resolver(_semantic(ontology))
+    r.match("Customer", [0.1], "stub-v1")
+    assert not hasattr(r.engine.source.vectors, "predicate")
+    assert r.engine.source.vectors.table.predicate is None
+
+
+def test_match_ties_break_on_the_primary_key(ontology):
+    r = _resolver(_semantic(ontology))
+    r.match("Customer", [0.1], "stub-v1")
+    assert r.engine.source.order_by == ("id",)
+
+
+def test_match_pages_like_every_other_read(ontology):
+    """Including the bound: a ranked read reaches `_page_size` by the same door, so asking for more
+    than the maximum is the refusal it is everywhere else rather than a clamp only this surface
+    would have to explain."""
+    r = _resolver(_semantic(ontology))
+    r.match("Customer", [0.1], "stub-v1")
+    assert r.engine.source.limit == DEFAULT_PAGE_SIZE
+    r.match("Customer", [0.1], "stub-v1", limit=MAX_PAGE_SIZE, offset=3)
+    assert r.engine.source.limit == MAX_PAGE_SIZE and r.engine.source.offset == 3
+    with pytest.raises(ResolverError, match=f"limit must be <= {MAX_PAGE_SIZE}"):
+        r.match("Customer", [0.1], "stub-v1", limit=9_000)
+
+
+def test_match_takes_the_same_filters_search_takes(ontology):
+    r = _resolver(_semantic(ontology))
+    r.match("Customer", [0.1], "stub-v1", {"tier": "gold"})
+    assert r.engine.source.filters == (_eq("tier", "gold"),)
+
+
+def test_match_refuses_a_filter_on_a_masked_property(typed):
+    """The same refusal `search` gets, from the same code: a ranking over a withheld value would be
+    an even better oracle for it than a filter, since it answers with a gradient.
+
+    The masked property has to be a *searchable* one for this to be the refusal that fires, because
+    `_filters` checks the spec's list before the deployment's policies — a property that was never
+    filterable is told so without a policy name being spoken. Hence `typed`, where `ltv` is declared
+    the way an author would declare it: the two other searchable properties cannot be masked at all
+    here, `name` because this variant declares it semantic and `tier` because an action writes it."""
+    ont = _semantic(typed)
+    policies = bind_policies(
+        ont, (Policy(name="hide-ltv", object_type="Customer", mask=("ltv",)),)
+    ).select(None)
+    r = _resolver(ont).governed_by(policies)
+    with pytest.raises(ResolverError, match="withheld by governance policy 'hide-ltv'"):
+        r.match("Customer", [0.1], "stub-v1", {"ltv": 5.0})
+
+
+def test_match_refuses_a_type_that_declares_nothing(ontology):
+    with pytest.raises(ResolverError, match="declares no 'semantic:' property"):
+        _resolver(ontology).match("Customer", [0.1], "stub-v1")
+
+
+def test_match_refuses_an_empty_query_vector(ontology):
+    """`{"in": []}`'s argument one plane over: a zero-width query has no distance to anything, so
+    every row would come back in key order wearing a score — an answer nobody could tell from one."""
+    with pytest.raises(ResolverError, match="empty, so it ranks nothing"):
+        _resolver(_semantic(ontology)).match("Customer", [], "stub-v1")
+
+
+def test_match_splits_the_score_from_the_object(ontology):
+    """§7's namespace rule reaching the result: the object is the spec's vocabulary and the score is
+    Loom's, so one is never inside the other."""
+    rows = [
+        {"customerId": "c1", "name": "Ada", "_loom_score": 0.9, "_loom_embedded_at": None},
+        {"customerId": "c2", "name": "Grace", "_loom_score": 0.4, "_loom_embedded_at": None},
+    ]
+    result = _resolver(_semantic(ontology), rows).match("Customer", [0.1], "stub-v1")
+    assert result.object_type == "Customer" and result.property == "name"
+    assert result.model == "stub-v1"
+    assert [m.score for m in result.matches] == [0.9, 0.4]
+    assert result.matches[0].object == {"customerId": "c1", "name": "Ada"}
+
+
+def test_embedded_as_of_is_the_oldest_stamp_among_the_rows_returned(ontology):
+    """The claim an envelope can honestly make about the page it is attached to: every object here
+    was embedded at least this recently. `loom embed` reports the sidecar-wide reading, which is the
+    operator's question rather than the caller's."""
+    old = datetime(2026, 1, 1, tzinfo=UTC)
+    new = datetime(2026, 8, 1, tzinfo=UTC)
+    rows = [
+        {"customerId": "c1", "_loom_score": 0.9, "_loom_embedded_at": new},
+        {"customerId": "c2", "_loom_score": 0.4, "_loom_embedded_at": old},
+    ]
+    result = _resolver(_semantic(ontology), rows).match("Customer", [0.1], "stub-v1")
+    assert result.embedded_as_of == old
+
+
+def test_a_property_named_like_the_score_does_not_collide_with_it(ontology):
+    """Nothing stops a spec declaring `_loom_score`, and the engine hands rows back keyed by output
+    name — so a collision would not be an error, it would be two columns silently becoming one."""
+    obj = ontology.object_types["Customer"]
+    renamed = replace(
+        obj,
+        properties={
+            **{k: v for k, v in obj.properties.items() if k != "name"},
+            "_loom_score": replace(obj.properties["name"], name="_loom_score"),
+        },
+    )
+    ont = replace(ontology, object_types={**ontology.object_types, "Customer": renamed})
+    r = _resolver(_semantic(ont, prop="_loom_score"))
+    r.match("Customer", [0.1], "stub-v1")
+    outputs = [c.output for c in r.engine.plans[-1].columns]
+    assert r.engine.source.score_as not in {"_loom_score"}
+    assert len(outputs) == len(set(outputs))
