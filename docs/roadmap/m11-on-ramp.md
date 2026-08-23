@@ -5,7 +5,8 @@
 M9 made a batch become rows. What it did not touch is everything *before* the first load: somebody
 still writes the spec by hand against a file they are looking at, and a warehouse that needs three
 tables filled needs three commands with nothing to say which order they go in. This milestone is
-that on-ramp. It runs beside M10's open fourth slice rather than after it — the two share no code.
+that on-ramp. It ran beside M10's then-open fourth slice rather than after it — the two share no
+code, which is why the two milestones closed out of order.
 
 Four slices, in order:
 

@@ -57,6 +57,7 @@ The deterministic mapping from a spec to the tool surface, and the filter gramma
 
 - [§7.1 The filter grammar — what `search_<type>` takes](./spec/07-compilation.md#71-the-filter-grammar-what-search_type-takes)
 - [§7.2 `match_<type>` — ranking, and why it is not an operator in §7.1](./spec/07-compilation.md#72-match_type-ranking-and-why-it-is-not-an-operator-in-71)
+  - [`via` — narrowing by a linked object](./spec/07-compilation.md#via-narrowing-by-a-linked-object)
 
 ## §8 — [Worked example](./spec/08-worked-example.md)
 

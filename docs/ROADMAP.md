@@ -25,7 +25,7 @@ record it always held — the scope, the decisions made while it was built, and 
 | ✅ | [**M7** — Fully typed filters](./roadmap/m07-typed-filters.md) | `filter: {salesDate: {gte: …, lt: …}}` — operators a property's type deserves |
 | ✅ | [**M8** — `in`](./roadmap/m08-in-filter.md) | First slice: a disjunction of *values* the conjunction could already hold. `or` / `not` still open |
 | ✅ | [**M9** — Bulk ingest](./roadmap/m09-bulk-ingest.md) | `loom ingest`: a batch becomes rows, and `_loom_meta.loads` says so |
-| 🔨 | [**M10** — Semantic search](./roadmap/m10-semantic-search.md) | `semantic:`, `loom embed`, `match_<object>` — slice 4 (`via`) in progress |
+| ✅ | [**M10** — Semantic search](./roadmap/m10-semantic-search.md) | `semantic:`, `loom embed`, `match_<object>`, and `via` to rank across a link |
 | ✅ | [**M11** — The on-ramp](./roadmap/m11-on-ramp.md) | `loom infer` drafts a spec from a file; `sequences:` runs loads in order |
 | | [**Backlog**](./roadmap/backlog.md) | Spec edges from spec-v0's "Open edges", plus cross-cutting infra |
 

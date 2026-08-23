@@ -10,8 +10,8 @@ surface. Nothing here is hand-authored.
 | `objectType Customer`                | `get_customer(key)`                                     | PK type |
 |                                      | `search_customer(filter, page)`                         | `searchable` props + property types → §7.1 |
 |                                      | `list_customer(page)`                                   | pagination |
-|                                      | `match_customer(text, filter, page)` — only with `semantic:` **and** `mcp.embedding` | free text + the same `filter` → §7.2 |
-| `linkType placedBy` (+ `reverseName`)| contributes `order` / `customer` directions to `traverse(object, link, direction)` | link mapping |
+|                                      | `match_customer(text, filter, via, page)` — only with `semantic:` **and** `mcp.embedding` | free text + the same `filter` → §7.2; `via` from the declared links |
+| `linkType placedBy` (+ `reverseName`)| contributes `order` / `customer` directions to `traverse(object, link, direction)`, and a `via` key to the `match_` of each end | link mapping |
 | `action upgradeTier`                 | `run_upgrade_tier(parameters, dryRun)`                  | `parameters` → JSON Schema; `description` → tool description |
 
 Tool names are the api name in `snake_case`, for every row of that table. This one used to read
@@ -185,7 +185,8 @@ a client paging with `offset += limit` steps past everything it was not given.
 
 ```
 match_ticket(text: "the customer wanted their money back",
-             filter: { queue: logistics },     # the same grammar §7.1 defines
+             filter: { queue: logistics },        # the same grammar §7.1 defines
+             via:    { handledBy: { owner: ada } },  # …read against the type at the far end
              limit: 10, offset: 0)
 ```
 
@@ -212,6 +213,48 @@ the table at the point a type becomes one.
 `mcp.embedding` (§6.3); with no provider there is no tool, exactly as `mcp.writes: false` exposes no
 action. That is not a policy narrowing a surface: §6.1 refuses a `mask:` over a semantic property
 before the deployment starts, because no deployment gets to be the one that makes a tool disappear.
+
+### `via` — narrowing by a linked object
+
+Ranking by meaning and being unable to say *belonging to a gold-tier customer* is not most of the
+feature; it is the half nobody can use. `via` is keyed by **link name**, one key per declared link
+out of the ranked type (both directions, as `traverse` sees them), and each value is that far type's
+own §7.1 filter object:
+
+```
+via: { handledBy: { owner: ada }, tags: { label: { contains: "vip" } } }
+```
+
+**A top-level argument rather than a dotted key inside `filter`.** §7's namespace rule is one
+namespace per level of the argument tree, and the spec has *two* vocabularies here — link names and
+property names. A `handledBy.owner` key inside `filter` would put both on one level, so an ontology
+with a link and a property of the same name would have a surface that could not say which was meant.
+
+**Existential, always.** A hop keeps a near row when **at least one** object on the far end matches.
+On a to-one link that reading is invisible; on a to-many link it is a choice, and the other reading —
+*every* linked object matches — is a quantifier this grammar has no spelling for and `traverse`
+answers by handing you the rows. An empty `{}` is therefore an existence test rather than a no-op:
+*tickets that are in a queue at all*.
+
+**Each near row comes back once.** A hop is a semi-join and not a join, which matters exactly where
+it is invisible: joining would return the near object once per far row that matched — same object,
+same score — and the page would be smaller than the number on it. Deduplicating afterwards would
+work only while the projection is unique, and a §6.1 mask can remove the primary key from it.
+
+**Both ends are governed, and the far end's rows are the rows this deployment shows.** A `rows:`
+predicate on the far type withholds through the hop: a linked object you may not see is not a link
+you may follow, so `via: { handledBy: {} }` finds nothing through it. A `mask:` on a far property
+removes it from that hop's advertised schema and refuses a filter naming it — the same oracle
+refusal §6.1 makes for a filter on the ranked type, one join out, since a hop can binary-search a
+withheld value exactly as a filter can.
+
+**It narrows before the ranking**, with `filter` and with the other hops, all ANDed. One hop per
+link name; several links are several keys.
+
+`search_<type>` has no `via` and does not need one — it can already ask the question from the other
+end by traversing. The fragment exists on the ranked read because a ranking cannot be composed that
+way: a rank is over the rows that survive narrowing, and there is no *second* call that would
+recover the answer.
 
 **What comes back.**
 
@@ -249,6 +292,9 @@ the pushdown channel carries a conjunction of equality pairs — a key set has n
 way a range has none — so the vector column is materialized whole on every call, filtered or not.
 That is the floor, it grows with the embedded rows rather than with the answer, and the serve banner
 says both halves rather than the flattering one.
+
+A `via` hop adds one subquery over the far table per link named, which narrows the *arithmetic* the
+way `filter` does and does not move the floor.
 
 ---
 

@@ -15,6 +15,7 @@ from loom.query.ir import (
     Eq,
     GetByKey,
     In,
+    LinkFilter,
     Match,
     Project,
     Search,
@@ -455,3 +456,175 @@ def test_capabilities_claim_vector_search():
     """The flag a spec declaring `semantic:` demands, and the one this adapter can answer for
     because `array_cosine_similarity` is core DuckDB rather than an extension."""
     assert DuckDBEngine(catalogs={}).capabilities().vector_search is True
+
+
+# ---- via ------------------------------------------------------------------------
+#
+# The semi-join, and the two things about it only compiled SQL can show: that a hop's governance
+# predicate is *inside* its own subquery — where the roadmap predicted it would arrive for free —
+# and that the parameters still concatenate in the order the clauses appear, across a boundary that
+# did not exist before this slice.
+
+CUSTOMERS_L0 = TableRef(catalog="main", table="crm.customers", alias="l0")
+
+
+def _hop(**kwargs):
+    fields = dict(table=CUSTOMERS_L0, near_column="customer_id", far_column="id")
+    fields.update(kwargs)
+    return LinkFilter(**fields)
+
+
+def test_a_hop_compiles_to_a_semi_join(engine):
+    """`IN (SELECT …)` rather than a JOIN: a to-many hop would otherwise duplicate the near row
+    once per far row, and `DISTINCT` repairs that only when the projection is unique — which a mask
+    over the primary key removes."""
+    q = engine.compile(
+        _match(links=(_hop(filters=(Compare("==", ColumnRef("l0", "tier"), Const("gold")),)),))
+    )
+    assert (
+        '"t0"."customer_id" IN (SELECT "l0"."id" FROM "l0" '
+        'WHERE "l0"."tier" IS NOT DISTINCT FROM ?)' in q.sql
+    )
+    assert "JOIN \"l0\"" not in q.sql
+    # The vector, the guard, the hop, the page — the order the clauses appear in.
+    assert q.params == ([0.5, -0.5], "stub-v1", 2, "name", "gold", 10)
+
+
+def test_a_hop_with_no_filters_is_a_bare_existence_test(engine):
+    q = engine.compile(_match(links=(_hop(),)))
+    assert '"t0"."customer_id" IN (SELECT "l0"."id" FROM "l0")' in q.sql
+    assert q.params == ([0.5, -0.5], "stub-v1", 2, "name", 10)
+
+
+def test_a_hop_is_governed_inside_its_own_subquery(engine):
+    """The finding this slice turned on. *A `via` inherits cross-object governance for free* was
+    true of where the predicate comes from and not of where it is **placed**: `compile` ANDs every
+    `tables_of` predicate into the top-level `WHERE`, where a semi-joined alias is out of scope —
+    and the parameters concatenate slot by slot, so a clause in one slot cannot have its parameters
+    in another. Both halves fail together, and both are fixed by rendering it here."""
+    governed = replace(
+        CUSTOMERS_L0, predicate=Compare("==", ColumnRef("l0", "region"), Const("emea"))
+    )
+    q = engine.compile(_match(links=(_hop(table=governed),)))
+    # Inside the parentheses, asserted as the whole subquery rather than as "somewhere before the
+    # ORDER BY" — the top-level `WHERE` is also before the ORDER BY, which is exactly the placement
+    # this test exists to rule out.
+    assert (
+        'IN (SELECT "l0"."id" FROM "l0" WHERE "l0"."region" IS NOT DISTINCT FROM ?)' in q.sql
+    )
+    # And not a second time at the top level, which is what `scoped` buys: one clause, one parameter.
+    assert q.sql.count('"l0"."region"') == 1
+    assert q.params == ([0.5, -0.5], "stub-v1", 2, "name", "emea", 10)
+
+
+def test_a_hop_filter_and_a_hop_predicate_are_both_inside_and_in_order(engine):
+    """The caller's narrowing, then the deployment's — the order they are ANDed in the subquery is
+    the order their parameters are bound in, which is the only thing keeping them paired."""
+    governed = replace(
+        CUSTOMERS_L0, predicate=Compare("==", ColumnRef("l0", "region"), Const("emea"))
+    )
+    q = engine.compile(
+        _match(
+            links=(
+                _hop(
+                    table=governed,
+                    filters=(Compare("==", ColumnRef("l0", "tier"), Const("gold")),),
+                ),
+            )
+        )
+    )
+    assert (
+        'WHERE "l0"."tier" IS NOT DISTINCT FROM ? AND "l0"."region" IS NOT DISTINCT FROM ?' in q.sql
+    )
+    assert q.params == ([0.5, -0.5], "stub-v1", 2, "name", "gold", "emea", 10)
+
+
+def test_the_far_table_is_scanned_for_what_the_hop_reads(engine):
+    """Its join column, its filters' columns, and its policy's columns — the last of which the
+    projection never asks for, exactly as it does not on the near end."""
+    governed = replace(
+        CUSTOMERS_L0, predicate=Compare("==", ColumnRef("l0", "region"), Const("emea"))
+    )
+    q = engine.compile(
+        _match(
+            links=(
+                _hop(
+                    table=governed,
+                    filters=(Compare("==", ColumnRef("l0", "tier"), Const("gold")),),
+                ),
+            )
+        )
+    )
+    scan = {s.alias: s for s in q.scans}["l0"]
+    assert scan.table == "crm.customers"
+    assert scan.columns == ("id", "region", "tier")
+    # The caller's filter may be a pushdown hint; the policy may never be one.
+    assert scan.predicates == (("tier", "gold"),)
+
+
+def test_the_near_join_column_is_scanned_even_when_it_is_not_projected(engine):
+    """The `IN` reads it, so the scan has to carry it — the same reason a governed column is
+    scanned without being selected."""
+    q = engine.compile(_match(links=(_hop(near_column="customer_id"),)))
+    assert "customer_id" in {s.alias: s for s in q.scans}["t0"].columns
+
+
+def test_a_many_to_many_hop_joins_its_mapping_table_inside_the_subquery(engine):
+    """The mapping table changes which column the subquery *selects*: the near row's value has to
+    be found on the near side of the mapping, not on the far table's join column."""
+    through = ThroughRef(
+        table=TableRef(catalog="main", table="sales.order_customers", alias="lm0"),
+        from_column="order_id",
+        to_column="customer_id",
+    )
+    q = engine.compile(_match(links=(_hop(near_column="id", through=through),)))
+    assert (
+        '"t0"."id" IN (SELECT "lm0"."order_id" FROM "lm0" JOIN "l0" '
+        'ON "l0"."id" = "lm0"."customer_id")' in q.sql
+    )
+    scans = {s.alias: s for s in q.scans}
+    assert scans["lm0"].table == "sales.order_customers"
+    assert scans["lm0"].columns == ("customer_id", "order_id")
+
+
+def test_two_hops_are_two_independent_subqueries(engine):
+    """ANDed, each with its own alias — which is what stops two routes to one object type from
+    being one filter over both."""
+    q = engine.compile(
+        _match(
+            links=(
+                _hop(filters=(Compare("==", ColumnRef("l0", "tier"), Const("gold")),)),
+                _hop(
+                    table=replace(CUSTOMERS_L0, alias="l1"),
+                    near_column="billed_to",
+                    filters=(Contains(alias="l1", column="full_name", value="ada"),),
+                ),
+            )
+        )
+    )
+    assert '"t0"."customer_id" IN (SELECT "l0"."id"' in q.sql
+    assert '"t0"."billed_to" IN (SELECT "l1"."id"' in q.sql
+    assert q.params == ([0.5, -0.5], "stub-v1", 2, "name", "gold", "%ada%", 10)
+
+
+def test_a_hop_narrows_before_the_ranking(engine):
+    """Where every other narrowing in this node is: in the `WHERE`, ahead of the `ORDER BY`, so a
+    hop ranks fewer rows rather than re-ranking the ones it kept."""
+    q = engine.compile(_match(links=(_hop(),)))
+    assert q.sql.index("IN (SELECT") < q.sql.index("ORDER BY")
+
+
+def test_an_ungoverned_hop_reports_nothing_and_the_top_level_stays_empty(engine):
+    """The skip list is produced by the branch that renders a predicate, not assembled beside it.
+
+    A hop with no policy contributes no clause and claims no alias, so an adapter cannot end up
+    skipping a table it never governed — the one direction that would silently drop a `rows:`
+    policy. Asserted through the compiled output because `scoped` is internal: with a governed near
+    end and an ungoverned hop, exactly one governance clause survives, and it is the near one."""
+    governed_near = replace(
+        CUST, predicate=Compare("==", ColumnRef("t0", "region"), Const("emea"))
+    )
+    q = engine.compile(_match(table=governed_near, links=(_hop(),)))
+    assert 'AND "t0"."region" IS NOT DISTINCT FROM ?' in q.sql
+    assert "IN (SELECT \"l0\".\"id\" FROM \"l0\")" in q.sql  # no WHERE inside, nothing claimed
+    assert q.params == ([0.5, -0.5], "stub-v1", 2, "name", "emea", 10)
