@@ -10,6 +10,7 @@ pyiceberg is imported lazily, inside methods, so that `import loom` and a struct
 
 from __future__ import annotations
 
+import itertools
 import re
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
@@ -20,11 +21,13 @@ from typing import Any
 from .base import (
     EDIT_LOG_TABLE,
     LOAD_LOG_TABLE,
+    VECTOR_KEY_COLUMN,
     CatalogError,
     Column,
     ConcurrencyError,
     SchemaEdit,
     TableSchema,
+    vector_table,
 )
 
 _DECIMAL = re.compile(r"^decimal\((\d+),\s*(\d+)\)$")
@@ -43,14 +46,37 @@ def canonical_iceberg_type(t: object) -> str:
     return str(t).replace(" ", "")
 
 
-def iceberg_type(canonical: str):
+def iceberg_type(canonical: str, element_id: int | None = None):
     """The inverse: the type system's spelling -> a pyiceberg type object, for DDL.
 
     Only the spellings `PropType.iceberg_type()` can produce are here, plus the two the physical
-    side already tolerates on a column Loom didn't create (`float`, naive `timestamp`). Anything
-    else is a bug above this line rather than a user error, but it still gets a message that names
-    the spelling instead of a KeyError."""
+    side already tolerates on a column Loom didn't create (`float`, naive `timestamp`), plus
+    `list<float>`, which `PropType` cannot produce at all. Anything else is a bug above this line
+    rather than a user error, but it still gets a message that names the spelling instead of a
+    KeyError.
+
+    **`list<float>` is here without being in `ALL_KINDS`, and that gap is deliberate.** No property
+    may declare it — spec §2's kinds are unchanged, and a spec that could say `type: list<float>`
+    would be a spec that can hand Loom a vector, which is the whole thing `semantic:` exists not to
+    be. It is reachable only from `embed.store`'s column list, for a table in `_loom_meta` no spec
+    names. The type system stays the set of things an *ontology* can say; this function is the set of
+    things *Loom* can create, and this milestone is the first time those differ.
+
+    `element_id` is required for the list and refused for everything else. Iceberg gives every
+    nested field an id of its own out of the same space as the top-level ones, so the caller
+    allocating ids is the only thing that can know which one is free — see `create_table`."""
     from pyiceberg import types as t
+
+    if canonical == "list<float>":
+        if element_id is None:  # pragma: no cover - every caller allocates one
+            raise CatalogError(
+                "'list<float>' needs an element field id — Iceberg numbers nested fields out of the "
+                "same space as top-level ones, so only the caller assigning ids knows which is free"
+            )
+        # `element_required=True`: a null *inside* a vector is not a sparse embedding, it is a
+        # corrupt one, and `array_cosine_similarity` has no answer for it. A row with no vector at
+        # all is spelled by the column being null, which the column being optional already allows.
+        return t.ListType(element_id=element_id, element_type=t.FloatType(), element_required=True)
 
     simple = {
         "string": t.StringType,
@@ -83,10 +109,10 @@ def _namespace_of(table: str) -> str:
 class PyIcebergCatalog:
     """Adapts a constructed pyiceberg catalog to every port in `base.py`.
 
-    One class implements all six because pyiceberg can do all six; that is not the same as the ports
-    being one port. What each *caller* is handed is decided by which of `writer_for` /
-    `row_writer_for` / `bulk_writer_for` / `edit_log_writer_for` / `load_log_writer_for` it asked,
-    and the type it holds is what bounds what it can do."""
+    One class implements all seven because pyiceberg can do all seven; that is not the same as the
+    ports being one port. What each *caller* is handed is decided by which of `writer_for` /
+    `row_writer_for` / `bulk_writer_for` / `edit_log_writer_for` / `load_log_writer_for` /
+    `vector_writer_for` it asked, and the type it holds is what bounds what it can do."""
 
     name: str
     _impl: Any
@@ -193,12 +219,21 @@ class PyIcebergCatalog:
         # Field ids are assigned here, densely and in declaration order, because this table has no
         # history for them to be compatible with yet. Every later change goes through
         # `alter_table`, where pyiceberg assigns the next id itself — Loom must never reuse one.
+        #
+        # Nested ids continue the same run, above every top-level one, rather than interleaving with
+        # them. That keeps this loop's "the id is the position" property true for the columns a
+        # reader can see, and it is why the element ids are allocated from a counter that starts past
+        # the last column instead of from `i`.
+        nested = itertools.count(len(columns) + 1)
         schema = Schema(
             *(
                 NestedField(
                     field_id=i,
                     name=col.name,
-                    field_type=iceberg_type(col.iceberg_type),
+                    field_type=iceberg_type(
+                        col.iceberg_type,
+                        element_id=next(nested) if col.iceberg_type.startswith("list<") else None,
+                    ),
                     required=col.required,
                 )
                 for i, col in enumerate(columns, start=1)
@@ -550,6 +585,78 @@ class PyIcebergCatalog:
         routing it through `_guarded` would let the log table's own traffic refuse the record of a
         load that already committed."""
         self._append_meta_row(LOAD_LOG_TABLE, columns, row, "record a load in")
+
+    # --- VectorWriter --------------------------------------------------------------------
+    # Many rows, keyed, in a table this class derives from an object type name. The only section
+    # here that both writes over existing rows *and* removes them — see `base.VectorWriter` for why
+    # a plane of derived data gets verbs the two record planes are permanently denied.
+
+    def ensure_vectors(self, object_type: str, columns: Sequence[Column]) -> None:
+        self._ensure_meta_table(vector_table(object_type), columns)
+
+    def merge_vectors(
+        self,
+        object_type: str,
+        columns: Sequence[Column],
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        expect_snapshot_id: int | None,
+    ) -> None:
+        """`merge_batch` against a table nobody named, keyed on the column this port defines.
+
+        The commit carries no properties, and that is the difference between derived data and a
+        write. `merge_batch` stamps `loom.load_id` and an actor into its snapshot because somebody
+        decided to load that batch and the record of who has to be atomic with it. Nothing was
+        decided here: a vector is a function of text that is already in the lake, and the honest
+        answer to *who wrote this* is the same reconcile that would write it again from scratch."""
+        if not rows:
+            return
+        table = vector_table(object_type)
+        self._ensure_meta_table(table, columns)
+        with self._guarded(table, expect_snapshot_id, "merge vectors into") as (tbl, txn):
+            txn.overwrite(
+                self._batch(tbl, rows),
+                overwrite_filter=self._keys_filter(VECTOR_KEY_COLUMN, [r.get(VECTOR_KEY_COLUMN) for r in rows]),
+            )
+
+    def delete_vectors(self, object_type: str, keys: Sequence[Any]) -> None:
+        """The equality-delete half of a merge, with nothing appended after it.
+
+        Deliberately not routed through `_guarded` — `append_batch`'s posture, arrived at from the
+        other direction. There the caller read nothing; here the caller read nothing *its correctness
+        depends on*, and an assertion would let a concurrent reconcile refuse an erasure.
+
+        An empty `keys` returns without opening a transaction rather than deleting nothing, because
+        `_keys_filter` renders it as `AlwaysFalse` and a commit that provably changes no row is a
+        snapshot in the history saying an erasure happened. There was no erasure."""
+        if not keys:
+            return
+        table = vector_table(object_type)
+        try:
+            # `self._impl` rather than `self.table_exists`, which is the read port's *existence
+            # check* and swallows every exception to answer False. That is right for a probe and
+            # catastrophic here: an unreachable metastore would read as "no sidecar", this would
+            # return quietly, and the delete action that called it would report `applied` over a
+            # vector that still exists. The one verb whose failure must be loud cannot be built on
+            # the one method that cannot fail.
+            present = bool(self._impl.table_exists(table))
+        except Exception as e:
+            raise CatalogError(
+                f"could not determine whether '{table}' exists in catalog '{self.name}', so the "
+                f"vectors it may hold cannot be shown to be gone: {e}"
+            ) from e
+        if not present:
+            # Nothing was ever embedded for this type, so there is nothing to prune. Creating the
+            # sidecar in order to delete from it would make a read-only reconcile write DDL.
+            return
+        tbl = self._load(table)
+        try:
+            tbl.delete(delete_filter=self._keys_filter(VECTOR_KEY_COLUMN, list(keys)))
+        except Exception as e:
+            raise CatalogError(
+                f"could not delete {len(keys)} vector(s) from '{table}' in catalog "
+                f"'{self.name}': {e}"
+            ) from e
 
     # --- shared by both log ports --------------------------------------------------------
 

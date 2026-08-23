@@ -5,9 +5,10 @@ canonical spelling `PropType.iceberg_type()` produces, so physical validation is
 comparison against the type system's own output and nothing above this port needs pyiceberg
 imported to reason about types.
 
-**Six ports, four planes, and no supersets.** `Catalog` reads. `CatalogWriter` changes a table's
+**Seven ports, five planes, and no supersets.** `Catalog` reads. `CatalogWriter` changes a table's
 *shape*. `RowWriter` changes one of a table's *rows*, keyed. `BulkWriter` changes *many* of them at
-once. `EditLogWriter` and `LoadLogWriter` append to *Loom's own record*. The read path — the
+once. `EditLogWriter` and `LoadLogWriter` append to *Loom's own record*. `VectorWriter` maintains
+*Loom's own derived data*. The read path — the
 resolver, the query engines, `loom serve` — is handed a `Catalog` and cannot write at all. `loom
 apply` asks for a `CatalogWriter` and therefore cannot delete a row: the port has no verb for it. The
 action runtime asks for a `RowWriter` and therefore cannot alter a schema, for the same reason. No
@@ -37,9 +38,26 @@ would be one a caller could point at the other log — or at anything else in `_
 the whole of what the shape buys. Two ports whose verbs are named differently are two capabilities a
 structural check can tell apart; one port used twice is not.
 
+**`VectorWriter` is the seventh, and it is the first that opens a plane rather than re-cutting one.**
+The two logs write *records of what happened*: append-only, never read back by Loom, and permanently
+without a delete verb because an expired record and a lost one are the same sight. A vector is not a
+record. It is **derived data about a row that exists now** — it goes stale when the row's text
+changes, it is meaningless once the row is gone, and keeping it correct therefore needs the two verbs
+the log ports refuse: an upsert and a delete. Handing that plane to `BulkWriter` was the alternative,
+and it fails on the property `_loom_meta` has always had: `BulkWriter` takes a table name, so a
+runtime holding one to maintain a sidecar could point it at the ontology's own tables.
+
+So this port keeps the guarantee the log ports make — *the table is not an argument* — while writing
+many tables. Its verbs take an **object type name** and derive the table themselves, which is why
+`vector_table()` lives here beside `EDIT_LOG_TABLE`: a reader of this module is looking at the whole
+of what a `VectorWriter` can reach, and it is `_loom_meta.vectors__*` and nothing else. The sidecar is
+one table per type rather than one global table because the `key` column is a *join* column, and a
+type whose primary key is a `long` should not have it string-encoded and cast back on every ranked
+query.
+
 Asking is explicit in every case: `writer_for()` / `row_writer_for()` / `bulk_writer_for()` /
-`edit_log_writer_for()` / `load_log_writer_for()` fail loudly, naming the catalog, against a backend
-that doesn't implement what was asked for.
+`edit_log_writer_for()` / `load_log_writer_for()` / `vector_writer_for()` fail loudly, naming the
+catalog, against a backend that doesn't implement what was asked for.
 """
 
 from __future__ import annotations
@@ -559,6 +577,111 @@ class LoadLogWriter(Protocol):
         ...
 
 
+VECTOR_KEY_COLUMN = "key"
+"""The column every sidecar is keyed and merged on, defined by the port rather than by its caller.
+
+Unlike `columns`, which is the caller's decision because the schema varies per type, this cannot be:
+the two writing verbs below take no key argument, so a caller that could rename this could point a
+merge at a column that is not the key and turn an upsert into a duplicate."""
+
+
+VECTOR_TABLE_PREFIX = "_loom_meta.vectors__"
+"""The namespace and name-stem of every table a `VectorWriter` can reach.
+
+Named here for `EDIT_LOG_TABLE`'s reason, and it is doing more work than that constant is: `edits` is
+one table, so naming it here makes the port's reach *visible*. This is a family, so naming the stem
+here is what makes the reach **bounded** — no verb below takes a table, and `vector_table` is the only
+function that produces one."""
+
+
+def vector_table(object_type: str) -> str:
+    """`Order` -> `_loom_meta.vectors__Order`. The sidecar of one object type.
+
+    A `__` separator rather than a `.` because the second would put every type in a namespace of its
+    own, and `_loom_meta` is one namespace Loom creates and owns. It is also why this is a function
+    rather than an f-string at three call sites: the name is a fact about the port, and a caller that
+    can spell it itself is a caller that can spell something else."""
+    return f"{VECTOR_TABLE_PREFIX}{object_type}"
+
+
+@runtime_checkable
+class VectorWriter(Protocol):
+    """Loom's own derived data — one sidecar per object type, none of them named by the caller.
+
+    **The two verbs the log ports refuse, and why they are safe here.** `EditLogWriter` has no delete
+    verb permanently, because a record that can be removed makes an expired edit and a lost one the
+    same sight. Nothing about that argument reaches a vector: a vector asserts nothing about the past,
+    it *describes a row that exists*, and a stale one is not evidence of anything — it is a wrong
+    answer waiting to be returned. So `merge_vectors` overwrites and `delete_vectors` removes, and the
+    absence of either would be the defect rather than the safeguard.
+
+    `delete_vectors` is additionally the one path by which text Loom derived from a row stops being
+    recoverable, which is a heavier job than pruning an orphan. See `embed.store` for the lag that
+    leaves and who is on the hook for it.
+
+    **Every verb takes an object type, never a table.** That is `EditLogWriter`'s guarantee held
+    across a family of tables — see the module docstring — and it is the reason this is a port rather
+    than a `BulkWriter` the embed runtime happens to point at `_loom_meta`.
+
+    **`columns` comes from the caller**, as it does for both logs: the sidecar's schema is a decision
+    that belongs above the port, and it varies per type anyway, since `key` takes the type's own
+    primary-key type. The port stays stateless and never learns what a Loom vector row contains.
+
+    **`merge_vectors` asserts a snapshot and `delete_vectors` has no parameter for one**, which is
+    `BulkWriter`'s split — `merge_batch` checks, `append_batch` has no argument to check with — and
+    it lands here for the same reason plus a sharper one.
+
+    M3's rule is *a caller that genuinely has no expectation has not read anything*. A merge follows
+    a read: the embed runtime decided **which** vectors to write by diffing this table against the
+    object's, so it holds a real expectation and two concurrent reconciles must not interleave. A
+    sidecar that does not exist yet is `None`, which asserts *there is no snapshot* and is the honest
+    expectation for a table created a moment ago.
+
+    A delete follows no such read. Removing a key is idempotent and commutes with every change to
+    every other key, so an assertion would protect nothing — and it would do active harm in the one
+    caller that matters most: an action deleting a row prunes that row's vector and **fails if it
+    cannot**, so a check here would let a concurrent `loom embed` refuse an erasure. That is exactly
+    backwards. The parameter is therefore absent rather than optional, so no caller can supply one
+    and no implementation can pretend to honour it.
+    """
+
+    name: str
+
+    def ensure_vectors(self, object_type: str, columns: Sequence[Column]) -> None:
+        """Create this type's sidecar with `columns` if it is not there. Idempotent.
+
+        `ensure_log`'s twin, and it exists for a second reason beyond proving a permission: the
+        writing verbs below assert a snapshot, and there is no snapshot to read from a table that
+        does not exist. Creating it first is what makes `None` mean *empty* rather than *absent*."""
+        ...
+
+    def merge_vectors(
+        self,
+        object_type: str,
+        columns: Sequence[Column],
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        expect_snapshot_id: int | None,
+    ) -> None:
+        """Upsert `rows` into this type's sidecar on `key`, as one commit.
+
+        Each row must be complete — `merge_batch`'s requirement, for its reason: a merge is an
+        equality-delete plus an append, so a column left out is nulled rather than preserved. Here
+        the caller always has every column, because every one of them is derived in the same breath
+        as the vector."""
+        ...
+
+    def delete_vectors(self, object_type: str, keys: Sequence[Any]) -> None:
+        """Remove the rows of this type's sidecar with these keys, as one commit.
+
+        Keyed and enumerated rather than predicated: there is no filter argument, so the widest thing
+        this can express is *these keys*, and emptying a sidecar means naming every row in it. The
+        one verb in Loom that removes derived data, and the erasure slice's entry point.
+
+        Unconditional — see the class docstring for why this one has no snapshot to assert."""
+        ...
+
+
 def writer_for(catalog: Catalog) -> CatalogWriter:
     """Exchange a read handle for one that can change a table's shape. `loom apply` asks."""
     return _port_for(catalog, CatalogWriter, "schema writes", "'loom apply' to execute against")
@@ -596,6 +719,13 @@ def load_log_writer_for(catalog: Catalog) -> LoadLogWriter:
     """Exchange a read handle for one that can append to Loom's record of ingests. Ingest asks."""
     return _port_for(
         catalog, LoadLogWriter, "load-log writes", "an ingest to record what it loaded in"
+    )
+
+
+def vector_writer_for(catalog: Catalog) -> VectorWriter:
+    """Exchange a read handle for one that can maintain Loom's vector sidecars. `loom embed` asks."""
+    return _port_for(
+        catalog, VectorWriter, "vector sidecar writes", "'loom embed' to reconcile vectors in"
     )
 
 
