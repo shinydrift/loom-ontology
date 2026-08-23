@@ -89,7 +89,10 @@ _PAGE_SCHEMA = {
         "type": "integer",
         "minimum": 1,
         "maximum": MAX_PAGE_SIZE,
-        "description": f"max rows to return (default {DEFAULT_PAGE_SIZE}, hard cap {MAX_PAGE_SIZE})",
+        # `maximum` is enforced by `Resolver._page_size` and not only advertised here — a larger
+        # number is refused rather than quietly clamped, so the `limit` in a page envelope below is
+        # always the page size the caller actually got.
+        "description": f"max rows to return (default {DEFAULT_PAGE_SIZE}, maximum {MAX_PAGE_SIZE})",
     },
     "offset": {"type": "integer", "minimum": 0, "description": "rows to skip, for paging"},
 }
@@ -352,13 +355,19 @@ def _paged(args: dict, count: int) -> dict:
 
     One function rather than three copies, which is what stops `hasMore` from being computed against
     a different cap in one of them: an agent has no other way to tell "that's everything" from "the
-    page filled up", so the three surfaces that page must agree about when it is true."""
+    page filled up", so the three surfaces that page must agree about when it is true.
+
+    `hasMore` compares against the caller's own number because that number is now either the page
+    size or an error — `Resolver._page_size` refuses a `limit` above `MAX_PAGE_SIZE` rather than
+    clamping to it. While it clamped, this key was `count == min(limit, MAX_PAGE_SIZE)` and `limit`
+    beside it echoed what the caller asked for, so an envelope could report a page that was never
+    served and a client paging with `offset += limit` stepped past everything in between."""
     limit = args.get("limit") or DEFAULT_PAGE_SIZE
     return {
         "count": count,
         "limit": limit,
         "offset": args.get("offset", 0),
-        "hasMore": count == min(limit, MAX_PAGE_SIZE),
+        "hasMore": count == limit,
     }
 
 

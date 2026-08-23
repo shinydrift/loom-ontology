@@ -234,6 +234,34 @@ def test_a_substring_value_is_coerced_like_every_other_value(ontology, customer)
     assert _lower(ontology, customer, "name", 3) == (Contains("t0", "full_name", "3"),)
 
 
+def test_a_container_where_a_value_goes_is_refused_rather_than_stringified(ontology, customer):
+    """The third refusal, and the one that reads as an empty answer instead of a full one.
+
+    `str()` obliged a JSON object with a Python repr — `"{'deep': 1}"` — which no row holds, so a
+    malformed argument came back as `0 rows` and no error. The scalar coercion above is what makes
+    that possible and is deliberately kept: a container is not mistyped, it is unreadable."""
+    with pytest.raises(FilterError, match="cannot read an object as string"):
+        _lower(ontology, customer, "name", {"eq": {"deep": 1}})
+    with pytest.raises(FilterError, match="cannot read a list as string"):
+        _lower(ontology, customer, "name", ["a"])
+    with pytest.raises(FilterError, match="cannot read a list as string"):
+        _lower(ontology, customer, "name", {"contains": ["a"]})
+
+
+def test_a_container_inside_in_names_the_element_that_was_one(ontology, customer):
+    with pytest.raises(FilterError, match=r"filter 'tier.in\[1\]': cannot read an object as enum"):
+        _lower(ontology, customer, "tier", {"in": ["gold", {"deep": 1}]})
+
+
+def test_the_refusals_point_at_the_spelling_that_works(ontology, customer):
+    """Both name the thing to write instead, because both are shapes an agent reaches by accident:
+    an operator object one level too deep, and a list where `in` was meant."""
+    with pytest.raises(FilterError, match=r'\{"name": \{"eq": \.\.\.\}\}'):
+        _lower(ontology, customer, "name", {"eq": {"deep": 1}})
+    with pytest.raises(FilterError, match=r'\{"name": \{"in": \[\.\.\.\]\}\}'):
+        _lower(ontology, customer, "name", ["a"])
+
+
 # ---- what may become advisory --------------------------------------------------
 
 

@@ -473,19 +473,50 @@ class Resolver:
         )
 
     def _filters(self, obj: ObjectType, filters: Mapping[str, Any]) -> tuple[Comparison, ...]:
-        """A caller's `filter` argument as comparison nodes — governance first, grammar second.
+        """A caller's `filter` argument as comparison nodes — the spec, then governance, then grammar.
 
-        The split is the layering: *which properties may be filtered at all* is this deployment's
-        question and belongs to a policy, while *what may be said about one* is the grammar's and
-        lives in `filters.py`, where the surface reads the same answer to build its schema. A
-        governed property is refused before its value is even parsed, so no refusal can be a
-        function of what a caller guessed the value might be."""
+        The split is the layering: *which properties may be filtered at all* is answered twice, by
+        the spec's `searchable` list and then by this deployment's policies, while *what may be said
+        about one* is the grammar's question and lives in `filters.py`, where the surface reads the
+        same answer to build its schema. A governed property is refused before its value is even
+        parsed, so no refusal can be a function of what a caller guessed the value might be.
+
+        **`searchable` is checked here and not only at the surface.** It used to be enforced by
+        the surface alone — `_filterable` builds both read tools' `filter` schemas from the list, so
+        the ranked read inherited the same hole — and a caller who ignored the advertised schema
+        could filter on any declared property, leaving `filter`'s `additionalProperties: false` an
+        announcement nothing made true. §2 rule 6 is the
+        narrower claim: *a property still has to be listed here to be filterable at all*. The one
+        thing the list already gated at this level was `contains` (`filters.operators`), which is
+        why the refusal below borrows that one's words.
+
+        It is checked *before* the mask, so a deployment's policy names are never mentioned for a
+        property that was never filterable in the first place — a mask on a searchable property
+        still gets the oracle refusal, which is the case that argument was written for."""
+        if not isinstance(filters, Mapping):
+            # The shape, before the contents. `Resolver.search` is reached from a tool call whose
+            # arguments are whatever JSON arrived, and a `filter` that is not an object used to
+            # reach `.items()` and come back as a raw AttributeError — the same defect the surface
+            # fixed one level up when a missing argument surfaced as `KeyError: 'key'`.
+            got = "null" if filters is None else type(filters).__name__
+            raise ResolverError(
+                f"'filter' takes an object of property filters, got {got} — write "
+                f'{{"filter": {{"{next(iter(obj.searchable), "property")}": ...}}}}'
+            )
         out: list[Comparison] = []
         for name, value in filters.items():
             prop = obj.properties.get(name)
             if prop is None:
                 known = ", ".join(obj.properties) or "none"
                 raise ResolverError(f"'{obj.api_name}' has no property '{name}' (known: {known})")
+            if name not in obj.searchable:
+                available = ", ".join(obj.searchable)
+                raise ResolverError(
+                    f"'{obj.api_name}.{name}' is not declared searchable, so it cannot be filtered "
+                    "on — 'searchable' is what decides a property is filterable at all. Add "
+                    f"'{name}' to this objectType's 'searchable' list, or filter on: "
+                    + (available or "nothing, since this objectType declares none")
+                )
             policy = self.policies.masked_by(obj.api_name, name)
             if policy is not None:
                 # A refusal rather than an empty result, and the difference is the whole point: a
@@ -523,12 +554,25 @@ class Resolver:
     @staticmethod
     def _page_size(limit: int | None) -> int:
         """Always bounded. An unbounded read is a way for one tool call to pull a whole table
-        into an agent's context, so there is no way to ask for one."""
+        into an agent's context, so there is no way to ask for one.
+
+        **Refused rather than clamped, and both bounds the same way.** This used to answer a limit
+        above the cap with `min(limit, MAX_PAGE_SIZE)`, which reads like generosity and is a silent
+        narrowing: the page an agent got back was 500 rows while the envelope echoed the number it
+        asked for, so a client paging with `offset += limit` stepped past everything it had not
+        been given. The lower bound was already a refusal, and enforcing one bound while quietly
+        rewriting the other is what made the two disagree. Now the number a caller sends is either
+        the page size or an error, and the envelope cannot report a size that was not used."""
         if limit is None:
             return DEFAULT_PAGE_SIZE
         if limit < 1:
             raise ResolverError(f"limit must be >= 1, got {limit}")
-        return min(limit, MAX_PAGE_SIZE)
+        if limit > MAX_PAGE_SIZE:
+            raise ResolverError(
+                f"limit must be <= {MAX_PAGE_SIZE}, got {limit} — {MAX_PAGE_SIZE} is the largest "
+                "page this surface serves. Ask for that many and page with 'offset'"
+            )
+        return limit
 
     @staticmethod
     def _offset(offset: int) -> int:

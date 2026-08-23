@@ -25,10 +25,18 @@ from loom import build
 from loom.action import APPLIED, CONFLICT, PREVIEWED, REFUSED, UNKNOWN_ACTOR, ActionRuntime
 from loom.catalog.base import CatalogError, writer_for
 from loom.config import LoomConfig, McpConfig
-from loom.mcp.registry import DRY_RUN_ARG, PARAMETERS_ARG, RESERVED_RUN_ARGS, build_tools, json_safe, snake_case
+from loom.mcp.registry import (
+    DRY_RUN_ARG,
+    PARAMETERS_ARG,
+    RESERVED_RUN_ARGS,
+    TEXT_ARG,
+    build_tools,
+    json_safe,
+    snake_case,
+)
 from loom.mcp.server import LoomMCPServer, build_mcp_server, build_server
 from loom.query.engine import Capabilities, CompiledQuery
-from loom.resolver import MAX_PAGE_SIZE, Resolver
+from loom.resolver import MAX_PAGE_SIZE, Resolver, ResolverError
 
 # The runtime's fakes, not a second pair of them: a fake catalog defined twice is two answers to
 # "what does a catalog do", and the interesting assertions below are about the *same* object the
@@ -233,6 +241,39 @@ def test_search_exposes_only_declared_searchable_properties(ontology):
     """`ltv` is a real property but not searchable, so it is not part of the query surface."""
     props = _tools(ontology)["search_customer"].input_schema["properties"]["filter"]["properties"]
     assert set(props) == {"name", "tier"}
+
+
+def test_the_advertised_filter_properties_are_exactly_the_ones_accepted(ontology):
+    """The agreement the schema above only *claimed* until a live client tested it.
+
+    `filter` carries `additionalProperties: false` over a property set built from `searchable`,
+    while the resolver accepted any declared property — so `ltv` filtered fine through a tool that
+    never offered it, and the one row `{"ltv": {"eq": null}}` selects was reachable only by ignoring
+    the schema. Announcement and enforcement are asserted here against the same tool, in both
+    directions, because that is the pair that drifted."""
+    tool = _tools(ontology)["search_customer"]
+    advertised = set(tool.input_schema["properties"]["filter"]["properties"])
+
+    for name in advertised:
+        assert tool.handler({"filter": {name: "gold" if name == "tier" else "x"}})["objectType"]
+
+    declared = set(ontology.object_types["Customer"].properties)
+    for name in declared - advertised:
+        with pytest.raises(ResolverError, match="is not declared searchable"):
+            tool.handler({"filter": {name: "x"}})
+
+
+def test_the_ranked_read_is_held_to_the_same_agreement(ontology):
+    """`match_` is the fourth read shape and it advertises `filter` from the same `_filterable`, so
+    the pair that drifted for `search_` is a pair here too — and one door further from the schema,
+    since a ranking answers a withheld value with a gradient rather than a bit."""
+    tool = _everything(ontology)["match_customer"]
+    advertised = set(tool.input_schema["properties"]["filter"]["properties"])
+    assert advertised == set(_tools(ontology)["search_customer"].input_schema["properties"]["filter"]["properties"])
+
+    for name in set(ontology.object_types["Customer"].properties) - advertised:
+        with pytest.raises(ResolverError, match="is not declared searchable"):
+            tool.handler({TEXT_ARG: "a question", "filter": {name: "x"}})
 
 
 def test_descriptions_come_from_the_spec(ontology):

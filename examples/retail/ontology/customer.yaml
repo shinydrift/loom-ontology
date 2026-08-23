@@ -15,4 +15,11 @@ objectType:
     # otherwise read like a filter and be none.
     - { name: tier,       type: enum, values: [bronze, silver, gold, closed], column: tier }
     - { name: ltv,        type: double, column: lifetime_value, nullable: true }
-  searchable: [name, tier]
+  # `ltv` is here because the list is what makes a property filterable at all (§2 rule 6), and two
+  # things this example claims need it to be. It is the only nullable property in the warehouse, so
+  # it is the only one that can show `{"eq": null}` selecting a row and an ordering comparison *not*
+  # selecting it. And the `hide-ltv` policy the dashboard walks you through withholds it — a mask
+  # refuses a filter on the property it hides, which is a refusal you can only see for a property
+  # that would otherwise be filterable. Before typed filters this list could hold strings and enums
+  # only, which is why a double could not be named here.
+  searchable: [name, tier, ltv]
