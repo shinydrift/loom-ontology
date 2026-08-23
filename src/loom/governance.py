@@ -703,7 +703,7 @@ def bind_policies(
     Every problem at once rather than the first, for `check_capabilities`' reason: an operator
     reconciling a policy file with a spec should learn the whole of what disagrees in one reading.
 
-    Four things a mask cannot withhold, and none of them is a limitation of the implementation:
+    Five things a mask cannot withhold, and none of them is a limitation of the implementation:
 
     - a property no object type declares, or a type the spec has never heard of — a policy that
       protects a misspelling protects nothing, and a mask is exactly the config whose typo is
@@ -716,9 +716,16 @@ def bind_policies(
     - a property a **link** joins on, whose value is the link's whole meaning;
     - a property an **action** reads in a rule or writes in an effect — see the module docstring.
       This is the one refusal that is about a combination rather than a declaration: the spec is
-      fine and the policy is fine, and it is the deployment of the two together that cannot stand.
+      fine and the policy is fine, and it is the deployment of the two together that cannot stand;
+    - the **semantic** property, for a sharper version of the same argument this module already
+      makes about filtering on a mask. Filtering was refused because a caller who can filter on a
+      withheld value binary-searches it; a *ranking* hands back how near each row came, so the
+      probe returns a gradient instead of a bit and converges faster than the search it replaces.
+      A combination refusal like the action one, and the reason it is not simply "withhold the tool
+      too" is that a tool is derived from the spec (§7) and this deployment cannot be the one that
+      makes it disappear.
 
-    **All four are checked as though every policy always applies, and conditionality changes
+    **All five are checked as though every policy always applies, and conditionality changes
     nothing here** — which costs nothing, because a mask may not carry `when:` at all. They are mask
     refusals about a *spec*, and a spec does not vary per caller; checking them per caller would be a
     deployment that starts and then fails for one caller, which is the shape "refuse rather than
@@ -774,6 +781,16 @@ def bind_policies(
                     f"{', '.join(touching)}. A rule that reads a withheld property is an oracle the "
                     "caller drives, and an effect that writes one changes data this deployment says "
                     "the caller may not see. Withhold the property or expose the action, not both"
+                )
+                continue
+            if name == obj.semantic:
+                problems.append(
+                    f"policy '{policy.name}' masks '{obj.api_name}.{name}', which the spec declares "
+                    "as its semantic property — a ranking over a withheld value is an oracle for it, "
+                    "and a sharper one than a filter: a filter answers whether a row matches, a "
+                    "ranking answers how close it came, so a caller probing with text reads the "
+                    "gradient rather than a bit. Withhold the property or declare it semantic, not "
+                    "both"
                 )
                 continue
             masks.setdefault(obj.api_name, {}).setdefault(name, policy.name)

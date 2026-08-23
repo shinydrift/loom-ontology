@@ -1605,6 +1605,200 @@ range-pushdown backlog entry describes.
 
 ---
 
+## 🔨 M10: Semantic search — a column searched by meaning
+
+*Goal: the question `contains` cannot be asked.*
+
+`search_<type>` finds rows that **say** a word. An agent asked *which orders had a payment dispute?*
+gets nothing for "sent the money back", "chargeback", "customer wanted out" — the answer is in the
+text and the caller's words are not the data's words. Every other lever in the surface is exact by
+construction, which is why this needs a plane of its own rather than another operator: §7.1's
+filters are **predicates**, each deciding a row true or false with `order_by` pinned to the primary
+key, and a similarity clause decides nothing. It **ranks**. Putting one in `filter:` would introduce
+`k` and an ordering into a grammar that has neither, and `{similar} AND {tier: gold}` would have two
+different answers — rank-then-filter and filter-then-rank — with nothing in the grammar to choose
+between them.
+
+That is the same shape as M8's correction, arrived at before the mistake instead of after: right
+about the word (*it filters the result set*), wrong about the shape.
+
+### The four slices
+
+- [x] **1 — the grammar, and every refusal it owes.** `semantic:` in the loader, `mcp.embedding` in
+      the config, `vector_search` in `NEGOTIATED`, the fifth mask refusal. No vector, no table, no
+      tool. Grammar before plane, the way M5 went.
+- [ ] **2 — `EmbeddingProvider`, the sidecar, and `loom embed`.** Loom's first model dependency, and
+      where staleness is defined.
+- [ ] **3 — `match_<object>`.** The tool, the brute-force lowering, the result envelope.
+- [ ] **4 — `via`.** Cross-object filtering, without which the interesting queries are not
+      expressible. **M10 closes here, and there is no partial ship**: slices 1–3 generate a tool
+      that can rank orders by meaning and cannot say *belonging to a gold-tier customer*, which is
+      the query anyone actually has.
+
+### Decided before any of it was built
+
+- **A tool per object type, not an operator in the filter grammar** — see above. `match_<object>`,
+  because `search` is a word already spent on rows; the same discipline as `filters.py`'s note that
+  `contains` is spent.
+
+- **One semantic property per type, and the key is a *name* rather than a list.** `primaryKey` and
+  `title` are the precedent: a list is what `searchable` is because it is genuinely many. Refusing
+  a two-element list would be a rule somebody has to be told about, for a spec nobody can write.
+  Going plural later widens the key to accept both, which is additive.
+
+- **Only a `string` may be embedded**, which is *narrower* than `searchable` and reverses M7's
+  direction deliberately. M7 widened `searchable` to every scalar because every scalar has
+  comparisons worth offering; the opposite holds here. An ordered type already has an order, so
+  `gte` says exactly what a similarity score would approximate, and an `enum` is a closed set that
+  `eq`/`in` answer exactly. Embedding either buys a fuzzy answer to a question with a precise one.
+
+- **`vector_search` is negotiated — the first flag this module's rule has let through.** Three were
+  refused before it and all three for one reason: nothing could fail them. `range_comparisons` was a
+  floor because every dialect that can say `WHERE c = ?` can say `WHERE c >= ?`. There is no
+  comparable implication for vector distance: ranking needs a fixed-width array type and arithmetic
+  over it, which a dialect can be a complete SQL engine without. Both halves of the test hold — a
+  spec demands it by declaring `semantic:`, an adapter fails it by not having array math.
+
+  It is demanded by the **spec**, not by the deployment that configures a provider. An ontology
+  whose engine has no array arithmetic describes a surface that engine could never serve, and
+  finding that out only in the deployments that switch embedding on would make the refusal a
+  property of a config file rather than of the pairing `negotiate.py` exists to check.
+
+- **`Capabilities.vector_search` defaults `false`**, unlike the three above it, and the asymmetry is
+  what a default *asserts*. Those three are floors, so defaulting them true describes almost every
+  adapter correctly. This one is not implied by being able to filter, so an adapter claims it or it
+  does not have it — and a fourth adapter that says nothing is described correctly rather than
+  optimistically.
+
+- **The spec declares intent, the deployment declares mechanism.** `semantic: notes` is true of the
+  model wherever it runs; `provider`/`model` is true of one deployment. A spec can no more demand
+  `text-embedding-3` than it can demand a transport.
+
+- **Absent `mcp.embedding` withholds a tool; it does not refuse to start.** The distinction from
+  `check_capabilities` is worth stating because the two look alike. Negotiation asks *could this
+  engine ever serve what this spec describes* — a spec's own claim, so a mismatch is a contradiction.
+  This asks *does this deployment switch it on*, and a deployment configuring no provider is not
+  describing a contradiction; it is one of the deployments that reads without embedding, exactly as
+  `writes: false` serves without actions.
+
+- **`model` is required and `dims` is not a key.** Both are the same failure avoided twice. The model
+  is folded into every stored vector's hash, so a *default* Loom could change in a later release
+  would silently invalidate every vector in every warehouse that took it. And `dims` is a property
+  of the model, so declaring it beside the model name is a chance to declare it wrong — vectors of
+  the declared width get written, ranked against each other, and mean nothing. Neither failure is an
+  error; both are a ranking that quietly stops meaning anything, which is why the answer is to not
+  let the file say it.
+
+- **`provider: local` by default.** No row's text leaves the machine unless a deployment says so —
+  the loopback-bind posture, applied to a different wire. The provider set is enumerated rather than
+  free-form so the places a lake's text can be sent to are something `loom.yaml` lists.
+
+### The fifth thing a mask cannot withhold
+
+A mask over the semantic property is refused at bind time, beside the other four. It is the
+combination shape the action refusal already has — the spec is fine, the policy is fine, and their
+deployment together cannot stand — and it sharpens an argument `governance.py` already makes.
+Filtering on a masked property was refused because a caller who can filter on a withheld value
+binary-searches it a bit at a time. A **ranking** hands back how *near* each row came, so the same
+probe returns a gradient rather than a bit and converges faster than the search it replaces.
+
+The reason it is not simply *withhold the tool as well* is §7: a tool is derived from the spec, and
+no deployment gets to be the one that makes one disappear.
+
+### Settled for the slices that have not been built
+
+Recorded here because each was decided against a real alternative, and a decision nobody wrote down
+gets re-litigated by whoever builds it.
+
+- **Vectors live in a Loom-managed sidecar, one table per object type**, under `_loom_meta` beside
+  `applied`, `edits` and `loads`. Not a column in the object's own table, for three reasons that
+  compound: `ALL_KINDS` has no `array`, so it cannot be a declared property at all until complex
+  types land; as an *unmanaged* column it would make `loom plan` report Loom's own data as somebody
+  else's, permanently; and `ActionRuntime._read` carries unmapped columns across a modify, so a
+  `run_` that changes the embedded text would write the **old vector back beside it in the same
+  commit** — internally consistent by construction, with nothing to compare, which is the one kind
+  of staleness that cannot be detected. Per type rather than one global table because the key is a
+  *join* column and a string-encoded primary key would need a cast on every call.
+
+  This is the migrate layer's posture applied one level down: *this table is not mine*.
+
+- **`source_hash` covers the model, not just the text.** `hash(text ‖ model ‖ dims)`, so changing
+  provider invalidates everything by construction rather than by anyone remembering to.
+
+- **The sidecar holds only facts about the row it is keyed to.** No source text — that is a governed
+  copy outside the table governance is written against, and `forgetCustomer` would gain a second
+  place to reach. No denormalised link columns — they optimise the join, but the cost of a ranked
+  query is the distance computation over the survivors, and they buy a staleness axis `source_hash`
+  structurally cannot see (one customer changing tier invalidates the vector row of every order they
+  ever placed) plus a governance hole (a denormalised column is not an `ir.TableRef`, so no policy
+  rides on it). One line has now decided three questions.
+
+- **`loom embed` is the mechanism; inline is not built in v1.** "Automatic" means automatic
+  *derivation* — you never hand Loom a vector — not automatic *timing*. Embedding at query time
+  calls a model on every call; at serve time it is a boot that fans out N of them. And M9 is why
+  the reconcile cannot be optional even if inline existed: `loom ingest` writes four million rows
+  without passing the action runtime, so the write path a `run_`-time hook covers is the minority
+  of writes by a wide margin.
+
+- **Filtering is part of retrieval, and pre-filtering is a rule rather than a heuristic.** Choosing
+  per query by estimated selectivity is a query planner, and Loom does not have one. `pushdown_hints`
+  is the precedent: the hint is advisory and the `WHERE` is re-applied regardless, because an
+  optimisation is never load-bearing for correctness here.
+
+  For a governance predicate the question does not arise at all — a governed row is not filtered out
+  of the ranking, it *does not exist* for that caller, because the predicate rides on `ir.TableRef`
+  at the point a type becomes a table. Which also means `via` inherits cross-object governance for
+  free: `_table` already governs both ends of a traverse.
+
+- **No vector index in v1, and the row counts are why.** Pre-filtering means brute-forcing distances
+  over the survivors anyway, and at 10⁵ rows × ~10³ dimensions that is ~10⁸ multiply-adds — tens of
+  milliseconds in a vectorised engine. `array_cosine_similarity` is core DuckDB, so this needs no
+  extension; `vss` buys an HNSW index, which is an optimisation for the **unfiltered** case. The
+  pleasant symmetry: the hard case for an index is the one that does not need it.
+
+  The cost belongs in the banner beside the existing note about a slow query blocking the server:
+  `match_` is linear in the filtered set.
+
+- **The envelope carries `embeddedAsOf` and not a count of unembedded rows.** The count needs an
+  anti-join over the admitted set on every call, but the deciding reason is that an agent cannot
+  *act* on it — it cannot wait and it cannot trigger a reconcile, and this surface says things a
+  caller can do something about. What that gives up is real and stated: `match_` can silently omit a
+  row that exists, so the honesty moves from the caller to the operator, and the reconcile has to be
+  reliable rather than best-effort. The count goes to `loom embed`'s output and the banner.
+
+- **A model change refuses and names the flag.** Every hash mismatching at once is a model swap
+  rather than a warehouse of edits, and `loom embed` says so instead of politely re-embedding
+  everything. Deliberately unlike `loom apply`, which refuses a breaking plan with *no* force flag:
+  there no safe version of the operation exists, and here it is merely expensive and reversible.
+
+### Refused, permanently
+
+- **Blending vectors across a link** — ranking Customer by the meaning of its Orders' text, via a
+  mean of their vectors. A mean over a one-to-many denotes nothing in particular, and there is no
+  honest answer to what "similar" would then mean. Rank the object that owns the text and traverse.
+  The expansion step people build whole retrieval systems for is `traverse`, and it is already here:
+  declared, deterministic and governed.
+- **A staleness threshold that blocks a call.** Any number is a magic one.
+- **An external vector store.** A second data plane governance cannot reach.
+
+### What this leaves owing
+
+**Erasure now has three targets, and the backlog entry names two.** An embedding is not a
+fingerprint — it is a lossy, partially invertible copy, and inversion works best on exactly the
+short text worth embedding. So a row erased from its table leaves recoverable text in the sidecar.
+Not reachable through `match_`, since the join to a deleted row returns nothing, but readable by
+anyone with warehouse access, and Loom is what put it there.
+
+M10 does not build the general erasure command; it owes three small things to the slice that will.
+Slice 2's orphan prune is documented as *the* vector erasure path, with its lag stated. A `delete`
+action prunes that key's vector in the same breath and **fails if it cannot** — the one place the
+best-effort rule does not apply, because the two failures are not symmetric: a failed embed leaves a
+row briefly missing from search, and a failed vector delete leaves personal data outliving the
+request that erased it. And the backlog entry gains a line, so the erasure slice does not ship
+correct against a world that stopped existing.
+
+---
+
 ## Backlog — spec edges (from spec-v0 §"Open edges")
 
 Consciously deferred in v0; each is a self-contained follow-up:
@@ -1637,7 +1831,11 @@ Consciously deferred in v0; each is a self-contained follow-up:
       `parameters`/`before`/`after`/`object_key`), never one that deletes them; a holder and a port
       of its own, so the action runtime still cannot reach a verb that rewrites `_loom_meta.edits`.
       M5's third slice decided the shape and deliberately did not build it: it is a command, a port
-      and an erasure semantics, which is a slice rather than a coda to one
+      and an erasure semantics, which is a slice rather than a coda to one.
+      **Three targets, not two, since M10.** A row's text lives in its table, in `_loom_meta.edits`
+      as `before`/`after` — and now in the vector sidecar, because an embedding is a lossy but
+      *partially invertible* copy rather than an opaque token. A command that reaches two of the
+      three is one that reports success while leaving recoverable text in the lake
 - [ ] More engine adapters — Trino, Spark (+ route writes through native `MERGE` when
       `capabilities().native_merge`)
 

@@ -77,6 +77,29 @@ def _validate_object(obj: ObjectType, diag: Diagnostics) -> None:
         if s not in props:
             diag.error(f"searchable entry '{s}' is not a declared property", loc)
 
+    # `semantic` names the property this type may be searched by *meaning*. Two rules, and the
+    # second is narrower than `searchable`'s deliberately.
+    if obj.semantic is not None:
+        prop = props.get(obj.semantic)
+        if prop is None:
+            diag.error(
+                f"semantic property '{obj.semantic}' is not a declared property",
+                loc,
+                suggest(obj.semantic, props),
+            )
+        elif prop.type.kind != "string":
+            # Not "every scalar", which is where `searchable` landed. A ranking needs prose to
+            # rank: an `int` or a `date` has an order already and `gte` says what a similarity
+            # score could only approximate, and an `enum` is a closed set whose members are
+            # enumerable — `eq` and `in` answer it exactly. Embedding either buys a fuzzy answer
+            # to a question that already has an exact one.
+            diag.error(
+                f"semantic property '{obj.semantic}' is {prop.type.kind}, and only a string may be "
+                "embedded — a ranking needs prose to rank, and an ordered or closed type is "
+                "answered exactly by a filter",
+                loc,
+            )
+
 
 # ---- linkType ------------------------------------------------------------------
 

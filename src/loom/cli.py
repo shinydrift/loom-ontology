@@ -520,7 +520,12 @@ def cmd_serve(args) -> int:
     # lake", and that is the question somebody pointing a client at a production catalog is
     # actually asking. The counts above are what was *built*, so the lines below are what explain
     # the gap between them and what the spec declares — and, over HTTP, who can reach them.
-    for line in _write_mode(config, ontology) + _governance_mode(resolver) + _transport_mode(config):
+    for line in (
+        _write_mode(config, ontology)
+        + _semantic_mode(config, ontology)
+        + _governance_mode(resolver)
+        + _transport_mode(config)
+    ):
         print(f"  {line}", file=sys.stderr)
     if config.mcp.transport == "http":
         asyncio.run(serve_http(server, config.mcp))
@@ -564,6 +569,38 @@ def _write_mode(config, ontology) -> list[str]:
             "row has committed still reports 'log_failed')"
         )
     return lines
+
+
+def _semantic_mode(config, ontology) -> list[str]:
+    """Which types declare a semantic property, and where this deployment's vectors come from.
+
+    Same job as `_write_mode`'s: explain the gap between what the spec declares and what got built.
+    A spec may declare `semantic:` on three types and a deployment may configure no provider, and
+    the number of tools alone cannot tell those apart from a spec that declares none — which is
+    exactly the reading `mcp.writes` needed a line for.
+
+    It names the provider *and* the model because the model is folded into every stored vector's
+    hash: two servers on one spec with different models do not share a warehouse's vectors, and
+    that is a fact an operator can only get from here.
+
+    Silent when the spec declares nothing, like `_governance_mode` and unlike `_write_mode` — a
+    deployment with no semantic property is not being asked "is this switched on", so a line saying
+    no would be one more thing to read on every start."""
+    declared = tuple(
+        f"{obj.api_name}.{obj.semantic}"
+        for obj in ontology.object_types.values()
+        if obj.semantic is not None
+    )
+    if not declared:
+        return []
+    if config.mcp.embedding is None:
+        return [
+            f"semantic search off · {len(declared)} declared ({', '.join(sorted(declared))}), and "
+            "this deployment configures no mcp.embedding provider",
+        ]
+    return [
+        f"semantic search · {', '.join(sorted(declared))} via {config.mcp.embedding.describe()}",
+    ]
 
 
 def _governance_mode(resolver) -> list[str]:

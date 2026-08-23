@@ -39,6 +39,12 @@ SPEC_VERSION = 0
 CATALOG_TYPES = frozenset({"iceberg-rest", "iceberg-sql"})
 ENGINE_TYPES = frozenset({"duckdb"})
 TRANSPORTS = frozenset({"stdio", "http"})
+EMBEDDING_PROVIDERS = frozenset({"local", "openai"})
+"""Where a vector comes from. `local` runs the model in this process and is the default posture the
+same way a loopback bind is: no bytes of somebody's lake leave the machine unless a deployment says
+so. `openai` is the option, and naming it here rather than accepting any string keeps the set of
+places a row's text can be sent to something this file enumerates."""
+DEFAULT_EMBEDDING_PROVIDER = "local"
 
 DEFAULT_HTTP_PORT = 8000
 DEFAULT_HTTP_PATH = "/mcp"
@@ -62,8 +68,13 @@ _TOP_KEYS = {"version", "catalogs", "engine", "mcp", "governance", "ingest"}
 _INGEST_KEYS = {"name", "objectType", "mode", "format", "columns"}
 _CATALOG_KEYS = {"type", "uri", "warehouse", "auth", "properties"}
 _ENGINE_KEYS = {"type", "options"}
-_MCP_KEYS = {"name", "transport", "writes", "actor", "host", "port", "path", "allowed_hosts", "auth"}
+_MCP_KEYS = {"name", "transport", "writes", "actor", "host", "port", "path", "allowed_hosts", "auth", "embedding"}
 _AUTH_KEYS = {"issuer", "audience", "jwks_uri", "clock_skew", "claims"}
+_EMBEDDING_KEYS = {"provider", "model"}
+"""No `dims`. It is a property of the model, so declaring it beside the model name is a chance to
+declare it *wrong* — and the failure of a mismatch is silent rather than loud: vectors of the
+declared width get written, ranked against each other, and mean nothing. The provider is asked
+instead, and what it answers is recorded per row in the sidecar as an observed fact."""
 _ADDRESS_KEYS = ("host", "port", "path", "allowed_hosts")
 """The keys that only mean something once the transport has an address. stdio has none, and a
 config that sets them under `transport: stdio` is refused rather than ignored — the rule
@@ -177,6 +188,12 @@ class McpConfig:
     port: int = DEFAULT_HTTP_PORT
     path: str = DEFAULT_HTTP_PATH
     allowed_hosts: tuple[str, ...] = ()
+    embedding: EmbeddingConfig | None = None
+    """Where this deployment's vectors come from, or None — meaning it computes none.
+
+    None is not a degraded `embedding:`; it is what every deployment before this one was, and it
+    stays the default. See `EmbeddingConfig` for why absent withholds a tool rather than refusing
+    to start."""
     auth: McpAuth | None = None
     """The authorization server this deployment believes, or None — meaning it attests nobody.
 
@@ -214,6 +231,35 @@ class McpConfig:
         if self.allowed_hosts:
             return self.allowed_hosts
         return tuple(f"{name}:{self.port}" for name in ("127.0.0.1", "localhost", "[::1]"))
+
+
+@dataclass(frozen=True)
+class EmbeddingConfig:
+    """Where this deployment's vectors come from — the mechanism, next to the spec's intent.
+
+    **Two files, and the split is the same one `mcp.actor` and `engine:` already make.** An object
+    type declares `semantic: notes`, which says *this property is worth searching by meaning* and
+    is true of the model wherever it is deployed. Which model computes that, and whether it runs
+    here or over a wire, is true of one deployment — a spec can no more demand `text-embedding-3`
+    than it can demand a transport. So the same ontology serves with a local model in a lab and a
+    hosted one in production, and neither spec file changes.
+
+    **Absent means no semantic tools, not a refusal**, which is `mcp.writes`' posture and not
+    `check_capabilities`'. The two look similar and answer different questions. Negotiation asks
+    *could this engine ever serve what this spec describes* — a spec's own claim, so a mismatch is
+    a contradiction and refuses. This asks *does this deployment switch it on*, and a deployment
+    that configures no provider is not describing a contradiction, it is one of the deployments
+    that reads without embedding. The surface is what the deployment permits.
+
+    There is no `dims` — see `_EMBEDDING_KEYS`."""
+
+    provider: str = DEFAULT_EMBEDDING_PROVIDER
+    model: str = ""
+
+    def describe(self) -> str:
+        """One line for the startup banner. `provider/model`, so an operator reading two servers'
+        output can tell a local run from a hosted one without opening either config."""
+        return f"{self.provider}/{self.model}"
 
 
 @dataclass(frozen=True)
@@ -510,6 +556,7 @@ def _parse_mcp(raw: object, loc: SourceLoc, diag: Diagnostics) -> McpConfig:
         port=port,
         path=path,
         allowed_hosts=allowed_hosts,
+        embedding=_parse_embedding(raw.get("embedding"), loc, diag),
         auth=_parse_auth(raw.get("auth"), loc, diag),
     )
     if declared:
@@ -552,6 +599,46 @@ def _parse_address(raw: dict, loc: SourceLoc, diag: Diagnostics) -> tuple[str, i
         else:
             allowed_hosts = tuple(h.strip() for h in raw_hosts)
     return host, port, path, allowed_hosts
+
+
+def _parse_embedding(raw: object, loc: SourceLoc, diag: Diagnostics) -> EmbeddingConfig | None:
+    """`mcp.embedding`, shape-checked without loading a model.
+
+    Nothing here imports a runtime or opens a socket. Whether the named model can actually be
+    obtained is a fact about a machine at the moment somebody asks; whether the config *names* a
+    provider Loom knows and a model at all is a fact about the file, and this is where facts about
+    the file are found. The same two-phase split `_parse_auth` describes.
+
+    `model` is required and has no default. A default would be Loom choosing which model somebody's
+    text is described by — and because the model is folded into every `source_hash`, changing that
+    choice in a later release would silently invalidate every vector in every warehouse that took
+    the default."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        diag.error("'mcp.embedding' must be a mapping", loc)
+        return None
+    check_keys(raw, _EMBEDDING_KEYS, loc, diag, "mcp.embedding")
+
+    provider = raw.get("provider", DEFAULT_EMBEDDING_PROVIDER)
+    if provider not in EMBEDDING_PROVIDERS:
+        diag.error(
+            f"unknown embedding provider '{provider}' "
+            f"(available: {', '.join(sorted(EMBEDDING_PROVIDERS))})",
+            loc,
+            suggest(str(provider), EMBEDDING_PROVIDERS),
+        )
+        provider = DEFAULT_EMBEDDING_PROVIDER
+
+    model = raw.get("model")
+    if not isinstance(model, str) or not model.strip():
+        diag.error(
+            f"'mcp.embedding.model' must be a non-empty string, got {model!r} — the model is folded "
+            "into every stored vector's hash, so it is named rather than defaulted",
+            loc,
+        )
+        return None
+    return EmbeddingConfig(provider=str(provider), model=model.strip())
 
 
 def _parse_auth(raw: object, loc: SourceLoc, diag: Diagnostics) -> McpAuth | None:

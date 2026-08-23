@@ -92,6 +92,7 @@ objectType:
       nullable: true
 
   searchable: [name, tier]        # optional · the properties search_<type> can filter on
+  semantic: bio                   # optional · the one property match_<type> ranks by meaning
 ```
 
 **Validation rules**
@@ -109,17 +110,31 @@ objectType:
    string-or-enum while a filter could only say equality and substring, and lifting that is a
    widening of what an author *may declare* rather than of any surface — a property still has to be
    listed here to be filterable at all, and the word still means "substring" for a string.
-7. **Physical check** (at `loom plan` / `loom serve`, against catalog introspection): every
+7. `semantic` (if set) names an existing property of type **`string`**, and it is a *name* rather
+   than a list — one property, so the key says one. Narrower than `searchable` on purpose: rule 6
+   widened that to every scalar because every scalar has comparisons worth offering, and the
+   opposite is true here. An ordered type already has an order, so `gte` says exactly what a
+   similarity score could only approximate; an `enum` is a closed set, so `eq`/`in` answer it
+   exactly. Embedding either buys a fuzzy answer to a question that already has a precise one.
+   The two lists are independent — a property may be searchable, semantic, both or neither.
+
+   Declaring it demands `vector_search` of the engine (§6.3), and it is the *spec* that demands it:
+   an ontology whose engine has no array arithmetic describes a surface that engine could never
+   serve, whatever any deployment configures. What a declaration does **not** yet do is generate a
+   tool — the ranked surface it is the grammar for is not built, and §7's table is the complete
+   list of what a spec compiles to today. `semantic:` is accepted, validated and negotiated now so
+   that a spec can be written against a lake before the plane that reads it exists.
+8. **Physical check** (at `loom plan` / `loom serve`, against catalog introspection): every
    `backing.table` exists, every `column` exists on it, and every property type is compatible
    with its column's Iceberg type per §1. Missing table/column → error; incompatible type →
    error; extra columns on the table that no property maps → warning (not an error).
-8. `renamedFrom` (if set) is a non-empty column name and is **not** the property's own `column`.
-9. No property's `renamedFrom` may equal any property's `column` **on the same table** — including
+9. `renamedFrom` (if set) is a non-empty column name and is **not** the property's own `column`.
+10. No property's `renamedFrom` may equal any property's `column` **on the same table** — including
    columns contributed by a *different* declaration bound to that table. This is what makes
    renames independent of one another: neither a chain (`a→b` and `b→c`) nor a swap is
    expressible, which is in turn what lets the planner order edits per column.
-10. Two columns on one table may not declare the same `renamedFrom`. One column cannot become two.
-11. Two declarations mapping the same column may not name *different* `renamedFrom` sources.
+11. Two columns on one table may not declare the same `renamedFrom`. One column cannot become two.
+12. Two declarations mapping the same column may not name *different* `renamedFrom` sources.
     Silence is **no opinion**, not "there was no rename", so only one of them has to say it.
 
 ### 2.1 `renamedFrom` — a moved column, not a new one
@@ -601,6 +616,9 @@ mcp:
     jwks_uri: https://issuer.example/jwks
     clock_skew: 0                 # seconds, bounded — for drift, not for longer sessions
     claims: { dept: string, groups: "string[]" }   # what a policy may name of a caller
+  embedding:                      # optional · where this deployment's vectors come from
+    provider: local               # local | openai · default local — nothing leaves the machine
+    model: bge-small-en-v1.5      # required, never defaulted — it is hashed with every vector
 ingest:                           # optional · how rows get in, in bulk · §6.2
   - name: daily-sales             # required, unique — a refusal names it
     objectType: DailySalesPerformance
@@ -957,6 +975,36 @@ Parquet table can say *these columns, and no rows*; NDJSON cannot.
 Kafka, crawl an object store or open a JDBC connection. A pipeline hands Loom a batch; Loom decides
 whether that batch may become rows. Adding a fourth format is a small decision about parsers; adding
 a *source* would be a large one about what Loom is.
+
+### 6.3 `mcp.embedding` — where a vector comes from
+
+A spec declares `semantic:` on an object type (§2 rule 7); this says which model computes it. The
+split is the one `engine:` and `mcp.actor` already make: *that this property is worth searching by
+meaning* is true of the model wherever it is deployed, and *which model, running where* is true of
+one deployment. So one ontology serves with a local model in a lab and a hosted one in production,
+and no spec file changes.
+
+**`provider` defaults to `local`** — the model runs in this process and no row's text leaves the
+machine. `openai` is the option, and it is named here rather than accepted as any string so the set
+of places a lake's text can be sent to is something this file enumerates. The same posture as the
+loopback default bind: reaching the network is a deliberate act.
+
+**`model` is required and has no default.** It is folded into the hash stored beside every vector,
+so a default Loom could change in a later release would silently invalidate every vector in every
+warehouse that took it — and the failure of a stale vector is not an error, it is a ranking that
+means nothing.
+
+**There is no `dims` key.** The width is a property of the model, so declaring it beside the model
+name is a chance to declare it *wrong*, and that failure is silent in the same way: vectors of the
+declared width get written and ranked against each other. The provider is asked, and what it answers
+is recorded per row as an observed fact rather than a declared one.
+
+**Absent means no semantic tools, not a refusal**, and the contrast with engine negotiation is
+the point. `check_capabilities` asks *could this engine ever serve what this spec describes* — a
+spec's own claim, so a mismatch is a contradiction and refuses to start. This key asks *does this
+deployment switch it on*, and a deployment that configures no provider is not describing a
+contradiction. It is one of the deployments that reads without embedding, exactly as a deployment
+with `writes: false` is one that serves without actions. The surface is what the deployment permits.
 
 ---
 
