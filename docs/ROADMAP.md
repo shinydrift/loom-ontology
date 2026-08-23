@@ -1974,6 +1974,81 @@ what it reaches is `_loom_meta.vectors__<type>` for the type the action already 
 
 ---
 
+## 🔨 M11: The on-ramp — a spec drafted from a file, and loads that run in order
+
+M9 made a batch become rows. What it did not touch is everything *before* the first load: somebody
+still writes the spec by hand against a file they are looking at, and a warehouse that needs three
+tables filled needs three commands with nothing to say which order they go in. This milestone is
+that on-ramp. It runs beside M10's open fourth slice rather than after it — the two share no code.
+
+Four slices, in order:
+
+1. `loom infer` — draft an objectType from a file (this PR)
+2. `sequences:` — an ordered set of declared loads, run as one command
+3. Restage `crm.customers` in the example so its unmanaged columns arrive the way unmanaged columns
+   really do
+4. Move the example's materialization onto its own declared load
+
+### First slice — `loom infer`, and the direction of the arrow
+
+Loom's whole posture is that the spec is the authority and the lake is checked against it. A command
+that reads a schema and writes a spec points the arrow the other way, and M9 had already refused
+something that looks like this: `BulkWriter` has no DDL verb, "the never-drop rule pointed at a new
+plane, **refusing to infer a schema change from the shape of somebody's file**."
+
+**That refusal is about a load inferring a migration, and this is neither.** `loom infer` opens no
+catalog, holds no port, takes no ontology path, and writes no file. It reads one file's declared
+schema and prints text. The argument is not that a scaffold is harmless — it is that this one is not
+on the plane the refusal governs, and the *absence of a catalog argument* is what makes that
+structural rather than a promise in a docstring.
+
+- **The draft does not validate, on purpose.** `primaryKey` and `backing` come out as placeholders
+  no property matches, so `loom validate` fails on them by name. This is the whole safety story, and
+  it is asserted in both directions: a test loads a rendered draft and expects the failure, and a
+  second test fills in what a person would and expects a working `ObjectType`. A scaffold that
+  emitted something immediately servable would be a scaffold that gets committed unread, and the
+  first person to discover what it guessed would be whoever queried it.
+
+- **Parquet only, and the other two are refused by name.** Parquet *declares* its types, so reading
+  one is reading. A CSV declares nothing — every type would be sniffed from a sample, and
+  decimal-versus-double on a money column is the sniff that loses fractions of a cent without
+  anybody noticing, which is the exact hazard `examples/retail/seed.py` already comments on. NDJSON
+  is JSON: no decimal, no date. Both are listed in `--format`'s choices *so that the refusal can
+  name them* rather than reading as an unimplemented flag.
+
+- **Nullability is read, never observed.** It comes from the file's schema and not from whether this
+  file happens to hold a null. Worth stating because most writers declare everything nullable, so a
+  draft is usually more permissive than the domain — which is the direction to err, and still a
+  thing to go through by hand. Reading rows at all was refused for the same reason: it is how a
+  generator starts inferring enum values from a sample.
+
+- **What it will not guess.** `enum` values (a file shows the values it happens to hold, not the
+  domain's set — the retail example's `closed` tier is in its enum for a reason no sample would
+  reveal), `unique`, links, `searchable`, `semantic:`. Every one of them is a claim about meaning,
+  and this reads storage.
+
+- **The unmapped column is the interesting output, not the mapped one.** A column whose type the
+  spec has no name for is rendered where its property would have been, with the reason, followed
+  once by what actually happens to it: §2 rule 7 says an unmanaged column is reported by `plan`,
+  never dropped, and carried across untouched by every write. So "no type for this" is drafted as a
+  working outcome rather than a gap — and the half a reader would otherwise learn from a refused
+  load is stated too, since a source column no property claims *is* refused at load time.
+
+- **A property name is a reading of the column; the column is kept verbatim.** `full_name` becomes
+  `fullName` with `column: full_name` on the same line, so the guess sits next to the thing it was
+  guessed from and is undone by deleting one word. Two columns that read as one property are refused
+  naming both, rather than resolved by order.
+
+- **It drafts the `ingest:` entry too, and addresses it to the other file.** An objectType is a fact
+  about the ontology and a load is a fact about a deployment, so they are printed as two blocks with
+  the second commented for `loom.yaml`. `mode` comes out as a placeholder for the reason `config.py`
+  already gives: the three modes differ in what they *destroy*, so a default would make the safest
+  reading of an under-specified config the one nobody wrote down. The `columns:` map is emitted only
+  for the properties whose name differs from their source column — and a test asserts the drafted
+  block parses as a real entry, rather than looking like one.
+
+---
+
 ## Backlog — spec edges (from spec-v0 §"Open edges")
 
 Consciously deferred in v0; each is a self-contained follow-up:

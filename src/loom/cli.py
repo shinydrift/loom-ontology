@@ -8,7 +8,9 @@ tools. `plan` dry-runs the migration engine, `apply` executes exactly what `plan
 M4's `run_<action>` tool will call. `ingest` is `run` at batch scale and the one command with no
 tool behind it: a declared load, from a file, checked against the ontology and written as one commit
 — deliberately reachable only from here, because a verb that writes an arbitrary batch is not
-something any agent surface should be able to name.
+something any agent surface should be able to name. `infer` runs before any of them and is the only
+command that reads a schema instead of being told one: it drafts a spec from a file and prints it,
+touching no catalog and writing nothing.
 """
 
 from __future__ import annotations
@@ -23,6 +25,11 @@ from typing import Any
 
 from .config import CONFIG_FILENAME, find_config, load_config
 from .errors import Diagnostics, SourceLoc, SpecError, SpecErrors
+
+# Module-level, unlike every other command's imports, because `main()` builds the parser before it
+# knows which command is running — and `infer`'s `--format` choices are the refusal list itself.
+# Cheap enough to be unremarkable: `infer` imports pyarrow inside the function that needs it.
+from .infer import INFER_FORMATS, UNREADABLE_FORMATS
 from .model import Ontology
 from .ontology import build
 
@@ -54,6 +61,48 @@ def _load_project(path: str, diag: Diagnostics):
     diag.warnings.extend(ont_diag.warnings)
     diag.raise_if_errors()
     return ontology, config
+
+
+def cmd_infer(args) -> int:
+    """Draft an objectType from a file and print it. The only command that loads no project.
+
+    Note what it does not take: an ontology directory. There is nothing to read one for — the draft
+    is a new type, and a command that opened `loom.yaml` here would be a command that could be made
+    to consult a catalog later. The path it does not take is the reason it can never migrate
+    anything, which is stronger than the same claim made in a docstring.
+
+    Everything goes to stdout so it can be redirected into a file. That is two deliberate steps —
+    redirect, then edit — and the draft's placeholders are what make the second one unavoidable."""
+    from .infer import InferError, infer_draft, render_draft
+
+    try:
+        draft = infer_draft(
+            args.source,
+            args.api_name,
+            fmt=args.format,
+            catalog=args.catalog,
+            table=args.table,
+            key=args.key,
+            entry=args.entry,
+        )
+    except InferError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    print(render_draft(draft), end="")
+    unmapped = draft.unmapped
+    if unmapped:
+        names = ", ".join(c.name for c in unmapped)
+        print(
+            f"note: {len(unmapped)} column(s) have no property — {names}. They are unmanaged, not "
+            f"lost: see the comments above each one.",
+            file=sys.stderr,
+        )
+    print(
+        "note: this draft does not validate yet — fill in the TODOs, then run 'loom validate'.",
+        file=sys.stderr,
+    )
+    return 0
 
 
 def cmd_validate(args) -> int:
@@ -1096,6 +1145,29 @@ def _confirmed(assume_yes: bool, action: str = "apply") -> bool:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="loom", description="Loom ontology framework")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    n = sub.add_parser("infer", help="draft an objectType from a data file (writes nothing)")
+    n.add_argument("source", help="path to the file to read the schema of")
+    # Required, and not derived from the filename. `customers.parquet` -> `Customer` needs a
+    # singulariser, which is a guess about English rather than about data, and it would be the one
+    # guess this command makes that no comment in the output could justify.
+    n.add_argument("--as", dest="api_name", required=True, metavar="NAME", help="apiName for the drafted objectType")
+    n.add_argument(
+        "--format",
+        default="parquet",
+        choices=list(INFER_FORMATS) + sorted(UNREADABLE_FORMATS),
+        help="source format; only parquet is readable — the others are listed so the refusal names them",
+    )
+    n.add_argument("--catalog", default=None, metavar="NAME", help="backing catalog, as named in loom.yaml")
+    n.add_argument("--table", default=None, metavar="NS.TABLE", help="backing table for this type")
+    n.add_argument(
+        "--key",
+        default=None,
+        metavar="COLUMN",
+        help="source column to use as the primary key — named as a column, since the property does not exist yet",
+    )
+    n.add_argument("--entry", default=None, metavar="NAME", help="name for the drafted ingest entry")
+    n.set_defaults(func=cmd_infer)
 
     v = sub.add_parser("validate", help="load and validate an ontology directory")
     v.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")
