@@ -1,5 +1,7 @@
 """IR -> DuckDB SQL. `Engine.compile()` is pure, so the generated SQL is asserted directly."""
 
+from dataclasses import replace
+
 import pytest
 
 from loom.query.engine import EngineError
@@ -13,11 +15,13 @@ from loom.query.ir import (
     Eq,
     GetByKey,
     In,
+    Match,
     Project,
     Search,
     TableRef,
     ThroughRef,
     Traverse,
+    VectorRef,
 )
 
 CUST = TableRef(catalog="main", table="crm.customers", alias="t0")
@@ -27,6 +31,33 @@ COLUMNS = (
     Column(alias="t0", column="id", output="customerId"),
     Column(alias="t0", column="full_name", output="name"),
 )
+
+VECTORS = VectorRef(
+    table=TableRef(catalog="main", table="_loom_meta.vectors__Customer", alias="v0"),
+    key_column="key",
+    vector_column="vector",
+    model_column="model",
+    dims_column="dims",
+    property_column="property",
+    model="stub-v1",
+    property="name",
+)
+
+
+def _match(**kwargs):
+    """A ranked read over the customers table, with the sidecar joined on the primary key."""
+    fields = dict(
+        table=CUST,
+        vectors=VECTORS,
+        key_column="id",
+        query=(0.5, -0.5),
+        score_as="_loom_score",
+        order_by=("id",),
+        limit=10,
+    )
+    fields.update(kwargs)
+    columns = fields.pop("columns", COLUMNS)
+    return Project(source=Match(**fields), columns=columns)
 
 
 @pytest.fixture
@@ -309,3 +340,118 @@ def test_capabilities_report_no_native_merge():
     assert caps.name == "duckdb"
     assert caps.joins and caps.offset and caps.case_insensitive_like
     assert caps.native_merge is False
+
+
+# ---- match ---------------------------------------------------------------------
+#
+# The fourth source node, and the first whose SELECT list holds something no table has. Three
+# things are asserted here that nothing else can see: the parameter *order* across a clause
+# boundary (the query vector is bound before the guard, because it appears before it in the SQL),
+# the fixed-width cast on both sides of the distance, and that the score sorts before the tie-break
+# rather than after it.
+
+
+def test_match_joins_the_sidecar_and_ranks_by_distance(engine):
+    q = engine.compile(_match())
+    assert q.sql == (
+        'SELECT "t0"."id" AS "customerId", "t0"."full_name" AS "name", '
+        'array_cosine_similarity(CAST("v0"."vector" AS FLOAT[2]), CAST(? AS FLOAT[2])) AS "_loom_score" '
+        'FROM "t0" JOIN "v0" ON "t0"."id" = "v0"."key" '
+        'WHERE "v0"."vector" IS NOT NULL AND "v0"."model" = ? AND "v0"."dims" = ? '
+        'AND "v0"."property" = ? '
+        'ORDER BY "_loom_score" DESC, "t0"."id" LIMIT ?'
+    )
+    assert q.params == ([0.5, -0.5], "stub-v1", 2, "name", 10)
+
+
+def test_the_score_sorts_before_the_tie_break(engine):
+    """The tie-break is what makes the order total, so page 2 is the continuation of page 1 rather
+    than an unrelated draw from the same set."""
+    sql = engine.compile(_match(offset=10)).sql
+    assert 'ORDER BY "_loom_score" DESC, "t0"."id" LIMIT ? OFFSET ?' in sql
+
+
+def test_the_width_in_the_cast_comes_from_the_query_vector(engine):
+    """`dims` is never declared anywhere — the width the ranking happens at is the width of the
+    vector the provider just returned, stated in the SQL rather than inferred from a row."""
+    sql = engine.compile(_match(query=(1.0, 2.0, 3.0, 4.0))).sql
+    assert sql.count("FLOAT[4]") == 2
+    assert "FLOAT[2]" not in sql
+
+
+def test_the_comparability_guard_is_both_a_clause_and_a_pushdown(engine):
+    """In the `WHERE` for correctness — the distance function raises on two widths rather than
+    answering — and in the scan as the equality pair that channel can actually carry."""
+    q = engine.compile(_match())
+    scans = {s.alias: s for s in q.scans}
+    assert scans["v0"].predicates == (("model", "stub-v1"), ("dims", 2), ("property", "name"))
+    assert scans["v0"].table == "_loom_meta.vectors__Customer"
+    assert scans["v0"].columns == ("dims", "key", "model", "property", "vector")
+    for clause in ('"v0"."model" = ?', '"v0"."dims" = ?', '"v0"."property" = ?'):
+        assert clause in q.sql
+
+
+def test_the_guard_covers_the_property_the_vector_was_made_from(engine):
+    """The narrowest window in the milestone and the least visible: re-point `semantic:` from one
+    column to another and every `source_hash` changes, so a reconcile fixes it — but between the
+    deploy and the reconcile the sidecar holds vectors of the *old* text, and without this clause
+    they would be ranked under an envelope naming the new property."""
+    q = engine.compile(_match(vectors=replace(VECTORS, property="bio")))
+    assert '"v0"."property" = ?' in q.sql
+    assert q.params[3] == "bio"
+    assert ("property", "bio") in {s.alias: s for s in q.scans}["v0"].predicates
+
+
+def test_a_projected_sidecar_column_is_scanned(engine):
+    """The stamp the envelope reports is an ordinary projection off `v0`, so the scan picks it up
+    the same way a governed column does."""
+    plan = _match(columns=(*COLUMNS, Column("v0", "embedded_at", "_loom_embedded_at")))
+    q = engine.compile(plan)
+    scans = {s.alias: s for s in q.scans}
+    assert "embedded_at" in scans["v0"].columns
+    assert '"v0"."embedded_at" AS "_loom_embedded_at"' in q.sql
+
+
+def test_the_ranked_side_is_never_limited_in_the_scan(engine):
+    """`LIMIT k` bounds what comes back, never what has to be measured: every surviving row is a
+    candidate until its distance is computed."""
+    scans = {s.alias: s for s in engine.compile(_match(limit=1)).scans}
+    assert scans["t0"].limit is None and scans["v0"].limit is None
+
+
+def test_match_filters_narrow_before_the_ranking(engine):
+    """The same conjunction `search` takes, in the same `WHERE`, ahead of the ORDER BY — so a
+    filtered call ranks fewer rows rather than re-ranking the ones it kept."""
+    q = engine.compile(
+        _match(filters=(Compare("==", ColumnRef("t0", "tier"), Const("gold")),))
+    )
+    assert 'AND "t0"."tier" IS NOT DISTINCT FROM ?' in q.sql
+    assert q.sql.index('"t0"."tier"') < q.sql.index("ORDER BY")
+    # The vector, then the guard, then the filter: the order the clauses appear in.
+    assert q.params == ([0.5, -0.5], "stub-v1", 2, "name", "gold", 10)
+    scans = {s.alias: s for s in q.scans}
+    assert scans["t0"].predicates == (("tier", "gold"),)
+    assert "tier" in scans["t0"].columns
+
+
+def test_match_still_governs_the_object_table(engine):
+    """A ranked read is governed on the end that stands for an object type. The sidecar is the
+    other end and stands for none, which is `ThroughRef`'s answer rather than a second one."""
+    governed = TableRef(
+        catalog="main",
+        table="crm.customers",
+        alias="t0",
+        predicate=Compare("==", ColumnRef("t0", "region"), Const("emea")),
+    )
+    q = engine.compile(_match(table=governed))
+    assert 'AND "t0"."region" IS NOT DISTINCT FROM ?' in q.sql
+    assert q.params == ([0.5, -0.5], "stub-v1", 2, "name", "emea", 10)
+    assert "region" in {s.alias: s for s in q.scans}["t0"].columns
+    # Never a pushdown hint — that channel is advisory and a policy is not.
+    assert {s.alias: s for s in q.scans}["t0"].predicates == ()
+
+
+def test_capabilities_claim_vector_search():
+    """The flag a spec declaring `semantic:` demands, and the one this adapter can answer for
+    because `array_cosine_similarity` is core DuckDB rather than an extension."""
+    assert DuckDBEngine(catalogs={}).capabilities().vector_search is True

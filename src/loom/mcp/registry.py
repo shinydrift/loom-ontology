@@ -10,10 +10,19 @@ The generated surface is fixed (spec §7):
     get_<object>      one object by primary key
     search_<object>   filter by declared `searchable` properties
     list_<object>     a page of objects
+    match_<object>    rank by meaning against the declared `semantic:` property
     traverse          one hop along a declared link
     run_<action>      one declared action, against one row
 
 There is deliberately no tool that accepts a predicate, a column, a table, or a query string.
+
+**`match_` is a tool rather than an operator in the filter grammar**, and the rule that decides it is
+the one `traverse` states below, read from the other side: a generic tool is right when the varying
+element does not change the schema, and a *filter operator* is right when it decides rows. A
+similarity clause decides nothing — it ranks — so putting it under `filter` would introduce `k` and
+an ordering into a grammar that has neither, and would make `{similar} AND {tier: gold}` a question
+with two answers. `search` is also a word already spent on rows, the same discipline `filters.py`
+records about `contains`.
 
 **Two argument namespaces, and they never mix.** Names that come from the spec's vocabulary live
 inside a nested object; names Loom chose live at the top level. `search_<object>` was already built
@@ -57,8 +66,16 @@ from ..resolver import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Resolver
 
 if TYPE_CHECKING:
     from ..action import ActionRuntime
+    from ..embed.match import Matcher
 
 TRAVERSE_TOOL = "traverse"
+
+TEXT_ARG = "text"
+"""`match_`'s one required argument, and it is Loom's word at the top level like every other one.
+
+What a caller passes is *not* a value of the semantic property — it is the question, in the caller's
+own words, which is the entire reason this plane exists. Naming it after the property would say the
+opposite."""
 
 PARAMETERS_ARG = "parameters"
 DRY_RUN_ARG = "dryRun"
@@ -175,12 +192,22 @@ def build_tools(
     runtime: ActionRuntime | None = None,
     actor: str | None = None,
     program: PolicyProgram | None = None,
+    matcher: Matcher | None = None,
 ) -> list[ToolSpec]:
     """Introspect the ontology into the tool set this deployment exposes.
 
     The read tools always. The `run_` tools only when a runtime is supplied, which is `loom serve`'s
     way of saying `mcp.writes` is on — the surface is what the deployment permits, not what the spec
     declares, and the banner counts what was built rather than what could have been.
+
+    **A `match_` tool needs both halves, and the asymmetry with a mask is the point.** The spec
+    declares `semantic:` and the deployment configures `mcp.embedding`; absent the second there is no
+    tool, exactly as `mcp.writes: false` exposes no action. That is *not* the same thing a policy
+    does: a mask over the semantic property is refused before this deployment starts, because §7 says
+    no deployment gets to be the one that makes a tool disappear. A deployment configuring no
+    provider is not withholding a tool it could serve — it has no model, so there is no ranking to
+    withhold. `matcher` is `None` in that case and in the case of a spec that declares nothing, and
+    building it costs no model load and no catalog read: see `bind_matching`.
 
     **A mask is read here, once, and that stayed true when a principal arrived.** Masks are resolved
     into the schemas and descriptions at build time because they cannot change between two calls of a
@@ -200,6 +227,8 @@ def build_tools(
         tools.append(_get_tool(resolver, obj, program))
         tools.append(_search_tool(resolver, obj, program))
         tools.append(_list_tool(resolver, obj, program))
+        if matcher is not None and obj.api_name in matcher.stores:
+            tools.append(_match_tool(resolver, obj, matcher, program))
     if resolver.ontology.link_types:
         tools.append(_traverse_tool(resolver, program))
     if runtime is not None:
@@ -280,38 +309,66 @@ def _get_tool(resolver: Resolver, obj: ObjectType, program: PolicyProgram | None
     )
 
 
-def _search_tool(resolver: Resolver, obj: ObjectType, program: PolicyProgram | None = None) -> ToolSpec:
-    masked = resolver.masked(obj.api_name)
-    # A masked property leaves the filter schema as well as the projection. The resolver refuses a
-    # filter on one whatever the schema says — that is the enforcement, and it is below MCP where
-    # `loom query` meets it too — but advertising an argument that fails on every call is the thing
-    # `cmd_serve` already refuses to do when an engine cannot serve a tool. Subtracting from the
-    # surface, never adding to it: the rule from `governance.py`, seen at the surface.
-    filterable = {
+def _filterable(obj: ObjectType, masked: Sequence[str]) -> dict[str, Any]:
+    """The properties a `filter` argument may name: declared searchable, minus what a policy hides.
+
+    A masked property leaves the filter schema as well as the projection. The resolver refuses a
+    filter on one whatever the schema says — that is the enforcement, and it is below MCP where
+    `loom query` meets it too — but advertising an argument that fails on every call is the thing
+    `cmd_serve` already refuses to do when an engine cannot serve a tool. Subtracting from the
+    surface, never adding to it: the rule from `governance.py`, seen at the surface.
+
+    Shared by `search_` and `match_`, because "which properties may be filtered" is one question with
+    one answer — a ranked read that narrowed on a different set would be a second surface for a
+    policy to be read off."""
+    return {
         name: obj.properties[name]
         for name in obj.searchable
         if name in obj.properties and name not in masked
     }
-    # Generated from the property type and `searchable`, and from nothing else — the same function
-    # `Resolver._filters` enforces against, so the surface cannot advertise an operator the resolver
-    # refuses or hide one it accepts. §7's namespace rule survives one level deeper than it was
-    # written: operator keys are Loom's vocabulary *below* a property name, never beside one, so an
-    # ontology may declare a property called `gte` without shadowing anything.
-    filter_props = {
-        name: filters.property_schema(prop, searchable=True) for name, prop in filterable.items()
+
+
+def _filter_arg(filterable: Mapping[str, Any]) -> dict:
+    """The `filter` argument's schema.
+
+    Generated from the property type and `searchable`, and from nothing else — the same function
+    `Resolver._filters` enforces against, so the surface cannot advertise an operator the resolver
+    refuses or hide one it accepts. §7's namespace rule survives one level deeper than it was
+    written: operator keys are Loom's vocabulary *below* a property name, never beside one, so an
+    ontology may declare a property called `gte` without shadowing anything."""
+    return {
+        "type": "object",
+        "properties": {
+            name: filters.property_schema(prop, searchable=True)
+            for name, prop in filterable.items()
+        },
+        "additionalProperties": False,
+        "description": "property filters, ANDed together",
     }
+
+
+def _paged(args: dict, count: int) -> dict:
+    """The four keys every paged envelope carries, from the arguments that produced it.
+
+    One function rather than three copies, which is what stops `hasMore` from being computed against
+    a different cap in one of them: an agent has no other way to tell "that's everything" from "the
+    page filled up", so the three surfaces that page must agree about when it is true."""
+    limit = args.get("limit") or DEFAULT_PAGE_SIZE
+    return {
+        "count": count,
+        "limit": limit,
+        "offset": args.get("offset", 0),
+        "hasMore": count == min(limit, MAX_PAGE_SIZE),
+    }
+
+
+def _search_tool(resolver: Resolver, obj: ObjectType, program: PolicyProgram | None = None) -> ToolSpec:
+    masked = resolver.masked(obj.api_name)
+    filterable = _filterable(obj, masked)
 
     schema = {
         "type": "object",
-        "properties": {
-            "filter": {
-                "type": "object",
-                "properties": filter_props,
-                "additionalProperties": False,
-                "description": "property filters, ANDed together",
-            },
-            **_PAGE_SCHEMA,
-        },
+        "properties": {"filter": _filter_arg(filterable), **_PAGE_SCHEMA},
         "additionalProperties": False,
     }
 
@@ -361,21 +418,112 @@ def _list_tool(resolver: Resolver, obj: ObjectType, program: PolicyProgram | Non
 
 
 def _page(obj: ObjectType, rows: list[dict], args: dict, masked: Sequence[str] = ()) -> dict:
-    limit = args.get("limit") or DEFAULT_PAGE_SIZE
-    offset = args.get("offset", 0)
     return {
         "objectType": obj.api_name,
-        "count": len(rows),
-        "limit": limit,
-        "offset": offset,
-        # An agent has no other way to tell "that's everything" from "the page filled up".
-        "hasMore": len(rows) == min(limit, MAX_PAGE_SIZE),
+        **_paged(args, len(rows)),
         # Always present, empty when nothing is withheld. A key that appears only under a policy
         # would make "this deployment governs nothing" and "this Loom is too old to say"
         # indistinguishable, which is the one thing an envelope reporting a mask must not do.
         "masked": list(masked),
         "objects": json_safe(rows),
     }
+
+
+# ---- match ---------------------------------------------------------------------
+
+
+def _match_tool(
+    resolver: Resolver, obj: ObjectType, matcher: Matcher, program: PolicyProgram | None = None
+) -> ToolSpec:
+    """One object type's ranked read: the question `contains` cannot ask.
+
+    **The envelope's elements are `matches`, not `objects`, and that is a claim rather than a
+    synonym.** Every other read returns objects; this returns a score paired with one, so calling
+    the list `objects` would make an agent that unpacked it the same way get a dict with a `score`
+    key it did not expect. The score sits *beside* the object for §7's namespace reason — see
+    `resolver.Ranked` — and it is what a caller needs to tell a near miss from the best of a bad set,
+    which a rank alone cannot say.
+
+    **`embeddedAsOf` is in and a count of unembedded rows is not.** The count needs an anti-join over
+    the admitted set on every call, and the deciding reason is that an agent cannot *act* on it — it
+    cannot wait and it cannot trigger a reconcile, and this surface says things a caller can do
+    something about. What that gives up is real and named here rather than discovered: `match_` can
+    silently omit a row that exists, so the honesty moves to the operator and the reconcile has to be
+    reliable rather than best-effort. `loom embed`'s output and the serve banner are where that count
+    goes.
+
+    **The tool is built from the spec and the deployment's provider, never from the lake.** Whether
+    anything has actually been embedded is a fact that changes while the process runs, so it is
+    answered per call — as a refusal, not an empty page. `Matcher.match` says why."""
+    masked = resolver.masked(obj.api_name)
+    prop = obj.semantic_property
+    assert prop is not None  # `matcher.stores` is keyed by the types that declare one
+    filterable = _filterable(obj, masked)
+
+    schema = {
+        "type": "object",
+        "properties": {
+            TEXT_ARG: {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    f"what you are looking for, in your own words — ranked against "
+                    f"{obj.api_name}.{prop.name} by meaning, not by the words matching"
+                ),
+            },
+            "filter": _filter_arg(filterable),
+            **_PAGE_SCHEMA,
+        },
+        "required": [TEXT_ARG],
+        "additionalProperties": False,
+    }
+
+    def handler(args: dict) -> Any:
+        result = matcher.match(
+            _reading(resolver, program),
+            obj.api_name,
+            args[TEXT_ARG],
+            args.get("filter") or {},
+            limit=args.get("limit"),
+            offset=args.get("offset", 0),
+        )
+        return {
+            "objectType": obj.api_name,
+            "property": result.property,
+            # Named on every call, because a similarity is only meaningful against the model that
+            # produced both sides of it — and because a deployment mid-model-swap ranks nothing, so
+            # an empty page that names a model is diagnosable where a bare empty page is not.
+            "model": result.model,
+            "embeddedAsOf": json_safe(result.embedded_as_of),
+            **_paged(args, len(result.matches)),
+            "masked": list(masked),
+            "matches": [
+                {"score": m.score, "object": json_safe(m.object)} for m in result.matches
+            ],
+        }
+
+    narrowed = (
+        f" Narrow first with `filter` ({', '.join(filterable)}) — the filters apply *before* the "
+        "ranking, so a filtered call ranks fewer rows rather than re-ranking the ones you kept."
+        if filterable
+        else ""
+    )
+    return ToolSpec(
+        name=f"match_{snake_case(obj.api_name)}",
+        description=_described(
+            obj.status,
+            f"Rank {_subject(obj)} by how close {prop.name} is in meaning to your words. Use this "
+            f"when the answer is in the text but you do not know the data's wording — "
+            f"search_{snake_case(obj.api_name)} finds rows that *say* a word, this finds rows that "
+            f"*mean* one." + narrowed + " Each result carries a `score` beside the object, nearest "
+            "first: it is a cosine similarity, comparable between rows and between calls of this "
+            "deployment and meaningless against any other model. Only rows that have been embedded "
+            "can be ranked — `embeddedAsOf` says how current the oldest of these is.",
+        )
+        + _withheld(masked),
+        input_schema=schema,
+        handler=handler,
+    )
 
 
 # ---- traverse ------------------------------------------------------------------
@@ -447,17 +595,13 @@ def _traverse_tool(resolver: Resolver, program: PolicyProgram | None = None) -> 
             limit=args.get("limit"),
             offset=args.get("offset", 0),
         )
-        limit = args.get("limit") or DEFAULT_PAGE_SIZE
         return {
             "objectType": args["objectType"],
             "key": json_safe(args["key"]),
             "link": args["link"],
             "targetObjectType": direction.target_object_type,
             "cardinality": direction.link.cardinality,
-            "count": len(rows),
-            "limit": limit,
-            "offset": args.get("offset", 0),
-            "hasMore": len(rows) == min(limit, MAX_PAGE_SIZE),
+            **_paged(args, len(rows)),
             # The target's mask, not the source's: a traverse projects the objects at the other end,
             # so what is withheld here is a fact about where you landed. Read per call rather than
             # bound at build like the per-object tools', because this one tool spans every route.

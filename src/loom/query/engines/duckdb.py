@@ -20,10 +20,12 @@ from ..ir import (
     And,
     ColumnRef,
     Compare,
+    Comparison,
     Const,
     Contains,
     GetByKey,
     In,
+    Match,
     Not,
     Or,
     Predicate,
@@ -85,6 +87,10 @@ class DuckDBEngine:
             raise EngineError("Project has no columns")
 
         select = ", ".join(f"{_ref(c.alias, c.column)} AS {_quote(c.output)}" for c in plan.columns)
+        # A ranked read is the one plan whose SELECT list holds something no table has, so it is the
+        # one that can contribute a parameter *before* the FROM clause. Empty for the other three.
+        select_extra: str = ""
+        select_params: Sequence[Any] = ()
         src = plan.source
         if isinstance(src, GetByKey):
             frm, where, params, scans = self._compile_get(src, plan)
@@ -95,6 +101,11 @@ class DuckDBEngine:
         elif isinstance(src, Traverse):
             frm, where, params, scans = self._compile_traverse(src, plan)
             tail, tail_params = self._order_and_page(src.to_table.alias, src.order_by, src.limit, src.offset)
+        elif isinstance(src, Match):
+            select_extra, select_params, frm, where, params, scans = self._compile_match(src, plan)
+            tail, tail_params = self._order_and_page(
+                src.table.alias, src.order_by, src.limit, src.offset, rank=src.score_as
+            )
         else:
             raise EngineError(f"unsupported source node {type(src).__name__}")
 
@@ -104,13 +115,13 @@ class DuckDBEngine:
         governed, governed_params = self._governance(tables_of(src))
         clauses = [c for c in (where, governed) if c]
 
-        sql = f"SELECT {select} FROM {frm}"
+        sql = f"SELECT {select}{select_extra} FROM {frm}"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += tail
         return CompiledQuery(
             sql=sql,
-            params=tuple(params) + tuple(governed_params) + tuple(tail_params),
+            params=tuple(select_params) + tuple(params) + tuple(governed_params) + tuple(tail_params),
             scans=scans,
         )
 
@@ -133,12 +144,30 @@ class DuckDBEngine:
 
     def _compile_search(self, src: Search, plan: Project):
         alias = src.table.alias
-        frm = _quote(alias)
+        referenced = self._columns_for(plan, src, alias) | set(src.order_by)
+        clauses, params = self._filter_clauses(src.filters, referenced)
+
+        scans = (
+            ScanRequest(
+                alias=alias,
+                catalog=src.table.catalog,
+                table=src.table.table,
+                columns=tuple(sorted(referenced)),
+                predicates=tuple(pushdown_hints(src.filters)),
+            ),
+        )
+        return _quote(alias), " AND ".join(clauses), params, scans
+
+    def _filter_clauses(self, filters: Sequence[Comparison], referenced: set[str]):
+        """A caller's conjunction as SQL clauses, recording in `referenced` every column it reads.
+
+        Shared by `Search` and `Match`, because the conjunction means the same thing in both: a
+        ranked read narrows with the identical grammar, and a second copy of this loop would be
+        precisely where the two quietly stopped agreeing about what `contains` or a null `eq` does.
+        """
         clauses: list[str] = []
         params: list[Any] = []
-        referenced = self._columns_for(plan, src, alias) | set(src.order_by)
-
-        for f in src.filters:
+        for f in filters:
             if isinstance(f, Contains):
                 referenced.add(f.column)
                 clauses.append(f"{_ref(f.alias, f.column)} ILIKE ? ESCAPE '{_LIKE_ESCAPE}'")
@@ -154,18 +183,7 @@ class DuckDBEngine:
                 clauses.append(self._compare(f, params))
             else:
                 raise EngineError(f"unsupported filter {type(f).__name__}")
-        pushdown = list(pushdown_hints(src.filters))
-
-        scans = (
-            ScanRequest(
-                alias=alias,
-                catalog=src.table.catalog,
-                table=src.table.table,
-                columns=tuple(sorted(referenced)),
-                predicates=tuple(pushdown),
-            ),
-        )
-        return frm, " AND ".join(clauses), params, scans
+        return clauses, params
 
     def _compile_traverse(self, src: Traverse, plan: Project):
         to_alias, from_alias = src.to_table.alias, src.from_table.alias
@@ -211,6 +229,87 @@ class DuckDBEngine:
             ),
         ) + extra_scans
         return join, where, [src.anchor.value], scans
+
+    def _compile_match(self, src: Match, plan: Project):
+        """A ranked read: join the sidecar, keep the vectors that are comparable, score the rest.
+
+        **The comparability guard is in the `WHERE` *and* in the scan, for two different reasons.**
+        In the scan it is a pushdown hint — `(model, dims, property)` are equality pairs, the one
+        shape that channel carries — so a catalog can prune whole files of a superseded generation
+        before DuckDB sees them. In the `WHERE` it is correctness, because a hint may be ignored:
+        `array_cosine_similarity` over two different widths **raises** rather than answers, so this
+        is what stands between a sidecar caught mid-`--remodel` and a tool call that fails instead
+        of ranking the vectors that are current.
+
+        **The object table's scan takes no `limit`.** `LIMIT k` bounds what comes back, never what
+        has to be measured: every row the filters left is a candidate until its distance is computed.
+
+        **Neither does the sidecar's, and that one is a cost rather than a choice.** The keys that
+        survive the filters are known only after the object side is scanned, and `ScanRequest`
+        carries a *conjunction* of equality pairs — a key set has no spelling in it, the way a range
+        has none. So the vector column is materialized whole on every call: the distance arithmetic
+        is linear in the filtered set and the I/O is linear in the sidecar. What would fix it is the
+        same channel the range-pushdown backlog entry describes, or partitioning the sidecar; neither
+        is this slice's, and both are optimisations rather than corrections."""
+        alias, v = src.table.alias, src.vectors
+        valias = v.table.alias
+        dims = len(src.query)
+
+        join = (
+            f"{_quote(alias)} JOIN {_quote(valias)} "
+            f"ON {_ref(alias, src.key_column)} = {_ref(valias, v.key_column)}"
+        )
+        # A null vector is not a distant one — it is a row nothing was ever written for. Excluded
+        # here rather than ranked last, so the score column can never be null and the ordering never
+        # has to have an opinion about where a null sorts.
+        guard = [
+            f"{_ref(valias, v.vector_column)} IS NOT NULL",
+            f"{_ref(valias, v.model_column)} = ?",
+            f"{_ref(valias, v.dims_column)} = ?",
+            f"{_ref(valias, v.property_column)} = ?",
+        ]
+        params: list[Any] = [v.model, dims, v.property]
+
+        referenced = self._columns_for(plan, src, alias) | {src.key_column} | set(src.order_by)
+        clauses, filter_params = self._filter_clauses(src.filters, referenced)
+        params.extend(filter_params)
+
+        vector_columns = self._columns_for(plan, src, valias) | {
+            v.key_column,
+            v.vector_column,
+            v.model_column,
+            v.dims_column,
+            v.property_column,
+        }
+        scans = (
+            ScanRequest(
+                alias=alias,
+                catalog=src.table.catalog,
+                table=src.table.table,
+                columns=tuple(sorted(referenced)),
+                predicates=tuple(pushdown_hints(src.filters)),
+            ),
+            ScanRequest(
+                alias=valias,
+                catalog=v.table.catalog,
+                table=v.table.table,
+                columns=tuple(sorted(vector_columns)),
+                predicates=(
+                    (v.model_column, v.model),
+                    (v.dims_column, dims),
+                    (v.property_column, v.property),
+                ),
+            ),
+        )
+        # `FLOAT[n]` on both sides — the fixed-width spelling `Capabilities.vector_search` claims,
+        # and the one the distance function needs. The sidecar column arrives from Iceberg as a
+        # variable-length `list<float>`, so the width the ranking happens at is *stated* in the SQL
+        # rather than inferred from whichever row the engine reads first.
+        stored = f"CAST({_ref(valias, v.vector_column)} AS FLOAT[{dims}])"
+        score = (
+            f", array_cosine_similarity({stored}, CAST(? AS FLOAT[{dims}])) AS {_quote(src.score_as)}"
+        )
+        return score, (list(src.query),), join, " AND ".join(guard + clauses), params, scans
 
     @staticmethod
     def _columns_for(plan: Project, src, alias: str) -> set[str]:
@@ -317,11 +416,19 @@ class DuckDBEngine:
         raise EngineError(f"unsupported operand {type(operand).__name__}")  # pragma: no cover
 
     @staticmethod
-    def _order_and_page(alias: str, order_by: Sequence[str], limit: int | None, offset: int):
+    def _order_and_page(
+        alias: str, order_by: Sequence[str], limit: int | None, offset: int, rank: str | None = None
+    ):
+        """The tail. `rank` is the score's output name, which sorts descending *before* `order_by`.
+
+        By the alias rather than by repeating the expression: DuckDB resolves an output name in
+        `ORDER BY`, and spelling the distance twice would be two places for the width to be wrong.
+        The columns after it are the tie-break rather than decoration — see `ir.Match`."""
         sql = ""
         params: list[Any] = []
-        if order_by:
-            sql += " ORDER BY " + ", ".join(_ref(alias, c) for c in order_by)
+        terms = ([f"{_quote(rank)} DESC"] if rank else []) + [_ref(alias, c) for c in order_by]
+        if terms:
+            sql += " ORDER BY " + ", ".join(terms)
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)

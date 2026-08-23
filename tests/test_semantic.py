@@ -1,10 +1,13 @@
-"""`semantic:` — the grammar, the refusals, and the two files it is split across.
+"""`semantic:` — the grammar, the refusals, and the surface they turned into.
 
-M10's first slice ships no vector and no tool: what it ships is the ability to *say* a property is
-worth searching by meaning, the deployment key that says where a vector would come from, and every
-refusal the pairing of those two owes. So this module asserts a spec that declares it, a spec that
-declares it wrongly, a config that configures it, and the one policy that cannot stand beside it —
-and nothing about similarity, because nothing here computes one.
+The first half is M10's first slice, which shipped no vector and no tool: the ability to *say* a
+property is worth searching by meaning, the deployment key that says where a vector would come from,
+and every refusal the pairing of those two owes. The second half is slice 3's `match_<object>` — the
+tool set, the schema and the envelope, plus the two refusals that live above the resolver.
+
+What is *not* here is a similarity. Nothing in this module computes one: the plan is
+`test_resolver.py`'s, the SQL is `test_query_compile.py`'s, and whether a ranking actually ranks is
+`test_match_iceberg.py`'s, because it is the one claim a stub cannot make.
 """
 
 from __future__ import annotations
@@ -221,3 +224,233 @@ def test_a_row_predicate_over_the_semantic_property_is_not_refused(tmp_path):
         [Policy(name="only-open", object_type="Ticket", rows=parse_expr("object.body != 'closed'"))],
     )
     assert bound.select(None).masked("Ticket") == ()
+
+
+# ---- the tool ----------------------------------------------------------------------
+#
+# Slice 3. What is asserted here is the *surface* and the two refusals above the resolver — which
+# tools get built, what their schema says, what comes back — against a stub provider and a fake
+# catalog, because none of that needs a model or a lake. `test_query_compile.py` owns the SQL,
+# `test_resolver.py` owns the plan, and `test_match_iceberg.py` owns the one claim only a real
+# engine over a real warehouse can make: that a ranking actually ranks.
+
+
+class StubProvider:
+    """Two floats per text, so a similarity is arithmetic anybody can check by hand."""
+
+    model = "stub-v1"
+    dims = 2
+
+    def __init__(self, vector=(1.0, 0.0)):
+        self.vector = vector
+        self.calls: list[list[str]] = []
+
+    def embed(self, texts):
+        self.calls.append(list(texts))
+        return [self.vector for _ in texts]
+
+
+class StubCatalog:
+    """Answers the one question the ranked read plane asks a catalog directly."""
+
+    def __init__(self, tables=("_loom_meta.vectors__Ticket",)):
+        self.name = "c"
+        self.tables = set(tables)
+        self.asked: list[str] = []
+
+    def table_exists(self, table):
+        self.asked.append(table)
+        return table in self.tables
+
+
+class StubEngine:
+    def __init__(self, rows=()):
+        self.rows = list(rows)
+        self.plans = []
+
+    def capabilities(self):
+        from loom.query.engine import Capabilities
+
+        return Capabilities(name="stub", vector_search=True)
+
+    def compile(self, plan):
+        from loom.query.engine import CompiledQuery
+
+        self.plans.append(plan)
+        return CompiledQuery(sql="<stub>")
+
+    def execute(self, compiled):
+        return self.rows
+
+
+def _matcher(provider=None, catalog=None, ontology=None, types=("Ticket",)):
+    from loom.embed.match import Matcher
+    from loom.embed.store import VectorStore
+
+    return Matcher(
+        provider=provider or StubProvider(),
+        stores={
+            name: VectorStore(catalog=catalog or StubCatalog(), object_type=name, key_type="string")
+            for name in types
+        },
+    )
+
+
+def _tools(tmp_path, rows=(), matcher=..., extra="  semantic: body"):
+    from loom.mcp.registry import build_tools
+    from loom.resolver import Resolver
+
+    ontology, _ = _build(tmp_path, extra)
+    resolver = Resolver(ontology=ontology, engine=StubEngine(rows))
+    if matcher is ...:
+        matcher = _matcher()
+    return {t.name: t for t in build_tools(resolver, matcher=matcher)}, resolver
+
+
+RANKED = [
+    {"ticketId": "t1", "body": "chargeback filed", "opened": None, "severity": "high",
+     "_loom_score": 0.91, "_loom_embedded_at": None},
+    {"ticketId": "t2", "body": "shipping late", "opened": None, "severity": "low",
+     "_loom_score": 0.12, "_loom_embedded_at": None},
+]
+
+
+def test_a_declared_semantic_property_and_a_provider_make_a_tool(tmp_path):
+    tools, _ = _tools(tmp_path)
+    assert "match_ticket" in tools
+
+
+def test_no_provider_withholds_the_tool_and_nothing_else(tmp_path):
+    """`mcp.writes: false`'s posture. A deployment that configures no model is not withholding a
+    ranking it could serve — it has none — so every other tool is untouched."""
+    tools, _ = _tools(tmp_path, matcher=None)
+    assert "match_ticket" not in tools
+    assert {"get_ticket", "search_ticket", "list_ticket"} <= set(tools)
+
+
+def test_a_type_that_declares_nothing_gets_no_tool(tmp_path):
+    """Even with a provider configured: the spec declares intent and the deployment declares
+    mechanism, so both halves have to be there."""
+    tools, _ = _tools(tmp_path, extra="", matcher=_matcher(types=()))
+    assert not [t for t in tools if t.startswith("match_")]
+
+
+def test_the_tool_takes_text_and_the_same_filters_search_takes(tmp_path):
+    tools, _ = _tools(tmp_path)
+    schema = tools["match_ticket"].input_schema
+    assert schema["required"] == ["text"]
+    assert schema["additionalProperties"] is False
+    assert set(schema["properties"]) == {"text", "filter", "limit", "offset"}
+    # `severity` is what this fixture declares searchable, and the ranked read may narrow on exactly
+    # the same set — one question with one answer.
+    assert set(schema["properties"]["filter"]["properties"]) == set(
+        tools["search_ticket"].input_schema["properties"]["filter"]["properties"]
+    )
+
+
+def test_the_text_argument_is_the_callers_words_not_the_propertys_value(tmp_path):
+    tools, _ = _tools(tmp_path)
+    described = tools["match_ticket"].input_schema["properties"]["text"]["description"]
+    assert "your own words" in described and "Ticket.body" in described
+
+
+def test_a_ranked_result_puts_the_score_beside_the_object(tmp_path):
+    tools, _ = _tools(tmp_path, rows=RANKED)
+    out = tools["match_ticket"].handler({"text": "customer wanted their money back"})
+    assert out["objectType"] == "Ticket" and out["property"] == "body"
+    assert out["model"] == "stub-v1"
+    assert [m["score"] for m in out["matches"]] == [0.91, 0.12]
+    assert out["matches"][0]["object"]["ticketId"] == "t1"
+    assert "score" not in out["matches"][0]["object"]
+
+
+def test_the_envelope_pages_like_every_other_read(tmp_path):
+    tools, _ = _tools(tmp_path, rows=RANKED)
+    out = tools["match_ticket"].handler({"text": "dispute", "limit": 2})
+    assert out["count"] == 2 and out["limit"] == 2 and out["offset"] == 0
+    assert out["hasMore"] is True
+    assert tools["match_ticket"].handler({"text": "dispute", "limit": 5})["hasMore"] is False
+
+
+def test_the_caller_s_words_are_what_gets_embedded(tmp_path):
+    provider = StubProvider()
+    tools, _ = _tools(tmp_path, rows=RANKED, matcher=_matcher(provider=provider))
+    tools["match_ticket"].handler({"text": "  sent the money back  "})
+    # Stripped, and embedded once — a batch verb with a batch of one, never a call per row.
+    assert provider.calls == [["sent the money back"]]
+
+
+def test_a_filter_reaches_the_plan(tmp_path):
+    tools, resolver = _tools(tmp_path, rows=RANKED)
+    tools["match_ticket"].handler({"text": "dispute", "filter": {"severity": "high"}})
+    assert resolver.engine.plans[-1].source.filters
+
+
+def test_blank_text_is_refused_rather_than_answered(tmp_path):
+    """`{"in": []}`'s argument. An empty ranking a caller cannot tell from a real one is worse than
+    a sentence saying what to do, and `embeddable` decides this exactly as it decides a row has no
+    text."""
+    from loom.resolver import ResolverError
+
+    tools, _ = _tools(tmp_path)
+    for text in ("", "   "):
+        with pytest.raises(ResolverError, match="empty or blank"):
+            tools["match_ticket"].handler({"text": text})
+
+
+def test_an_unembedded_type_is_refused_and_names_the_command(tmp_path):
+    """A sidecar that does not exist yet is an ordinary state of an ordinary deployment, so it gets
+    a sentence rather than a catalog error — and rather than an empty page, which a caller could not
+    tell from *nothing was similar*."""
+    from loom.resolver import ResolverError
+
+    tools, _ = _tools(tmp_path, matcher=_matcher(catalog=StubCatalog(tables=())))
+    with pytest.raises(ResolverError, match="loom embed --type Ticket"):
+        tools["match_ticket"].handler({"text": "dispute"})
+
+
+def test_the_lake_is_only_asked_after_the_argument_is_checked(tmp_path):
+    """`cmd_query`'s ordering: a blank query should not need a reachable metastore to be refused."""
+    from loom.resolver import ResolverError
+
+    catalog = StubCatalog()
+    tools, _ = _tools(tmp_path, matcher=_matcher(catalog=catalog))
+    with pytest.raises(ResolverError):
+        tools["match_ticket"].handler({"text": ""})
+    assert catalog.asked == []
+
+
+def test_the_ranked_plane_holds_nothing_that_can_write_a_vector(tmp_path):
+    """Slice 2 split `VectorStore` in two so this could be a fact about the object rather than a
+    convention: a serving process can rank a sidecar and cannot maintain one."""
+    matcher = _matcher()
+    assert all(store.writer is None for store in matcher.stores.values())
+
+
+def test_bind_matching_answers_none_for_a_deployment_with_no_provider(tmp_path):
+    from loom.embed.match import bind_matching
+
+    ontology, _ = _build(tmp_path, "  semantic: body")
+    config, _ = _config(tmp_path, "  writes: false")
+    assert bind_matching(ontology, config, {}) is None
+
+
+def test_bind_matching_answers_none_for_a_spec_that_declares_nothing(tmp_path):
+    from loom.embed.match import bind_matching
+
+    ontology, _ = _build(tmp_path, "")
+    config, _ = _config(tmp_path, "  embedding: { provider: local, model: bge-small }")
+    assert bind_matching(ontology, config, {}) is None
+
+
+def test_bind_matching_loads_no_model(tmp_path):
+    """A server whose embedding model is a 150MB download still starts in the time it always did —
+    `provider_for` stays offline by construction and the first `match_` pays."""
+    from loom.embed.match import bind_matching
+    from loom.embed.provider import LocalProvider
+
+    ontology, _ = _build(tmp_path, "  semantic: body")
+    config, _ = _config(tmp_path, "  embedding: { provider: local, model: bge-small }")
+    matcher = bind_matching(ontology, config, {"c": StubCatalog()})
+    assert isinstance(matcher.provider, LocalProvider)
+    assert matcher.provider._impl is None and matcher.provider._dims is None

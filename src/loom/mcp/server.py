@@ -22,6 +22,7 @@ from typing import Any
 
 from ..action import ActionError, ActionRuntime
 from ..config import LoomConfig, McpConfig
+from ..embed.match import Matcher
 from ..governance import PolicyProgram
 from ..model import Ontology
 from ..resolver import Resolver, ResolverError
@@ -43,9 +44,10 @@ class LoomMCPServer:
         runtime: ActionRuntime | None = None,
         actor: str | None = None,
         program: PolicyProgram | None = None,
+        matcher: Matcher | None = None,
     ) -> LoomMCPServer:
         return cls(
-            tools={t.name: t for t in build_tools(resolver, runtime, actor, program)},
+            tools={t.name: t for t in build_tools(resolver, runtime, actor, program, matcher)},
             server_name=server_name,
         )
 
@@ -117,6 +119,13 @@ def build_server(ontology: Ontology, config: LoomConfig, catalogs: Mapping[str, 
     + `EditLogWriter` and *not* `CatalogWriter` serves every tool in this set. Point an MCP client
     at a lake and it cannot migrate one.
 
+    **The ranked plane extends that claim rather than qualifying it**, which is worth saying because
+    it arrived with a port that can *delete*. `bind_matching` builds each `VectorStore` with no
+    `VectorWriter`, and `vector_writer_for()` — the one place a handle becomes a writable one — is
+    not called here or anywhere the surface can reach. So the same fake serves `match_` too: this
+    process can rank a sidecar and cannot maintain one, and `loom embed` stays the only thing that
+    can remove a vector.
+
     And when `mcp.writes` is off — the default — the question does not arise: no runtime is built,
     so the process is exactly the read-only one M1 shipped.
 
@@ -154,6 +163,7 @@ def build_server(ontology: Ontology, config: LoomConfig, catalogs: Mapping[str, 
       policy is the same for every caller and the tool set is built once, from `announcing()`."""
     from ..action import bind_writes
     from ..catalog import open_catalogs
+    from ..embed.match import bind_matching
     from ..resolver import bind_reads
 
     open_cats = catalogs if catalogs is not None else open_catalogs(config)
@@ -167,6 +177,12 @@ def build_server(ontology: Ontology, config: LoomConfig, catalogs: Mapping[str, 
     # the same config against the same ontology, which is what stops a served surface and a dev
     # command from withholding different things.
     writes = bind_writes(ontology, config, open_cats) if config.mcp.writes else None
+    # A third binding, and it is `None` for most deployments. It holds the provider and one
+    # *unwritable* view of each sidecar — see `bind_matching` — so the sentence above about what a
+    # serving process holds gains one clause and loses nothing: a catalog that implements
+    # `VectorWriter` is still never exchanged for one here, so this process can rank vectors and
+    # cannot maintain them. `loom embed` is the only thing that can.
+    matching = bind_matching(ontology, config, open_cats)
     if not config.mcp.attests:
         # The refusal every other surface reaches by *needing* a decided policy set, reached here on
         # purpose instead. A stdio server is the case: it can carry policies naming a caller and can
@@ -182,6 +198,7 @@ def build_server(ontology: Ontology, config: LoomConfig, catalogs: Mapping[str, 
         runtime=writes.announcing() if writes is not None else None,
         actor=config.mcp.actor,
         program=reads.program,
+        matcher=matching,
     )
     # The announcing resolver, deliberately: what a caller of this function wants it for is the
     # banner — what this deployment withholds and which policies withhold it — and reading with it
@@ -247,6 +264,19 @@ def build_mcp_server(loom_server: LoomMCPServer):
         text, is_error = loom_server.call(params.name, dict(params.arguments or {}))
         return types.CallToolResult(content=[types.TextContent(type="text", text=text)], isError=is_error)
 
+    # Named in the instructions rather than left to be discovered in the tool list, because it is
+    # the one tool whose *absence* an agent would otherwise read as "this data cannot be searched
+    # that way" rather than "this deployment did not switch it on". When it is there, saying when to
+    # reach for it is the whole difference between an agent that finds a chargeback and one that
+    # greps for the word.
+    rankable = [t for t in loom_server.tools if t.startswith("match_")]
+    match_note = (
+        " When a search by keyword comes back empty and the answer would be in prose, use "
+        "match_<object>: it ranks rows by meaning rather than by wording, and its `filter` argument "
+        "narrows before the ranking."
+        if rankable
+        else ""
+    )
     writable = [t for t in loom_server.tools if t.startswith("run_")]
     write_note = (
         " Use run_<action> to change one object through a declared action: its result is typed, so "
@@ -260,7 +290,7 @@ def build_mcp_server(loom_server: LoomMCPServer):
         instructions=(
             "This server exposes a Loom ontology: typed objects, declared links, and governed "
             "reads. Use get_/search_/list_ tools for objects and `traverse` to follow a link. "
-            "There is no SQL interface." + write_note
+            "There is no SQL interface." + match_note + write_note
         ),
         on_list_tools=on_list_tools,
         on_call_tool=on_call_tool,
