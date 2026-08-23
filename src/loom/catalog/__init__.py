@@ -6,13 +6,14 @@ SQLite-backed warehouse in a test and a REST catalog in production, and it's whe
 non-Iceberg backing store would eventually plug in.
 
 The read port is deliberately narrow: introspect a table's columns, scan it, and ask which snapshot
-you just read. Writes are five *separate* ports, so holding a `Catalog` — which is all the resolver,
+you just read. Writes are six *separate* ports, so holding a `Catalog` — which is all the resolver,
 the engines and `loom serve` are ever given — carries no ability to write at all, and holding one
 writer carries no ability to do another's job. `loom apply` reaches for `writer_for()` and gets
 schema verbs only; the action runtime reaches for `row_writer_for()` and gets one-row verbs only,
 plus `edit_log_writer_for()`, which is one append to one table the port itself names; a declared
 ingest reaches for `bulk_writer_for()` and gets batch verbs and no DDL, plus `load_log_writer_for()`
-on the same terms.
+on the same terms; `loom embed` reaches for `vector_writer_for()` and gets an upsert and a delete over
+sidecars it cannot name, addressed by object type.
 
 Every `RowWriter` verb takes the snapshot its caller read and asserts it *inside* the commit, so a
 read-then-write behaves as one decision without the port ever growing a lock, a session, or a verb
@@ -29,6 +30,7 @@ from __future__ import annotations
 from .base import (
     EDIT_LOG_TABLE,
     LOAD_LOG_TABLE,
+    VECTOR_TABLE_PREFIX,
     BulkWriter,
     Catalog,
     CatalogError,
@@ -40,10 +42,13 @@ from .base import (
     RowWriter,
     SchemaEdit,
     TableSchema,
+    VectorWriter,
     bulk_writer_for,
     edit_log_writer_for,
     load_log_writer_for,
     row_writer_for,
+    vector_table,
+    vector_writer_for,
     writer_for,
 )
 from .factory import open_catalog, open_catalogs
@@ -51,6 +56,7 @@ from .factory import open_catalog, open_catalogs
 __all__ = [
     "EDIT_LOG_TABLE",
     "LOAD_LOG_TABLE",
+    "VECTOR_TABLE_PREFIX",
     "BulkWriter",
     "Catalog",
     "CatalogError",
@@ -62,11 +68,14 @@ __all__ = [
     "RowWriter",
     "SchemaEdit",
     "TableSchema",
+    "VectorWriter",
     "bulk_writer_for",
     "edit_log_writer_for",
     "load_log_writer_for",
     "open_catalog",
     "open_catalogs",
     "row_writer_for",
+    "vector_table",
+    "vector_writer_for",
     "writer_for",
 ]

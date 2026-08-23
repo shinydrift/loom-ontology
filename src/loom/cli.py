@@ -479,6 +479,116 @@ def _render_load(result, title: str) -> str:
     return "\n".join(lines)
 
 
+def cmd_embed(args) -> int:
+    """Bring every declared sidecar level with the text it describes.
+
+    It takes an **ontology path and, optionally, one object type**, and nothing that describes the
+    embedding: not a provider, not a model, not a dimension. Those live in `loom.yaml` for
+    `cmd_ingest`'s reason — a flag that could contradict the reviewed file would let one run write
+    vectors the served surface cannot rank, and the model is folded into every stored hash, so the
+    contradiction would be silent until a `match_` returned nothing.
+
+    `--remodel` is the one operator decision here, and it is a decision only a person can make: every
+    vector was produced by a model this deployment no longer configures, and re-deriving them is
+    expensive but correct. Unlike `loom apply`, which refuses a breaking plan with no flag at all —
+    there no safe version exists, and here it is merely expensive and reversible.
+
+    `--dry-run` previews. Every real reconcile previews first, for `cmd_run`'s reason: what the
+    prompt shows should be what is about to happen rather than a second guess at it. The preview
+    calls the model exactly once, to ask how wide it is — see `EmbedRuntime.reconcile`."""
+    diag = Diagnostics()
+    try:
+        ontology, config = _load_project(args.path, diag)
+    except SpecErrors as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    from .catalog import CatalogError, open_catalogs
+    from .embed import EmbedError, build_embedder
+    from .governance import PolicyError
+    from .mcp.registry import json_safe
+    from .negotiate import CapabilityError
+
+    try:
+        runtime = build_embedder(ontology, config, open_catalogs(config))
+        preview = runtime.reconcile(args.object_type, dry_run=True, remodel=args.remodel)
+    except (EmbedError, CapabilityError, PolicyError, CatalogError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    # Not printed when the run never got as far as reading a type, which is what an unreachable
+    # model looks like. A header over an empty list, above the error that explains it, is one more
+    # line between an operator and the sentence they need.
+    if preview.types:
+        print(_render_embed(preview, str(args.path)), file=sys.stderr)
+    if args.dry_run or not preview.ok:
+        print(json.dumps(json_safe(preview.as_json()), indent=2, default=str))
+        for failure in preview.failures:
+            print(f"error: {failure.code}: {failure.message}", file=sys.stderr)
+        return 0 if preview.ok else 1
+
+    # Nothing to do is not a question worth asking about. A reconcile with no pending rows and no
+    # orphans writes nothing, and prompting for it would train an operator to confirm without reading.
+    changing = preview.rows_embedded or preview.rows_pruned
+    if changing and not _confirmed(args.yes, "embed"):
+        print("aborted — nothing was written", file=sys.stderr)
+        return 1
+
+    try:
+        result = runtime.reconcile(args.object_type, remodel=args.remodel)
+    except CatalogError as e:  # pragma: no cover - the runtime folds these into WRITE_FAILED
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    print(json.dumps(json_safe(result.as_json()), indent=2, default=str))
+    for failure in result.failures:
+        print(f"error: {failure.code}: {failure.message}", file=sys.stderr)
+    if result.rows_pruned:
+        print(
+            f"note: {result.rows_pruned} vector(s) were pruned — that is the only path by which "
+            f"text Loom derived from a deleted row stops being recoverable, and its lag is the "
+            f"interval between runs of this command.",
+            file=sys.stderr,
+        )
+    print(
+        f"{result.status} · {result.rows_embedded} embedded, {result.rows_pruned} pruned "
+        f"via {result.model}/{result.dims}d",
+        file=sys.stderr,
+    )
+    return 0 if result.ok else 1
+
+
+def _render_embed(result, title: str) -> str:
+    """What is about to happen, before the prompt.
+
+    Shaped like `_render_load` and `render_plan`, and the symbols mean what they mean there: `~`
+    changes in place — a vector being recomputed is the same row saying something new — and `-` goes
+    away. There is no `+`: a first embed and a refresh are the same write, and spelling them
+    differently would imply the sidecar distinguishes them. It does not."""
+    lines = [f"loom embed — {title} · {result.model or '(no model)'}"]
+    for t in result.types:
+        marks = []
+        if t.rows_embedded:
+            marks.append(f"~ {t.rows_embedded} to embed")
+        if t.rows_pruned:
+            marks.append(f"- {t.rows_pruned} to prune")
+        if not marks:
+            marks.append("current")
+        detail = f"    {t.object_type} · {', '.join(marks)} · {t.rows_current} current"
+        # Stated per type rather than summed, because it is the count that is *not* work outstanding
+        # and a total would invite reading it as a backlog. See `TypeReconcile`.
+        if t.rows_without_text:
+            detail += f", {t.rows_without_text} with no text"
+        if t.rows_unkeyed:
+            detail += f", {t.rows_unkeyed} with no key"
+        # The *oldest* stamp, which is the only one an operator can act on: it says every vector
+        # here is at least this current. Absent for a sidecar that has never held a row.
+        if t.embedded_as_of:
+            detail += f" · embedded as of {t.embedded_as_of:%Y-%m-%d %H:%M}Z"
+        lines.append(detail)
+    return "\n".join(lines)
+
+
 def cmd_serve(args) -> int:
     import asyncio
 
@@ -960,6 +1070,30 @@ def main(argv: list[str] | None = None) -> int:
     )
     i.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     i.set_defaults(func=cmd_ingest)
+
+    e = sub.add_parser("embed", help="bring the vector sidecars level with the text they describe")
+    e.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")
+    # A flag rather than a leading positional, which is where every other command puts its subject.
+    # The difference is that this command *has* no required subject: it reconciles every type that
+    # declares `semantic:`, so a bare `loom embed ontology` is the ordinary call — and two optional
+    # positionals would make that one ambiguous with `loom embed Customer`, resolvable only by
+    # guessing which of them names a directory. `--type` narrows the run; it does not identify it.
+    e.add_argument(
+        "--type",
+        dest="object_type",
+        default=None,
+        metavar="NAME",
+        help="reconcile one objectType declaring 'semantic:' (default: every one that does)",
+    )
+    e.add_argument("--dry-run", action="store_true", help="report what would change, write nothing")
+    e.add_argument(
+        "--remodel",
+        action="store_true",
+        help="re-embed vectors produced by a different model — how you say 'yes, the model "
+        "changed, do it anyway'",
+    )
+    e.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    e.set_defaults(func=cmd_embed)
 
     s = sub.add_parser("serve", help="serve the ontology as MCP tools over stdio")
     s.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")

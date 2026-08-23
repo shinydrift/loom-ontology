@@ -1627,8 +1627,9 @@ about the word (*it filters the result set*), wrong about the shape.
 - [x] **1 — the grammar, and every refusal it owes.** `semantic:` in the loader, `mcp.embedding` in
       the config, `vector_search` in `NEGOTIATED`, the fifth mask refusal. No vector, no table, no
       tool. Grammar before plane, the way M5 went.
-- [ ] **2 — `EmbeddingProvider`, the sidecar, and `loom embed`.** Loom's first model dependency, and
-      where staleness is defined.
+- [x] **2 — `EmbeddingProvider`, the sidecar, and `loom embed`.** Loom's first model dependency, and
+      where staleness is defined. Also the seventh port, and the first `list<float>` column Loom has
+      ever created.
 - [ ] **3 — `match_<object>`.** The tool, the brute-force lowering, the result envelope.
 - [ ] **4 — `via`.** Cross-object filtering, without which the interesting queries are not
       expressible. **M10 closes here, and there is no partial ship**: slices 1–3 generate a tool
@@ -1766,10 +1767,71 @@ gets re-litigated by whoever builds it.
   row that exists, so the honesty moves from the caller to the operator, and the reconcile has to be
   reliable rather than best-effort. The count goes to `loom embed`'s output and the banner.
 
-- **A model change refuses and names the flag.** Every hash mismatching at once is a model swap
-  rather than a warehouse of edits, and `loom embed` says so instead of politely re-embedding
-  everything. Deliberately unlike `loom apply`, which refuses a breaking plan with *no* force flag:
-  there no safe version of the operation exists, and here it is merely expensive and reversible.
+- **A model change refuses and names the flag** — `--remodel`. Deliberately unlike `loom apply`,
+  which refuses a breaking plan with *no* force flag: there no safe version of the operation exists,
+  and here it is merely expensive and reversible.
+
+  **Built differently from the plan, and the plan was the weaker version.** This said a swap is
+  recognised by *every hash mismatching at once*, which is true and is a heuristic — and it misfires
+  exactly where it is least tolerable, on a small table whose rows all legitimately changed between
+  reconciles. The model that produced a vector is a fact about that vector, so by the sidecar's own
+  "only facts about the row it is keyed to" rule it belongs in the table; a dictionary-encoded string
+  per row turns the inference into the fact. `source_hash` still folds the model in, so invalidation
+  stays by construction. What changed is that the *refusal* is now exact rather than probabilistic.
+
+  A consequence worth stating, because the flag's name suggests otherwise: `--remodel` **permits** a
+  re-embed and does not cause one. Against an unchanged model the hashes still match and the honest
+  amount of work is none.
+
+### Decided while slice 2 was built
+
+Everything above was decided before the code existed. These came out of writing it, and each is
+recorded because it was a real choice rather than the only option:
+
+- **`VectorWriter` is the seventh port, and the first that opens a plane rather than re-cutting one.**
+  The two logs write *records*: append-only, never read back, permanently without a delete verb
+  because an expired record and a lost one are the same sight. A vector is not a record — it
+  describes a row that exists now, it goes stale, and keeping it correct needs exactly the upsert and
+  the delete the log ports refuse. The alternative was a `BulkWriter`, which fails on the property
+  `_loom_meta` has always had: it takes a table name, so a runtime holding one to maintain a sidecar
+  could point it at the ontology's own tables.
+
+  The port therefore keeps *the table is not an argument* while writing many tables — its verbs take
+  an **object type** and derive the name themselves. `vector_table()` is the only function that
+  produces one.
+
+- **`list<float>` is creatable without being in `ALL_KINDS`, and that gap is the point.** No property
+  may declare it, because a spec that could say `type: list<float>` is a spec that can hand Loom a
+  vector — the thing `semantic:` exists not to be. The type system stays what an *ontology* can say;
+  `iceberg_type()` becomes what *Loom* can create. This milestone is the first time those differ.
+  Nested field ids are allocated past the last column, since Iceberg numbers them out of the same
+  space and a collision is a corrupt schema rather than an error.
+
+- **The prune commits before the merge.** An orphan is text that outlived the row it described, so a
+  run that fails after the merge should still have removed it. The reverse ordering makes the one
+  operation with a deadline behind it the one most likely to be skipped.
+
+- **A reconcile commits per batch, and is resumable rather than atomic.** What needs embedding is
+  recomputed from hashes every run, never tracked in a cursor, so a failure halfway leaves the
+  batches it committed and the rest for next time. One commit for the whole run would buy atomicity
+  with a gigabyte of Python floats held in memory — paid to make a failure *less* resumable.
+
+- **A dry run calls the model exactly once.** `dims` is folded into every `source_hash`, so a preview
+  that guessed it would report on hashes the real run will not compute — it would preview a different
+  reconcile. One probe string is the smallest honest version of the command.
+
+- **Blank text is the absence of text, not staleness.** A row whose semantic property is null or
+  empty gets no vector and is counted apart, because a reconcile that called it pending would embed
+  nothing and never converge. It also means the orphan set keys on *rows with text*: text that is
+  blanked leaves a vector behind exactly as a deleted row does.
+
+- **`--type` is a flag, not a leading positional.** Every other command puts its subject first; this
+  one has no required subject, so two optional positionals would make `loom embed ontology` ambiguous
+  with `loom embed Customer`, resolvable only by guessing which names a directory.
+
+- **`provider: local` is fastembed**, which is a smaller model than the obvious alternative and the
+  cost is stated: sentence-transformers is the quality baseline and arrives with torch, so the
+  *default* provider would pull over a gigabyte. A default that expensive is one people route around.
 
 ### Refused, permanently
 
@@ -1789,13 +1851,23 @@ short text worth embedding. So a row erased from its table leaves recoverable te
 Not reachable through `match_`, since the join to a deleted row returns nothing, but readable by
 anyone with warehouse access, and Loom is what put it there.
 
-M10 does not build the general erasure command; it owes three small things to the slice that will.
-Slice 2's orphan prune is documented as *the* vector erasure path, with its lag stated. A `delete`
-action prunes that key's vector in the same breath and **fails if it cannot** — the one place the
-best-effort rule does not apply, because the two failures are not symmetric: a failed embed leaves a
-row briefly missing from search, and a failed vector delete leaves personal data outliving the
-request that erased it. And the backlog entry gains a line, so the erasure slice does not ship
-correct against a world that stopped existing.
+M10 does not build the general erasure command; it owed three small things to the slice that will,
+and slice 2 has paid all three.
+
+Slice 2's orphan prune is documented in `embed.store` as *the* vector erasure path, with its lag
+stated: exactly the interval between reconciles. A `delete` action prunes that key's vector **before**
+it deletes the row and **fails if it cannot** — the one place the best-effort rule does not apply,
+because the two failures are not symmetric: a failed embed leaves a row briefly missing from search,
+and a failed vector delete leaves personal data outliving the request that erased it. The ordering is
+what makes that promise keepable; refusing after the row is gone would leave nothing to refuse, and
+the inverse failure (prune lands, row delete loses its race) is the harmless direction, since a row
+with no vector is what the reconcile exists to notice. And the backlog entry names three targets, so
+the erasure slice does not ship correct against a world that stopped existing.
+
+What it costs is a fourth port in the action runtime's reach, and that is named rather than glossed:
+a `VectorWriter` can delete rows, which nothing the action runtime held could previously do. It is
+bounded by the same property the log ports rely on — no verb takes a table name — so the whole of
+what it reaches is `_loom_meta.vectors__<type>` for the type the action already writes.
 
 ---
 

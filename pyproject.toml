@@ -28,7 +28,14 @@ mcp = ["mcp>=2.0"]
 # whether a caller can be named. `[crypto]` is not optional either — without it PyJWT can verify
 # only symmetric signatures, which is exactly the algorithm class `auth.ALGORITHMS` refuses.
 auth = ["pyjwt[crypto]>=2.9"]
-all = ["loom-ontology[iceberg,duckdb,mcp,auth]"]
+# Embedding. fastembed rather than sentence-transformers: it runs the same class of model on
+# onnxruntime instead of torch, which is the difference between a ~150MB install and a ~2GB one for
+# what `provider: local` — the *default* provider — needs. httpx2 is what `provider: openai` posts
+# with: `mcp` 2.x depends on it, so it is the HTTP client this project already has rather than a
+# second one. Declared here regardless, because a transitive dependency is one an upstream may drop
+# in a patch release — and this extra must stand up without the `mcp` extra installed at all.
+embed = ["fastembed>=0.4", "httpx2>=2"]
+all = ["loom-ontology[iceberg,duckdb,mcp,auth,embed]"]
 
 [project.scripts]
 loom = "loom.cli:main"

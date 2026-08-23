@@ -684,6 +684,18 @@ class _Run:
         stamp = commit_properties(self.edit_id, self.action.api_name, self.actor)
         op = self.action.effect.op
         if op == "deleteObject":
+            # **Before the row, and this is the one place a failure here refuses the whole action.**
+            # M10's asymmetry: a failed embed leaves a row briefly missing from search and the next
+            # reconcile fixes it, while a vector that survives its row is a partially invertible copy
+            # of text somebody asked to be erased, outliving the request. So the two failures get
+            # opposite postures — embedding is best-effort and never part of an action's promise;
+            # pruning is neither.
+            #
+            # Pruning *first* is what makes "fails if it cannot" mean something. Refusing after the
+            # row is gone would leave nothing to refuse. And the inverse failure — the prune lands,
+            # the row delete then loses its race — is the harmless direction: a row with no vector is
+            # exactly what the reconcile exists to notice.
+            self._prune_vector(catalog, key)
             writer.delete_row(
                 table, key_column, key, expect_snapshot_id=snapshot, commit_properties=stamp
             )
@@ -707,6 +719,33 @@ class _Run:
             expect_snapshot_id=snapshot,
             commit_properties=stamp,
         )
+
+    def _prune_vector(self, catalog: Catalog, key: Any) -> None:
+        """Remove this key's row from the type's vector sidecar, or raise.
+
+        Silent for a type that declares no `semantic:` — there is no sidecar and nothing to reach for
+        — and silent for a sidecar that was never created, which `delete_vectors` decides for itself
+        rather than being asked here. Both of those are the ordinary state of most deployments, and
+        neither is a permission this action needs.
+
+        **It asks for a fourth port**, which widens what an action can reach and is worth naming: a
+        `VectorWriter` can delete rows, which no port the action runtime holds could previously do.
+        What bounds it is the same thing that bounds the log ports — no verb takes a table name, so
+        the whole of what this reaches is `_loom_meta.vectors__<type>` for the type this action
+        already writes.
+
+        A catalog that cannot be exchanged for one raises `CatalogError`, and that refuses the
+        action rather than being swallowed. It is the honest answer: a deployment declaring a delete
+        action against a semantic type on a backend with no vector port cannot promise an erasure,
+        and reporting `applied` would be the claim this whole path exists to avoid making."""
+        if self.target.semantic is None:
+            return
+        from ..catalog.base import vector_writer_for
+
+        # Unconditional, and the one write this runtime makes that asserts no snapshot. The port
+        # has no parameter for one: the sidecar was never read, and a check here would let a
+        # concurrent `loom embed` refuse an erasure, which is precisely backwards.
+        vector_writer_for(catalog).delete_vectors(self.target.api_name, [key])
 
     def _columns(self, row: Mapping[str, Any], values: Mapping[str, Any]) -> dict[str, Any]:
         """Property-named values back onto physical columns, over the row that was read.

@@ -675,3 +675,131 @@ def test_ingest_names_the_actor_on_a_refusal_too(tmp_path, capsys, monkeypatch):
     config = load_config(find_config(ontology), diag)
     history = LoadLog(catalog=open_catalogs(config)["rest_main"]).history()
     assert [r["actor"] for r in history] == ["ci:nightly"]
+
+
+# ---- embed ---------------------------------------------------------------------
+
+
+EMBED_CONFIG = LOCAL_CONFIG + """
+mcp:
+  embedding:
+    provider: local
+    model: bge-small
+"""
+
+
+class _StubProvider:
+    """Stands in for a real model, so these tests assert the *command* rather than fastembed."""
+
+    model = "bge-small"
+    dims = 3
+
+    def embed(self, texts):
+        return [(float(len(t)), 1.0, 2.0) for t in texts]
+
+
+@pytest.fixture
+def stub_provider(monkeypatch):
+    monkeypatch.setattr("loom.embed.runtime.provider_for", lambda config: _StubProvider())
+
+
+def _semantic_project(tmp_path: Path, config: str = EMBED_CONFIG) -> Path:
+    """The valid fixture with `semantic: name` written into the YAML, applied to a real warehouse.
+
+    Declared in a *copy* rather than in `fixtures/valid`, for the reason M10's first slice gave for
+    leaving that fixture alone: it is shared by two dozen tests and by the governance suite that
+    masks `Customer.name`."""
+    ontology = _seeded(tmp_path, config)
+    customer = ontology / "customer.yaml"
+    customer.write_text(customer.read_text().replace("searchable:", "semantic: name\n  searchable:"))
+    return ontology
+
+
+def test_embed_takes_a_path_and_a_type_and_nothing_that_describes_the_model():
+    """`cmd_ingest`'s rule on the embedding plane: the model lives in `loom.yaml`, because a flag
+    that could contradict the reviewed file would write vectors the served surface cannot rank —
+    and silently, since the model is folded into every stored hash."""
+    args = vars(_parsed(["embed", "ontology", "--type", "Customer"], "cmd_embed"))
+    assert set(args) - {"command", "func"} == {"object_type", "path", "dry_run", "remodel", "yes"}
+    for forbidden in ("provider", "model", "dims", "batch_size", "table"):
+        assert forbidden not in args
+
+
+def test_embed_without_a_configured_provider_says_so_and_does_not_start(tmp_path, capsys):
+    """Absent `mcp.embedding` withholds a tool rather than refusing a deployment — but there is
+    nothing for *this* command to do, and saying so beats a traceback."""
+    ontology = _semantic_project(tmp_path, LOCAL_CONFIG)
+
+    assert main(["embed", str(ontology)]) == 1
+    assert "no 'mcp.embedding'" in capsys.readouterr().err
+
+
+def test_embed_on_a_spec_that_declares_no_semantic_property_says_so(tmp_path, capsys):
+    ontology = _seeded(tmp_path, EMBED_CONFIG)
+
+    assert main(["embed", str(ontology)]) == 1
+    assert "nothing to embed" in capsys.readouterr().err
+
+
+def test_embed_dry_run_reports_the_work_and_writes_nothing(tmp_path, capsys, stub_provider):
+    ontology = _semantic_project(tmp_path)
+    main(["run", "createOrder", str(ontology), "--param", "orderId=o1",
+          "--param", "customer=c1", "--param", "total=5", "--yes"])
+
+    assert main(["embed", str(ontology), "--dry-run"]) == 0
+    out = capsys.readouterr()
+    assert '"status": "previewed"' in out.out
+    assert "loom embed" in out.err
+
+    from loom.catalog import open_catalogs
+    from loom.catalog.base import vector_table
+    from loom.config import find_config, load_config
+    from loom.errors import Diagnostics
+
+    diag = Diagnostics()
+    config = load_config(find_config(ontology), diag)
+    assert not open_catalogs(config)["rest_main"].table_exists(vector_table("Customer"))
+
+
+def test_embed_writes_the_sidecar_and_reports_the_model(tmp_path, capsys, stub_provider):
+    ontology = _semantic_project(tmp_path)
+
+    assert main(["embed", str(ontology), "--yes"]) == 0
+    out = capsys.readouterr()
+    assert '"status": "applied"' in out.out
+    assert "embedded" in out.err and "bge-small/3d" in out.err
+
+
+def test_embed_is_idempotent_from_the_command_line(tmp_path, capsys, stub_provider):
+    """The second run is the one an operator will schedule, so it is the one worth pinning."""
+    ontology = _semantic_project(tmp_path)
+    assert main(["embed", str(ontology), "--yes"]) == 0
+    capsys.readouterr()
+
+    assert main(["embed", str(ontology), "--yes"]) == 0
+    assert '"rowsEmbedded": 0' in capsys.readouterr().out
+
+
+def test_embed_refuses_an_unknown_type_by_name(tmp_path, capsys, stub_provider):
+    ontology = _semantic_project(tmp_path)
+
+    assert main(["embed", str(ontology), "--type", "Ghost"]) == 1
+    assert "not declared" in capsys.readouterr().err
+
+
+def test_embed_refuses_a_masked_semantic_property_rather_than_filling_a_sidecar(tmp_path, capsys,
+                                                                               stub_provider):
+    """The back door this command must not be: a mask that stops the ranking but not the vector
+    behind it withholds nothing. The refusal is `bind_policies`', reached through `bind_reads`."""
+    masked = EMBED_CONFIG + """
+governance:
+  policies:
+    - name: hide-name
+      objectType: Customer
+      mask: [name]
+"""
+    ontology = _semantic_project(tmp_path, masked)
+
+    assert main(["embed", str(ontology)]) == 1
+    err = capsys.readouterr().err
+    assert "semantic property" in err and "gradient" in err
