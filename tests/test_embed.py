@@ -577,7 +577,7 @@ def test_the_openai_provider_refuses_without_a_key_rather_than_reading_one_from_
 def test_the_openai_provider_reorders_by_index(monkeypatch):
     """The API documents that embeddings may come back out of order, and the port's contract is
     positional. Without this sort every row quietly gets its neighbour's meaning."""
-    import httpx
+    httpx2 = pytest.importorskip("httpx2", reason="needs the [embed] extra")
 
     from loom.embed import OpenAIProvider
 
@@ -587,20 +587,20 @@ def test_the_openai_provider_reorders_by_index(monkeypatch):
         {"index": 0, "embedding": [1.0]},
     ]}
     monkeypatch.setattr(
-        httpx, "post", lambda *a, **k: httpx.Response(200, json=payload, request=httpx.Request("POST", "http://x"))
+        httpx2, "post", lambda *a, **k: httpx2.Response(200, json=payload, request=httpx2.Request("POST", "http://x"))
     )
     assert OpenAIProvider(model="m").embed(["first", "second"]) == ((1.0,), (2.0,))
 
 
 def test_the_openai_provider_refuses_a_short_batch(monkeypatch):
-    import httpx
+    httpx2 = pytest.importorskip("httpx2", reason="needs the [embed] extra")
 
     from loom.embed import OpenAIProvider
 
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     payload = {"data": [{"index": 0, "embedding": [1.0]}]}
     monkeypatch.setattr(
-        httpx, "post", lambda *a, **k: httpx.Response(200, json=payload, request=httpx.Request("POST", "http://x"))
+        httpx2, "post", lambda *a, **k: httpx2.Response(200, json=payload, request=httpx2.Request("POST", "http://x"))
     )
     with pytest.raises(EmbeddingError, match="positional"):
         OpenAIProvider(model="m").embed(["first", "second"])
@@ -790,14 +790,14 @@ def test_a_model_swap_is_refused_before_any_type_is_written():
 
 def test_the_openai_provider_turns_a_wrong_shaped_response_into_a_failure():
     """A right-length, wrong-shape response is a failed embed rather than a traceback."""
-    import httpx
+    httpx2 = pytest.importorskip("httpx2", reason="needs the [embed] extra")
 
     from loom.embed import OpenAIProvider
 
     payload = {"data": [{"index": 0, "no_embedding_here": True}]}
     with pytest.MonkeyPatch.context() as m:
         m.setenv("OPENAI_API_KEY", "sk-test")
-        m.setattr(httpx, "post", lambda *a, **k: httpx.Response(
-            200, json=payload, request=httpx.Request("POST", "http://x")))
+        m.setattr(httpx2, "post", lambda *a, **k: httpx2.Response(
+            200, json=payload, request=httpx2.Request("POST", "http://x")))
         with pytest.raises(EmbeddingError, match="not embeddings"):
             OpenAIProvider(model="m").embed(["one"])

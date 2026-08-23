@@ -162,8 +162,11 @@ class OpenAIProvider:
     a repository; a credential in one is a credential in a diff. `mcp.auth` makes the same call from
     the other direction — it names an issuer and a JWKS URI and never a secret.
 
-    **`httpx` rather than the stdlib**, because it is already a hard dependency of `mcp` and this
-    milestone should not add a second HTTP client to a project that has one.
+    **`httpx2` rather than the stdlib, and rather than `httpx`.** `mcp` 2.x depends on `httpx2` —
+    `test_mcp_http.py` has driven the served surface through it since M4 — so that is the HTTP client
+    this project already has. Reaching for `httpx` instead would have added a *second* one, which is
+    the thing this note exists to avoid; it is declared in the `embed` extra anyway, because a
+    transitive dependency is one an upstream may drop in a patch release.
     """
 
     model: str
@@ -188,15 +191,15 @@ class OpenAIProvider:
                 f"repository and a key in one is a key in a diff"
             )
         try:
-            import httpx
-        except ImportError as e:  # pragma: no cover - httpx ships with the mcp extra
+            import httpx2
+        except ImportError as e:
             raise EmbeddingError(
-                f"'provider: openai' needs httpx — install the extra: "
+                f"'provider: openai' needs httpx2 — install the extra: "
                 f"pip install 'loom-ontology[embed]' ({e})"
             ) from e
 
         try:
-            response = httpx.post(
+            response = httpx2.post(
                 _OPENAI_ENDPOINT,
                 headers={"Authorization": f"Bearer {key}"},
                 json={"model": self.model, "input": list(texts)},
