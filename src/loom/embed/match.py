@@ -76,6 +76,7 @@ class Matcher:
         object_type: str,
         text: str,
         filters: Mapping[str, Any] | None = None,
+        via: Mapping[str, Any] | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> MatchResult:
@@ -111,7 +112,7 @@ class Matcher:
             )
         vector = self.provider.embed([query])[0]
         return resolver.match(
-            object_type, vector, self.provider.model, filters, limit=limit, offset=offset
+            object_type, vector, self.provider.model, filters, via, limit=limit, offset=offset
         )
 
 

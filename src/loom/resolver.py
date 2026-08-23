@@ -58,6 +58,7 @@ from .query.ir import (
     Comparison,
     Eq,
     GetByKey,
+    LinkFilter,
     Match,
     Project,
     Search,
@@ -72,10 +73,19 @@ MAX_PAGE_SIZE = 500
 
 # Stable aliases: the projected table is always t0, so compiled SQL is deterministic and
 # assertable in tests.
+#
+# **Three of them are constants and two are prefixes, and that is the milestone M6 twice predicted
+# arriving by a route neither prediction named.** M6 said an attested principal would force these to
+# become per-call, and it did not: a `PolicySet` is a value and a `Resolver` is shared. What forces
+# it is `via` — a single plan may now name an unbounded number of tables, one per hop plus a mapping
+# table each, so there is no constant to be had. The three that *can* stay constant do, because a
+# plan holds exactly one of each and a stable name is what makes compiled SQL assertable.
 _TARGET = "t0"
 _SOURCE = "t1"
 _THROUGH = "m0"
 _VECTORS = "v0"
+_LINK = "l"  # `l0`, `l1`, … — the far end of each `via` hop, in the order the hops were written
+_LINK_THROUGH = "lm"  # `lm0`, … — that hop's mapping table, when the link declares one
 
 # What a ranked read calls the two things a projection has no name for: the score, which is a column
 # of no table, and the stamp on the vector that produced it.
@@ -292,6 +302,7 @@ class Resolver:
         vector: Sequence[float],
         model: str,
         filters: Mapping[str, Any] | None = None,
+        via: Mapping[str, Any] | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> MatchResult:
@@ -310,7 +321,13 @@ class Resolver:
         **The filters are the same grammar `search` takes, answered by the same code**, and they
         narrow *before* the ranking. That is a rule rather than a per-query choice; `ir.Match` says
         why. Governance needs no line here at all: the predicate rides on the table this builds
-        through `_table`, so a withheld row is not ranked low, it is not there."""
+        through `_table`, so a withheld row is not ranked low, it is not there.
+
+        **`via` is that same sentence one hop out**, and it is what makes the ranking answer the
+        question anyone actually has. Ranking orders by meaning and cannot say *belonging to a
+        gold-tier customer*; a hop is keyed by link name and carries the identical filter grammar,
+        read against the type at the far end and governed by the same `_table`. It narrows with the
+        filters, before the ranking, for the same reason they do."""
         obj = self._object(object_type)
         prop = obj.semantic_property
         if prop is None:
@@ -339,6 +356,7 @@ class Resolver:
                 query=tuple(float(x) for x in vector),
                 score_as=score_as,
                 filters=self._filters(obj, filters or {}),
+                links=self._via(obj, via or {}),
                 # The tie-break, not the order. Two rows at the same distance would otherwise swap
                 # between calls and make page 2 unrelated to page 1 — `search`'s reason, and the
                 # reason `offset` means something here at all.
@@ -448,6 +466,69 @@ class Resolver:
             property=prop.name,
         )
 
+    def _via(self, obj: ObjectType, via: Mapping[str, Any]) -> tuple[LinkFilter, ...]:
+        """A caller's `via` argument as existential hops — the same grammar, one join out.
+
+        **Keyed by link name, and that is why it is a separate argument rather than a dotted key
+        inside `filter`.** `filter` is shared with `search_` through `_filterable`, and §7's namespace
+        rule is that each level of the argument tree belongs entirely to one vocabulary: property
+        names there, link names here. A `placedBy.tier` key inside `filter` would put a link name and
+        a property name in one namespace, so an ontology with a link and a property of the same name
+        would have a surface that could not say which one a caller meant.
+
+        Everything below the link name is `_filters` unchanged, against the type at the *far* end and
+        with that hop's alias — which is what makes a mask one hop out refuse a filter exactly as a
+        mask here does, without a second rule. The far table comes from `_table`, so its rows are the
+        rows this deployment shows; `ir.LinkFilter` covers what is existential about it and
+        `DuckDBEngine._compile_match` covers where a hop's predicate has to be *placed*."""
+        if not isinstance(via, Mapping):
+            got = "null" if via is None else type(via).__name__
+            available = ", ".join(sorted(d.name for d in self.links_of(obj.api_name))) or "none"
+            raise ResolverError(
+                f"'via' takes an object keyed by link name, got {got} — write "
+                f'{{"via": {{"<link>": {{"<property>": ...}}}}}} (links from '
+                f"'{obj.api_name}': {available})"
+            )
+        out: list[LinkFilter] = []
+        for index, (name, body) in enumerate(via.items()):
+            direction = self.link_direction(obj.api_name, name)
+            far = self._object(direction.target_object_type)
+            near_end = direction.link.frm if direction.forward else direction.link.to
+            far_end = direction.link.to if direction.forward else direction.link.frm
+            near_join = self._property(obj, near_end.property, f"link '{name}'")
+            far_join = self._property(far, far_end.property, f"link '{name}'")
+            if not isinstance(body, Mapping):
+                got = "null" if body is None else type(body).__name__
+                raise ResolverError(
+                    f"'via.{name}' takes an object of {far.api_name} filters, got {got} — write "
+                    f'{{"via": {{"{name}": {{"<property>": ...}}}}}}, or {{}} to keep only rows that '
+                    f"have a {far.api_name} at all"
+                )
+            alias = f"{_LINK}{index}"
+            through = None
+            if direction.link.through is not None:
+                # `through.fromColumn`/`toColumn` are written against the link's declared from/to
+                # ends, so a reverse hop swaps which one the near side joins — `traverse`'s line,
+                # read from the end that is filtering rather than the end that is landing.
+                th = direction.link.through
+                through = ThroughRef(
+                    table=TableRef(
+                        catalog=th.catalog, table=th.table, alias=f"{_LINK_THROUGH}{index}"
+                    ),
+                    from_column=th.from_column if direction.forward else th.to_column,
+                    to_column=th.to_column if direction.forward else th.from_column,
+                )
+            out.append(
+                LinkFilter(
+                    table=self._table(far, alias),
+                    near_column=near_join.column,
+                    far_column=far_join.column,
+                    filters=self._filters(far, body, alias),
+                    through=through,
+                )
+            )
+        return tuple(out)
+
     def masked(self, object_type: str) -> tuple[str, ...]:
         """The properties a policy withholds from every read of this type.
 
@@ -472,7 +553,9 @@ class Resolver:
             if p.name not in masked
         )
 
-    def _filters(self, obj: ObjectType, filters: Mapping[str, Any]) -> tuple[Comparison, ...]:
+    def _filters(
+        self, obj: ObjectType, filters: Mapping[str, Any], alias: str = _TARGET
+    ) -> tuple[Comparison, ...]:
         """A caller's `filter` argument as comparison nodes — the spec, then governance, then grammar.
 
         The split is the layering: *which properties may be filtered at all* is answered twice, by
@@ -492,7 +575,14 @@ class Resolver:
 
         It is checked *before* the mask, so a deployment's policy names are never mentioned for a
         property that was never filterable in the first place — a mask on a searchable property
-        still gets the oracle refusal, which is the case that argument was written for."""
+        still gets the oracle refusal, which is the case that argument was written for.
+
+        **`alias` is what makes `via` cost this method nothing.** A hop filters the same grammar
+        against a different type at a different alias, so every refusal above — not declared, not
+        searchable, withheld by a policy — is inherited one join out rather than restated there. In
+        particular the oracle refusal: filtering a masked property of the *far* type would binary-
+        search it exactly as filtering a masked property here would, and it is refused by this code
+        because it is this code."""
         if not isinstance(filters, Mapping):
             # The shape, before the contents. `Resolver.search` is reached from a tool call whose
             # arguments are whatever JSON arrived, and a `filter` that is not an object used to
@@ -532,7 +622,7 @@ class Resolver:
                 )
             try:
                 out.extend(
-                    lower_filter(obj, prop, value, _TARGET, self.ontology.object_types)
+                    lower_filter(obj, prop, value, alias, self.ontology.object_types)
                 )
             except FilterError as e:
                 raise ResolverError(str(e)) from e

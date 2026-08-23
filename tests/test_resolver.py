@@ -13,9 +13,21 @@ from pathlib import Path
 import pytest
 
 from loom import build
+from loom.expr import parse as parse_expr
 from loom.governance import Policy, bind_policies
 from loom.query.engine import Capabilities, CompiledQuery
-from loom.query.ir import ColumnRef, Compare, Const, Contains, Eq, GetByKey, Match, Search, Traverse
+from loom.query.ir import (
+    ColumnRef,
+    Compare,
+    Const,
+    Contains,
+    Eq,
+    GetByKey,
+    Match,
+    Search,
+    Traverse,
+    predicate_columns,
+)
 from loom.resolver import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Resolver, ResolverError
 
 VALID = Path(__file__).parent / "fixtures" / "valid"
@@ -448,3 +460,136 @@ def test_a_property_named_like_the_score_does_not_collide_with_it(ontology):
     outputs = [c.output for c in r.engine.plans[-1].columns]
     assert r.engine.source.score_as not in {"_loom_score"}
     assert len(outputs) == len(set(outputs))
+
+
+# ---- via ------------------------------------------------------------------------
+#
+# Slice 4. What is asserted here is the *plan* — which tables a hop names, which alias each gets,
+# and which refusals fire before one is built. The SQL is `test_query_compile.py`'s, and whether a
+# semi-join actually narrows is `test_match_iceberg.py`'s.
+
+
+def _ranked_order(ontology):
+    """A resolver over an ontology whose `Order` can be ranked, so `via` has a near end."""
+    return _resolver(_semantic(ontology, "Order", "orderId"))
+
+
+def test_via_builds_a_hop_to_the_far_type(ontology):
+    r = _ranked_order(ontology)
+    r.match("Order", [0.1], "stub-v1", via={"placedBy": {"tier": "gold"}})
+    (hop,) = r.engine.source.links
+    assert hop.table.table == "crm.customers"
+    # The physical columns of the link's two ends, as everywhere else in this layer.
+    assert hop.near_column == "customer_id" and hop.far_column == "id"
+    assert hop.filters == (Compare("==", ColumnRef("l0", "tier"), Const("gold")),)
+    assert hop.through is None
+
+
+def test_a_hop_with_no_filters_is_an_existence_test(ontology):
+    """`{}` is not a no-op: on a to-many link *orders that have a customer at all* is a narrowing,
+    and a caller has no other way to say it."""
+    r = _ranked_order(ontology)
+    r.match("Order", [0.1], "stub-v1", via={"placedBy": {}})
+    (hop,) = r.engine.source.links
+    assert hop.filters == () and hop.table.table == "crm.customers"
+
+
+def test_a_reverse_hop_is_the_same_shape_from_the_other_end(ontology):
+    """`orders` is the reverse of `placedBy`, so the join columns swap and nothing else does."""
+    r = _resolver(_semantic(ontology))
+    r.match("Customer", [0.1], "stub-v1", via={"orders": {"orderId": "o1"}})
+    (hop,) = r.engine.source.links
+    assert hop.table.table == "sales.orders"
+    assert hop.near_column == "id" and hop.far_column == "customer_id"
+
+
+def test_several_hops_get_positional_aliases(ontology):
+    """Aliases stopped being constants here: two hops in one plan name an unbounded number of
+    tables, which is what M6 twice predicted for `t0`/`t1`/`m0` and twice corrected. Each hop's
+    filters are lowered against its own alias, or two hops on the same far type would be one."""
+    ont = _semantic(_two_routes(ontology), "Order", "orderId")
+    r = _resolver(ont)
+    r.match("Order", [0.1], "stub-v1", via={"placedBy": {"tier": "gold"}, "billedTo": {"name": "Ada"}})
+    first, second = r.engine.source.links
+    assert (first.table.alias, second.table.alias) == ("l0", "l1")
+    assert first.filters[0].left.alias == "l0"
+    assert second.filters[0].alias == "l1"  # Contains, which carries its alias directly
+
+
+def _two_routes(ontology):
+    """The fixture with a second named link between the same two types.
+
+    Two routes to one type is the case an alias per *type* would get wrong and an alias per *hop*
+    gets right, and it is not exotic: a shipping address and a billing address are one object type
+    reached two ways."""
+    link = ontology.link_types["placedBy"]
+    second = replace(link, api_name="billedTo", reverse_name="billedOrders")
+    return replace(ontology, link_types={**ontology.link_types, "billedTo": second})
+
+
+def test_a_hop_is_governed_on_the_far_end(ontology):
+    """The predicate comes from `_table` exactly as the near end's does — there is no second rule
+    for the far end, because there is no second place a type becomes a table."""
+    ont = _semantic(ontology, "Order", "orderId")
+    policies = bind_policies(
+        ont,
+        (
+            Policy(
+                name="emea-only",
+                object_type="Customer",
+                rows=parse_expr("object.tier == 'gold'"),
+            ),
+        ),
+    ).select(None)
+    r = _resolver(ont).governed_by(policies)
+    r.match("Order", [0.1], "stub-v1", via={"placedBy": {}})
+    (hop,) = r.engine.source.links
+    assert hop.table.predicate is not None
+    # On the hop's own alias, or it would be a predicate about a table this clause cannot see.
+    assert {a for a, _ in predicate_columns(hop.table.predicate)} == {"l0"}
+
+
+def test_via_refuses_a_link_the_type_does_not_have(ontology):
+    with pytest.raises(ResolverError, match="'Order' has no link 'placedFor' \\(available: placedBy\\)"):
+        _ranked_order(ontology).match("Order", [0.1], "stub-v1", via={"placedFor": {}})
+
+
+def test_via_refuses_a_filter_on_a_property_the_far_type_does_not_declare(ontology):
+    with pytest.raises(ResolverError, match="'Customer' has no property 'region'"):
+        _ranked_order(ontology).match("Order", [0.1], "stub-v1", via={"placedBy": {"region": "emea"}})
+
+
+def test_via_refuses_a_filter_on_a_far_property_that_is_not_searchable(ontology):
+    """§2 rule 6 one join out, inherited rather than restated: `_filters` is the same method."""
+    with pytest.raises(ResolverError, match="'Customer.ltv' is not declared searchable"):
+        _ranked_order(ontology).match("Order", [0.1], "stub-v1", via={"placedBy": {"ltv": 5.0}})
+
+
+def test_via_refuses_a_filter_on_a_masked_far_property(typed):
+    """The oracle refusal one hop out. A masked property of the far type is exactly as
+    binary-searchable through a hop as through a filter, and it is refused by the same code."""
+    ont = _semantic(typed, "Order", "orderId")
+    policies = bind_policies(
+        ont, (Policy(name="hide-ltv", object_type="Customer", mask=("ltv",)),)
+    ).select(None)
+    r = _resolver(ont).governed_by(policies)
+    with pytest.raises(ResolverError, match="withheld by governance policy 'hide-ltv'"):
+        r.match("Order", [0.1], "stub-v1", via={"placedBy": {"ltv": 5.0}})
+
+
+def test_via_refuses_a_hop_body_that_is_not_an_object(ontology):
+    with pytest.raises(ResolverError, match="'via.placedBy' takes an object of Customer filters"):
+        _ranked_order(ontology).match("Order", [0.1], "stub-v1", via={"placedBy": "gold"})
+
+
+def test_via_refuses_an_argument_that_is_not_an_object(ontology):
+    """The shape before the contents, which is what `filter` learned when a malformed argument
+    reached `.items()` and came back as a raw AttributeError."""
+    with pytest.raises(ResolverError, match="'via' takes an object keyed by link name"):
+        _ranked_order(ontology).match("Order", [0.1], "stub-v1", via=["placedBy"])
+
+
+def test_no_via_leaves_the_plan_exactly_as_it_was(ontology):
+    r = _ranked_order(ontology)
+    r.match("Order", [0.1], "stub-v1")
+    assert r.engine.source.links == ()

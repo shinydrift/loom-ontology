@@ -147,13 +147,23 @@ def project(tmp_path):
     return _project(tmp_path)
 
 
-def _project(tmp_path: Path, extra: str = "", rows: pa.Table = TICKETS):
+def _project(
+    tmp_path: Path,
+    extra: str = "",
+    rows: pa.Table = TICKETS,
+    specs: tuple = (),
+    tables: tuple = (),
+):
+    """`specs` and `tables` are slice 4's: a `via` needs a second object type to hop to, and every
+    test above this one is about a plane that has none."""
     from pyiceberg.catalog.sql import SqlCatalog
 
     root = tmp_path / "proj"
     (root / "ontology").mkdir(parents=True)
     (root / "warehouse").mkdir(parents=True)
     (root / "ontology" / "ticket.yaml").write_text(textwrap.dedent(SPEC))
+    for name, text in specs:
+        (root / "ontology" / name).write_text(textwrap.dedent(text))
     # Beside the ontology directory rather than in it, as the shipped example has it: `build()`
     # reads every yaml file in the directory and a `loom.yaml` among them is not a spec.
     (root / "loom.yaml").write_text(
@@ -168,6 +178,8 @@ def _project(tmp_path: Path, extra: str = "", rows: pa.Table = TICKETS):
     catalog = SqlCatalog("local", uri=config.catalogs["local"].uri, warehouse=config.catalogs["local"].warehouse)
     catalog.create_namespace("support")
     catalog.create_table("support.tickets", schema=SCHEMA).append(rows)
+    for name, schema, data in tables:
+        catalog.create_table(name, schema=schema).append(data)
     return ontology, config, root
 
 
@@ -533,3 +545,370 @@ def _call(tool, arguments):
     server = LoomMCPServer(tools={tool.name: tool})
     text, is_error = server.call(tool.name, arguments)
     return (_json.loads(text) if not is_error else text), is_error
+
+
+# ---- via -------------------------------------------------------------------------
+#
+# Slice 4, and the claims here are the ones only a real engine over a real warehouse can make: that
+# a semi-join actually narrows, that a to-many hop does not quietly return the same object several
+# times, and that a governance predicate on the *far* end withholds rows — which is the case that
+# fails outright if a hop's predicate is left in the top-level `WHERE`, because the alias is out of
+# scope there and the parameters no longer line up with the clauses.
+
+QUEUE_SPEC = """
+objectType:
+  apiName: Queue
+  displayName: Support queue
+  primaryKey: queueId
+  backing: { catalog: local, table: support.queues }
+  properties:
+    - { name: queueId, type: string, column: id, unique: true }
+    - { name: owner,   type: string, column: owner }
+    - { name: region,  type: string, column: region }
+    - { name: charter, type: string, column: charter }
+  searchable: [owner, region]
+  semantic: charter
+"""
+
+LINK_SPEC = """
+linkType:
+  apiName: handledBy
+  cardinality: many_to_one
+  from: { objectType: Ticket, property: queue }
+  to:   { objectType: Queue,  property: queueId }
+  reverseName: tickets
+"""
+
+QUEUE_SCHEMA = pa.schema(
+    [
+        pa.field("id", pa.string(), nullable=False),
+        pa.field("owner", pa.string(), nullable=False),
+        pa.field("region", pa.string(), nullable=False),
+        pa.field("charter", pa.string(), nullable=False),
+    ]
+)
+
+# `accounts` is deliberately missing: `t3` is a ticket whose queue names no row, which is the only
+# way an empty `{}` hop can be told apart from a no-op.
+QUEUES = pa.table(
+    {
+        "id": ["billing", "logistics"],
+        "owner": ["ada", "grace"],
+        "region": ["emea", "amer"],
+        "charter": [
+            "we handle money paid and refunds charged back",
+            "we handle the parcel, the courier and the box",
+        ],
+    },
+    schema=QUEUE_SCHEMA,
+)
+
+
+@pytest.fixture
+def linked(tmp_path):
+    """The same tickets, plus the queues they are handled by and the link between them."""
+    return _linked_project(tmp_path)
+
+
+def _linked_project(tmp_path: Path, extra: str = ""):
+    return _project(
+        tmp_path,
+        extra=extra,
+        specs=(("queue.yaml", QUEUE_SPEC), ("link.yaml", LINK_SPEC)),
+        tables=(("support.queues", QUEUE_SCHEMA, QUEUES),),
+    )
+
+
+def _both_embedded(project, types=("Ticket", "Queue")):
+    ontology, config, _ = project
+    cats = open_catalogs(config)
+    provider = LexiconProvider()
+    result = EmbedRuntime(
+        ontology=ontology, catalogs=cats, provider=provider, targets=types
+    ).reconcile()
+    assert result.status == APPLIED, result.failures
+    return cats, provider
+
+
+def _via_matcher(provider, catalogs, types=("Ticket", "Queue")) -> Matcher:
+    return Matcher(
+        provider=provider,
+        stores={
+            name: VectorStore(catalog=catalogs["local"], object_type=name, key_type="string")
+            for name in types
+        },
+    )
+
+
+def _hopped(project, object_type, text, via=None, filters=None, catalogs=None):
+    ontology, config, _ = project
+    types = tuple(
+        name
+        for name, obj in ontology.object_types.items()
+        if obj.semantic_property is not None
+    )
+    cats, provider = (
+        _both_embedded(project, types) if catalogs is None else (catalogs, LexiconProvider())
+    )
+    resolver = build_resolver(ontology, config, cats)
+    return _via_matcher(provider, cats, types).match(
+        resolver, object_type, text, filters or {}, via or {}
+    )
+
+
+def test_a_hop_narrows_a_ranking_by_a_linked_object(linked):
+    """The query anyone actually has, and the one slices 1–3 could not express: rank by meaning,
+    *belonging to* something. The delivery tickets are the best match either way — what the hop
+    removes is everything handled by anyone else."""
+    everything = _hopped(linked, "Ticket", "the parcel never turned up")
+    grace = _hopped(linked, "Ticket", "the parcel never turned up", via={"handledBy": {"owner": "grace"}})
+    assert {m.object["ticketId"] for m in grace.matches} == {"t2", "t5"}
+    assert len(everything.matches) > len(grace.matches)
+    # And it is still a ranking: the nearest of the survivors comes first.
+    assert grace.matches[0].object["ticketId"] == "t2"
+
+
+def test_a_hop_narrows_before_the_ranking_like_every_other_filter(linked):
+    """Not a filter over the top k. `t5` is the second-best delivery ticket and it survives the hop,
+    which rank-then-filter over a page of two would have thrown away."""
+    result = _hopped(linked, "Ticket", "the customer wanted a refund", via={"handledBy": {"owner": "grace"}})
+    assert result.matches, "rank-then-filter would have kept nothing handled by grace"
+    assert {m.object["ticketId"] for m in result.matches} == {"t2", "t5"}
+
+
+def test_an_empty_hop_keeps_only_rows_that_have_a_far_object(linked):
+    """`{}` is an existence test rather than a no-op — `t3` is in the `accounts` queue and no such
+    Queue row exists, so it is the row this narrows away."""
+    everything = _hopped(linked, "Ticket", "money")
+    existing = _hopped(linked, "Ticket", "money", via={"handledBy": {}})
+    assert "t3" in {m.object["ticketId"] for m in everything.matches}
+    assert "t3" not in {m.object["ticketId"] for m in existing.matches}
+
+
+def test_a_to_many_hop_returns_each_near_row_once(linked):
+    """The reason it is `IN (SELECT …)` and not a JOIN. `billing` handles both high-severity
+    tickets, so a joined hop would hand back the same Queue twice — same score, same object — and
+    the page it filled would be smaller than it looked."""
+    result = _hopped(linked, "Queue", "refunds and chargebacks", via={"tickets": {"severity": "high"}})
+    keys = [m.object["queueId"] for m in result.matches]
+    assert keys == ["billing"]
+    assert len(keys) == len(set(keys))
+
+
+def test_a_hop_and_a_filter_are_anded(linked):
+    """Two narrowings of different kinds, composed the way everything in this grammar composes."""
+    result = _hopped(
+        linked,
+        "Ticket",
+        "the parcel never turned up",
+        filters={"severity": "low"},
+        via={"handledBy": {"owner": "grace"}},
+    )
+    assert {m.object["ticketId"] for m in result.matches} == {"t2", "t5"}
+    assert all(m.object["severity"] == "low" for m in result.matches)
+
+
+FAR_GOVERNED = """
+governance:
+  policies:
+    - name: emea-only
+      objectType: Queue
+      rows: "object.region == 'emea'"
+"""
+
+
+def test_a_policy_on_the_far_type_withholds_rows_through_the_hop(tmp_path):
+    """The finding, made checkable. The predicate comes from `Resolver._table` for free; where it is
+    *placed* is not free — in the top-level `WHERE` the hop's alias is out of scope and the
+    parameters stop lining up with the clauses, so this call would fail rather than narrow."""
+    project = _linked_project(tmp_path, extra=FAR_GOVERNED)
+    result = _hopped(project, "Ticket", "the parcel never turned up", via={"handledBy": {}})
+    # `logistics` is amer, so every ticket it handles is unreachable through this hop.
+    assert {m.object["ticketId"] for m in result.matches} == {"t1", "t4"}
+    assert "t2" not in {m.object["ticketId"] for m in result.matches}
+
+
+def test_the_far_policy_governs_the_hop_and_not_the_ranked_type(tmp_path):
+    """A policy on `Queue` says nothing about which tickets may be ranked — only about which queues
+    a hop may find. Without the hop, every ticket is still there."""
+    project = _linked_project(tmp_path, extra=FAR_GOVERNED)
+    result = _hopped(project, "Ticket", "the parcel never turned up")
+    assert "t2" in {m.object["ticketId"] for m in result.matches}
+
+
+def test_the_generated_tool_takes_via_and_returns_the_hopped_ranking(linked):
+    """Through `build_tools`, so the argument the agent actually sends is the one under test."""
+    ontology, config, _ = linked
+    cats, provider = _both_embedded(linked)
+    tool = _rebuilt_tool(ontology, config, cats, provider)
+    out, is_error = _call(
+        tool, {"text": "the parcel never turned up", "via": {"handledBy": {"owner": "grace"}}}
+    )
+    assert is_error is False
+    assert [m["object"]["ticketId"] for m in out["matches"]] == ["t2", "t5"]
+    assert out["count"] == 2 and out["hasMore"] is False
+    assert set(tool.input_schema["properties"]["via"]["properties"]) == {"handledBy"}
+
+
+def test_loom_query_via_returns_what_the_tool_returns(linked, monkeypatch, capsys):
+    """The dev command mirrors the generated tool, `via` included — a cross-object filter the CLI
+    could do and the surface could not would be the back door this command exists not to be."""
+    import json as _json
+
+    from loom.cli import main
+
+    ontology, config, root = linked
+    cats, provider = _both_embedded(linked)
+    monkeypatch.setattr("loom.embed.match.provider_for", lambda _config: provider)
+
+    argv = [
+        "query", "Ticket", str(root / "ontology"),
+        "--match", "the parcel never turned up",
+        "--via", "handledBy.owner=grace",
+    ]
+    assert main(argv) == 0
+    rows = _json.loads(capsys.readouterr().out)
+    tool_out, _ = _call(
+        _rebuilt_tool(ontology, config, cats, provider),
+        {"text": "the parcel never turned up", "via": {"handledBy": {"owner": "grace"}}},
+    )
+    assert [r["object"]["ticketId"] for r in rows] == [
+        m["object"]["ticketId"] for m in tool_out["matches"]
+    ]
+
+
+def test_loom_query_refuses_via_without_match(linked, capsys):
+    """`via` is an argument of `match_<object>` and of nothing else, so it is refused rather than
+    quietly applied to a search the surface offers no hop on."""
+    _, _, root = linked
+    assert main_argv(["query", "Ticket", str(root / "ontology"), "--via", "handledBy"]) == 1
+    assert "--via requires --match" in capsys.readouterr().err
+
+
+# ---- a hop with a table in the middle ---------------------------------------------
+#
+# These exist because a live probe reached a case the suite could not: `test_query_compile.py`
+# asserts the SQL a many-to-many hop compiles to, and nothing had ever *run* it. The subquery
+# changes which column it selects when a mapping table is present — the near row's value lives on
+# the mapping's near side, not on the far table's join column — and that is exactly the kind of
+# claim a string comparison cannot make.
+
+TAG_SPEC = """
+objectType:
+  apiName: Tag
+  primaryKey: tagId
+  backing: { catalog: local, table: support.tags }
+  properties:
+    - { name: tagId, type: string, column: id, unique: true }
+    - { name: label, type: string, column: label }
+  searchable: [tagId, label]
+  semantic: label
+"""
+
+TAGGED_SPEC = """
+linkType:
+  apiName: tags
+  cardinality: many_to_many
+  from: { objectType: Ticket, property: ticketId }
+  to:   { objectType: Tag,    property: tagId }
+  through: { catalog: local, table: support.ticket_tags, fromColumn: ticket_id, toColumn: tag_id }
+  reverseName: tickets
+"""
+
+TAG_SCHEMA = pa.schema(
+    [
+        pa.field("id", pa.string(), nullable=False),
+        pa.field("label", pa.string(), nullable=False),
+    ]
+)
+TAGS = pa.table(
+    {"id": ["urgent", "vip"], "label": ["needs a person today", "top account"]}, schema=TAG_SCHEMA
+)
+
+MAP_SCHEMA = pa.schema(
+    [
+        pa.field("ticket_id", pa.string(), nullable=False),
+        pa.field("tag_id", pa.string(), nullable=False),
+    ]
+)
+# `t1` carries both tags, which is the row a JOIN would hand back twice.
+TICKET_TAGS = pa.table(
+    {"ticket_id": ["t1", "t1", "t4", "t2"], "tag_id": ["urgent", "vip", "vip", "urgent"]},
+    schema=MAP_SCHEMA,
+)
+
+
+@pytest.fixture
+def tagged(tmp_path):
+    return _project(
+        tmp_path,
+        specs=(
+            ("queue.yaml", QUEUE_SPEC),
+            ("link.yaml", LINK_SPEC),
+            ("tag.yaml", TAG_SPEC),
+            ("tagged.yaml", TAGGED_SPEC),
+        ),
+        tables=(
+            ("support.queues", QUEUE_SCHEMA, QUEUES),
+            ("support.tags", TAG_SCHEMA, TAGS),
+            ("support.ticket_tags", MAP_SCHEMA, TICKET_TAGS),
+        ),
+    )
+
+
+def test_a_many_to_many_hop_reaches_through_its_mapping_table(tagged):
+    """The mapping table joins inside the subquery and changes what it selects, which is the half
+    of the lowering only a running engine can confirm."""
+    result = _hopped(tagged, "Ticket", "money", via={"tags": {"label": "top account"}})
+    assert {m.object["ticketId"] for m in result.matches} == {"t1", "t4"}
+
+
+def test_a_many_to_many_hop_returns_each_near_row_once(tagged):
+    """`t1` carries both tags, so a joined hop would return it twice — same object, same score, and
+    a page smaller than the number on it. The semi-join cannot, whatever the projection holds."""
+    result = _hopped(tagged, "Ticket", "money", via={"tags": {}})
+    keys = [m.object["ticketId"] for m in result.matches]
+    assert sorted(keys) == ["t1", "t2", "t4"]
+    assert len(keys) == len(set(keys))
+
+
+def test_two_hops_of_different_shapes_are_anded(tagged):
+    """One hop through a mapping table and one straight across, in a single call: two subqueries,
+    two aliases, and a near row has to satisfy both."""
+    both = _hopped(
+        tagged, "Ticket", "money", via={"tags": {"label": "top account"}, "handledBy": {"owner": "ada"}}
+    )
+    assert {m.object["ticketId"] for m in both.matches} == {"t1", "t4"}
+    # `ada` handles billing and `grace` handles logistics, so the same tag with the other owner is
+    # a conjunction nothing satisfies — which is what tells this apart from a hop being ignored.
+    neither = _hopped(
+        tagged, "Ticket", "money", via={"tags": {"label": "top account"}, "handledBy": {"owner": "grace"}}
+    )
+    assert neither.matches == ()
+
+
+def test_a_reverse_many_to_many_hop_swaps_the_mapping_columns(tagged):
+    """A hop taken from the link's `to` end, which is the one arm of the through-column swap nothing
+    else in the suite reaches — and an inverted swap joins ticket ids to tag ids, which matches
+    nothing and returns an empty ranking rather than an error.
+
+    `urgent` tags `t1` (billing) and `t2` (logistics); `vip` tags `t1` and `t4`, both billing. So
+    the queue a ticket sits in tells the two tags apart from the far side of the mapping."""
+    logistics = _hopped(tagged, "Tag", "needs attention", via={"tickets": {"queue": "logistics"}})
+    assert [m.object["tagId"] for m in logistics.matches] == ["urgent"]
+
+    high = _hopped(tagged, "Tag", "needs attention", via={"tickets": {"severity": "high"}})
+    # `t1` and `t4` are the high ones and between them carry both tags — once each, which is the
+    # no-duplication claim read from the reverse end, where `vip` is reached through two rows.
+    assert sorted(m.object["tagId"] for m in high.matches) == ["urgent", "vip"]
+
+    # `t3` is in the accounts queue and carries no tag at all.
+    assert _hopped(tagged, "Tag", "needs attention", via={"tickets": {"queue": "accounts"}}).matches == ()
+
+
+def test_a_reverse_hop_across_a_plain_link_is_the_same_shape(tagged):
+    """`tickets` off a Queue is `handledBy` read backwards, so the join columns swap and nothing
+    else does — the two-column version of the swap above."""
+    result = _hopped(tagged, "Queue", "money paid and refunds", via={"tickets": {"severity": "high"}})
+    # Only `billing` handles a high-severity ticket, and it handles two of them.
+    assert [m.object["queueId"] for m in result.matches] == ["billing"]

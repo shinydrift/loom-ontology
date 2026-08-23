@@ -454,3 +454,127 @@ def test_bind_matching_loads_no_model(tmp_path):
     matcher = bind_matching(ontology, config, {"c": StubCatalog()})
     assert isinstance(matcher.provider, LocalProvider)
     assert matcher.provider._impl is None and matcher.provider._dims is None
+
+
+# ---- via ------------------------------------------------------------------------
+#
+# Slice 4, and the same division of labour: the *surface* is here — which argument the tool
+# advertises, what a hop's schema is built from, and what a mask one join out does to it. The plan
+# is `test_resolver.py`'s, the SQL is `test_query_compile.py`'s, and whether a semi-join narrows a
+# real ranking is `test_match_iceberg.py`'s.
+
+QUEUE = """
+objectType:
+  apiName: Queue
+  primaryKey: queueId
+  backing: { catalog: c, table: support.queues }
+  properties:
+    - { name: queueId, type: string, column: id, unique: true }
+    - { name: owner,   type: string, column: owner }
+    - { name: region,  type: string, column: region }
+  searchable: [owner]
+"""
+
+LINK = """
+linkType:
+  apiName: handledBy
+  cardinality: many_to_one
+  from: { objectType: Ticket, property: ticketId }
+  to:   { objectType: Queue,  property: queueId }
+  reverseName: tickets
+"""
+
+
+def _linked_tools(tmp_path, policies=(), rows=()):
+    """The tool set for a spec whose ranked type has somewhere to hop to."""
+    from loom.mcp.registry import build_tools
+    from loom.resolver import Resolver
+
+    (tmp_path / "queue.yaml").write_text(textwrap.dedent(QUEUE))
+    (tmp_path / "link.yaml").write_text(textwrap.dedent(LINK))
+    ontology, _ = _build(tmp_path, "  semantic: body")
+    resolver = Resolver(
+        ontology=ontology,
+        engine=StubEngine(rows),
+        policies=bind_policies(ontology, policies).select(None),
+    )
+    return {t.name: t for t in build_tools(resolver, matcher=_matcher())}, resolver
+
+
+def test_the_tool_takes_a_via_keyed_by_link_name(tmp_path):
+    """A top-level argument rather than a dotted key inside `filter`: link names and property names
+    are two vocabularies, and §7's rule is one namespace per level of the argument tree."""
+    tools, _ = _linked_tools(tmp_path)
+    schema = tools["match_ticket"].input_schema
+    assert set(schema["properties"]) == {"text", "filter", "via", "limit", "offset"}
+    assert set(schema["properties"]["via"]["properties"]) == {"handledBy"}
+    assert schema["properties"]["via"]["additionalProperties"] is False
+
+
+def test_a_hop_advertises_the_far_types_own_filter_schema(tmp_path):
+    """Built by the two functions the far type's own tools are built from, so the two cannot say
+    different things about the same property."""
+    tools, _ = _linked_tools(tmp_path)
+    hop = tools["match_ticket"].input_schema["properties"]["via"]["properties"]["handledBy"]
+    assert set(hop["properties"]) == set(
+        tools["search_queue"].input_schema["properties"]["filter"]["properties"]
+    )
+    assert set(hop["properties"]) == {"owner"}  # `region` is declared and not searchable
+
+
+def test_a_mask_on_the_far_type_leaves_the_hop_schema(tmp_path):
+    """The announcement half of a policy, one join out. Subtracting from the surface and never
+    adding to it — and `Resolver._filters` refuses it whatever the schema says, which is the
+    enforcement."""
+    tools, _ = _linked_tools(
+        tmp_path, policies=(Policy(name="hide-owner", object_type="Queue", mask=("owner",)),)
+    )
+    hop = tools["match_ticket"].input_schema["properties"]["via"]["properties"]["handledBy"]
+    assert hop["properties"] == {}
+
+
+def test_a_type_with_no_links_has_no_via_argument(tmp_path):
+    """Omitted rather than advertised empty, which is the opposite of what `filter` does: a `filter`
+    with nothing in it still describes a real argument, and a `via` on a type no link leaves has
+    nothing it could ever accept."""
+    tools, _ = _tools(tmp_path)
+    assert "via" not in tools["match_ticket"].input_schema["properties"]
+    refusal = tools["match_ticket"].argument_refusal({"text": "x", "via": {"handledBy": {}}})
+    assert refusal is not None and "'via' is not an argument" in refusal
+
+
+def test_a_hop_reaches_the_plan(tmp_path):
+    tools, resolver = _linked_tools(tmp_path, rows=RANKED)
+    tools["match_ticket"].handler({"text": "dispute", "via": {"handledBy": {"owner": "ada"}}})
+    (hop,) = resolver.engine.plans[-1].source.links
+    assert hop.table.table == "support.queues"
+    assert hop.near_column == "id" and hop.far_column == "id"
+
+
+def test_an_empty_hop_reaches_the_plan_as_an_existence_test(tmp_path):
+    """`{}` is a narrowing and not a missing argument, so it must not be swallowed by the `or {}`
+    that turns an absent `via` into no hops at all."""
+    tools, resolver = _linked_tools(tmp_path, rows=RANKED)
+    tools["match_ticket"].handler({"text": "dispute", "via": {"handledBy": {}}})
+    (hop,) = resolver.engine.plans[-1].source.links
+    assert hop.filters == ()
+
+
+def test_the_description_teaches_via(tmp_path):
+    """An agent reads descriptions afresh every session, so a nested argument it is not told about
+    is one it will not use — the same reason a mask is announced rather than only enforced."""
+    tools, _ = _linked_tools(tmp_path)
+    described = tools["match_ticket"].description
+    assert "`via`" in described and "handledBy" in described
+
+
+def test_an_unknown_link_is_refused_by_the_schema_and_by_the_resolver(tmp_path):
+    """Both halves, because they answer different callers: the schema is what a client validates
+    against, and the refusal is what a client that ignored it gets."""
+    from loom.resolver import ResolverError
+
+    tools, _ = _linked_tools(tmp_path, rows=RANKED)
+    hop = tools["match_ticket"].input_schema["properties"]["via"]
+    assert "escalatedTo" not in hop["properties"]
+    with pytest.raises(ResolverError, match="'Ticket' has no link 'escalatedTo'"):
+        tools["match_ticket"].handler({"text": "dispute", "via": {"escalatedTo": {}}})

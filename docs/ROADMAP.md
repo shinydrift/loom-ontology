@@ -1605,7 +1605,7 @@ range-pushdown backlog entry describes.
 
 ---
 
-## 🔨 M10: Semantic search — a column searched by meaning
+## ✅ Done — M10: Semantic search — a column searched by meaning
 
 *Goal: the question `contains` cannot be asked.*
 
@@ -1632,7 +1632,7 @@ about the word (*it filters the result set*), wrong about the shape.
       ever created.
 - [x] **3 — `match_<object>`.** The tool, the brute-force lowering, the result envelope. Also the
       **fourth source node** — the read IR was three shapes for nine milestones.
-- [ ] **4 — `via`.** Cross-object filtering, without which the interesting queries are not
+- [x] **4 — `via`.** Cross-object filtering, without which the interesting queries are not
       expressible. **M10 closes here, and there is no partial ship**: slices 1–3 generate a tool
       that can rank orders by meaning and cannot say *belonging to a gold-tier customer*, which is
       the query anyone actually has.
@@ -1751,6 +1751,11 @@ gets re-litigated by whoever builds it.
   of the ranking, it *does not exist* for that caller, because the predicate rides on `ir.TableRef`
   at the point a type becomes a table. Which also means `via` inherits cross-object governance for
   free: `_table` already governs both ends of a traverse.
+
+  **Half of that last sentence was wrong, and slice 4 is where it was found.** "For free" is true of
+  where the predicate *comes from* and false of where it is *placed* — a hop's alias is out of scope
+  in the top-level `WHERE` every other predicate is ANDed into. See "Decided while slice 4 was
+  built".
 
 - **No vector index in v1, and the row counts are why.** Pre-filtering means brute-forcing distances
   over the survivors anyway, and at 10⁵ rows × ~10³ dimensions that is ~10⁸ multiply-adds — tens of
@@ -1936,6 +1941,74 @@ ranked read, and each is recorded because it was a real choice rather than the o
   different verbs — a similarity over the one row you already named is a number about nothing — so
   the combination is refused rather than resolved by precedence.
 
+### Decided while slice 4 was built
+
+The cross-object half, and the one sentence above it had to correct.
+
+- **`LinkFilter` is a fragment carried on `ir.Match`, not a fifth source node** — and the two
+  entries together produce a rule the node set did not have written down: *a read whose result shape
+  is unchanged does not get a node*. `Match` earned one because it returns something the other three
+  do not, an ordering the caller never gave and a score belonging to no table. A hop returns the same
+  objects in the same order and only fewer of them, which is what a filter is.
+
+  It is deliberately **not** also a field on `Search`. `search_` can already ask the question from
+  the other end by traversing, and a field nothing populates is `loom.managed` a second time — a
+  column written and never read is a check nobody is doing. The day a `search_` wants one, this
+  fragment is what it gets.
+
+- **`via` is a top-level argument keyed by link name, not a dotted key inside `filter`.** §7's rule
+  is one namespace per level of the argument tree, and this is where the *spec* turns out to have
+  two vocabularies rather than one: link names and property names. `filter` is also shared with
+  `search_` through `_filterable`, so a `handledBy.owner` key there would put both on one level, and
+  an ontology with a link and a property of the same name would have a surface that could not say
+  which was meant.
+
+- **Existential always, and `{}` is an existence test.** On a to-one link the reading is invisible;
+  on a to-many link the alternative — *every* linked object matches — is a quantifier this grammar
+  has no spelling for, and `traverse` already answers it by handing the caller the rows. So an empty
+  hop is a narrowing (*tickets that are in a queue at all*) rather than an argument that does
+  nothing, which is the only way the flag and the tool can mean the same thing.
+
+- **`IN (SELECT …)` and not a JOIN, decided on the projection rather than on taste.** A joined
+  to-many hop returns the near object once per far row that matched — same object, same score — and
+  the page is smaller than the number on it. `DISTINCT` repairs that only while the projection is
+  unique, and a §6.1 mask can remove the primary key from it, so the repair would be a function of
+  the deployment's policy. A semi-join says *some* once and cannot multiply a row whatever the
+  projection holds.
+
+- **The finding: "a `via` inherits cross-object governance for free" was true of where a predicate
+  comes from and not of where it is *placed*.** The sentence above (in *Filtering is part of
+  retrieval*) is right that `Resolver._table` governs both ends without a second rule. What it did
+  not see is that `compile()` ANDs every `tables_of` predicate into the **top-level** `WHERE`, where
+  a semi-joined alias is out of scope — and that parameters concatenate slot by slot, so a clause in
+  one slot cannot have its parameters in another. Both halves fail together and neither fails
+  quietly. The fix is that each hop renders its own predicate inside its own subquery and reports
+  back the aliases it has already governed.
+
+  **The report is a fact produced by the rendering, not an assertion beside it**, and that was a
+  review finding rather than the first design. A skip list assembled from the hops (*this link has a
+  predicate, so mark its alias*) is a second statement about the same thing, and the direction it
+  could get wrong — claiming an alias whose clause was never emitted — is the one that drops a
+  policy from both places at once, silently. So the aliases come back from the branch that writes
+  the predicate, which makes *governed here* and *skipped there* one fact.
+
+  The `scoped <= known` check that remains is a backstop for the only shape left: a claim naming no
+  table of the plan. The opposite slip needs no help at all — an unreported governed table falls
+  through to `_governance`, where its alias does not exist and DuckDB refuses the query.
+
+- **Aliases stopped being constants, and the milestone that forced it is not the one that predicted
+  it.** M6 twice said an attested principal would make `t0`/`t1`/`m0` per-call, and twice that was
+  corrected: a `PolicySet` is a value and a `Resolver` is shared. What actually forces it is this
+  slice — one plan may now name an unbounded number of tables, a far table and possibly a mapping
+  table per hop — so the hops are positional (`l0…`, `lm0…`) and the three a plan holds exactly one
+  of stay constant, because a stable name is what keeps compiled SQL assertable.
+
+- **A live probe is what found the untested half.** The suite asserted the SQL a many-to-many hop
+  compiles to and had never *run* one; driving `loom serve` as a real MCP client over a real
+  warehouse did, along with two hops of different shapes in one call. Both are now tests. Nothing was
+  wrong — which is the outcome a probe is allowed to have, and it still moved coverage from a string
+  comparison to an executed join.
+
 ### Refused, permanently
 
 - **Blending vectors across a link** — ranking Customer by the meaning of its Orders' text, via a
@@ -1979,7 +2052,8 @@ what it reaches is `_loom_meta.vectors__<type>` for the type the action already 
 M9 made a batch become rows. What it did not touch is everything *before* the first load: somebody
 still writes the spec by hand against a file they are looking at, and a warehouse that needs three
 tables filled needs three commands with nothing to say which order they go in. This milestone is
-that on-ramp. It runs beside M10's open fourth slice rather than after it — the two share no code.
+that on-ramp. It ran beside M10's then-open fourth slice rather than after it — the two share no
+code, which is why the two milestones closed out of order.
 
 Four slices, in order:
 
