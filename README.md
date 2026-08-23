@@ -262,6 +262,7 @@ spelling — the hints are ANDed, so one per value would prune to the rows match
 | Semantic search — a tool that ranks | ✅ `match_<object>(text, filter, page)`, brute force, filtered first |
 | Semantic search — ranking across a link (`via`) | 🔨 M10 slice 4 |
 | Drafting a spec from a file | ✅ `loom infer` — parquet, writes nothing, does not validate |
+| Ordered loads | ✅ `sequences:` + `loom sequence` — stops at the first refusal, `_loom_meta.sequences` |
 
 `docs/spec-v0.md` is the full grammar — the framework's public contract.
 `docs/ROADMAP.md` tracks what's next, milestone by milestone.
@@ -272,7 +273,7 @@ spelling — the hints are ANDed, so one per value would prune to the rows match
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 1035 tests
+pytest                              # 1074 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 3 action(s)
 ```
 
@@ -907,6 +908,58 @@ Five things shape it, and the first is what the rest are for:
 
 Loom does not connect to Kafka, crawl an object store, or open a JDBC connection. A pipeline hands it
 a file; Loom decides whether that file may become rows.
+
+## Loading several, in order
+
+A warehouse that needs three tables filled needs three loads, and something has to say which order
+they go in. `sequences:` names an order over the entries already declared; `loom sequence` runs it
+from a manifest — the file that varies per run, which for a sequence is the one that names the
+others:
+
+```yaml
+# loom.yaml
+sequences:
+  - { name: nightly, loads: [customers, orders, daily-sales] }
+```
+```yaml
+# drop/manifest.yaml — paths resolve against this file, not the cwd
+customers: customers.parquet
+orders:    orders.parquet
+daily-sales: daily.parquet
+```
+```
+$ loom sequence nightly drop/manifest.yaml examples/retail/ontology
+Loom sequence — nightly on examples/retail/ontology
+
+  + customers: append 4 row(s) into Customer (crm.customers)
+  + orders: append 6 row(s) into Order (sales.orders)
+  - daily-sales: replace 31 row(s) into DailySalesPerformance (sales.daily_sales_performance)
+
+  Iceberg's unit is the table, so there is no cross-table transaction to be had:
+  this sequences the loads, stops at the first refusal, and reports exactly which
+  ones landed rather than pretending the run was atomic.
+```
+
+That last paragraph is the whole design, and it is `loom apply`'s own sentence one level up — apply
+met this first for tables and answered it the same way. **A sequence is an order, not an atom.** When
+one stops, the loads before it are landed and stay landed; the result names them and names where it
+stopped, because there is nothing else honest to do.
+
+Three consequences worth knowing:
+
+- **The order is the list, not the order of `ingest:`.** Declaration order could have been given
+  meaning for free and deliberately was not — an entry moved during review would silently change
+  what runs when.
+- **A manifest that supplies some of the entries is refused before anything opens.** Loading two of
+  three tables and reporting success is the failure this exists to prevent; a partial run is what
+  `loom ingest` per entry already is.
+- **It records the run, in a third table.** `_loom_meta.sequences` — which loads were one run, in
+  what order, and where it stopped. A `sequence_id` column beside `load_id` would have been cheaper
+  and is the one thing `_loom_meta.loads` forbids: that table is only ever *created*, so a column
+  added today could never reach a log that already exists.
+
+It checks no referential integrity, and says so: ordering customers before orders makes the *result*
+coherent, but Loom has no cross-table constraint and this does not add one.
 
 The validator accumulates every problem and reports them in one pass with source locations:
 

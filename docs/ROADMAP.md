@@ -2047,6 +2047,72 @@ structural rather than a promise in a docstring.
   for the properties whose name differs from their source column — and a test asserts the drafted
   block parses as a real entry, rather than looking like one.
 
+### Second slice — `sequences:`, and the sentence `apply` already had to write
+
+Three tables filled needs three loads and something to say which order. What it must not need is a
+new claim about atomicity, and the answer was already in the repo: Iceberg's unit is the table, so
+`apply` "sequences tables, stops at the first failure, and reports exactly which ones landed rather
+than pretending the run was atomic". A sequence of loads inherits that verbatim, because what makes
+it true is one commit per table, which is the same thing one level up. The CLI prints that paragraph
+above the prompt rather than keeping it in a docstring.
+
+- **An explicit list, not the order of `ingest:`.** `ingest:` is already a YAML list, so declaration
+  order exists and could have been given meaning for nothing. Refused: an entry moved during review
+  would silently change what runs when, and "these three, in this order" is a different statement
+  from "these are the loads this deployment declares". One deployment can hold several sequences over
+  overlapping entries, and an entry in none of them is ordinary.
+
+- **`loads:` names entries and the manifest names files.** `loom ingest` takes one data file on the
+  command line because that is what varies per run; a sequence needs several, so it takes one file
+  that names them, and the principle survives rather than bends. Manifest paths resolve against the
+  **manifest's own directory** — a manifest describes a drop and a drop is a directory of files
+  beside it, so resolving against the cwd would make one manifest mean different things depending on
+  where somebody stood.
+
+- **Both manifest mismatches are refused, and they are different mistakes.** An entry the sequence
+  runs and the manifest lacks would load two of three tables and report success — the failure this
+  whole slice exists against. An entry the manifest names and the sequence does not is a file
+  somebody expects to land that nothing will read.
+
+- **`sequences:` is resolved at config load, unlike everything else in that module.** `objectType`
+  and a policy's subject wait for a pairing because they name things in an ontology `config.py` has
+  never seen. A sequence names entries in the file being parsed, so deferring the check would make
+  the one error a reader can fix without leaving the file arrive from somewhere else.
+
+- **An eighth port, and the third time one argument has been made.** `LOAD_LOG_TABLE` exists because
+  `edits`' columns are forever; **a sequence is now in exactly that position with respect to
+  `loads`**. The cheap move — a `sequence_id` column beside `load_id` — is the one thing
+  `LOAD_COLUMNS` already forbids in writing: that table is only ever *created*, so a column added
+  today can never reach a log that already exists, and every deployment that has run `loom ingest`
+  once has one. The split turns out to be right on its own terms too: a load's record answers *what
+  did this file do to this table*, and a run's answers *which loads were one run, in what order, and
+  where did it stop* — three properties of the run and of no load in it.
+
+- **`loom ingest` cannot reach the sequence table.** Which is why `sequence_log_writer_for` is a
+  separate exchange point rather than a second verb pair on the load log's port: a single load has no
+  run to record, and a port it holds should not be able to say that several of them were one.
+
+- **A refused *preview* does not run for real, unlike `loom ingest`'s.** That command runs a refusal
+  so the log records who tried; here the individual loads already do exactly that, each recording its
+  own refusal in `_loom_meta.loads`. What running anyway would add is a sequence row for an order
+  that was never attempted — precisely the intention-shaped record that writing after the fact
+  exists to avoid.
+
+- **The preview gate is the run's own `dry_run`, not its status.** Found by a test rather than by
+  argument: a preview that stops halfway reports `partial`, because it is describing what *would*
+  happen, so gating the record on `status != previewed` put a row in the log for a run nobody
+  performed. `_Load` draws the same line in the same place, by branching on `self.dry_run` before it
+  decides anything.
+
+- **`partial` is a status only a sequence can have**, and it has no counterpart in `IngestResult`
+  because a single load is one commit: it lands whole or not at all, so there is no half of it to
+  name.
+
+- **It buys no referential integrity, and says so.** Nothing in `ingest/` mentions links. Ordering
+  customers before orders makes the *result* coherent; it does not make Loom check that every
+  order's customer arrived. Reading a schedule as a guarantee is the misreading available here, so
+  the module docstring closes it explicitly.
+
 ---
 
 ## Backlog — spec edges (from spec-v0 §"Open edges")

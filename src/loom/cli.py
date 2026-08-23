@@ -8,9 +8,11 @@ tools. `plan` dry-runs the migration engine, `apply` executes exactly what `plan
 M4's `run_<action>` tool will call. `ingest` is `run` at batch scale and the one command with no
 tool behind it: a declared load, from a file, checked against the ontology and written as one commit
 — deliberately reachable only from here, because a verb that writes an arbitrary batch is not
-something any agent surface should be able to name. `infer` runs before any of them and is the only
-command that reads a schema instead of being told one: it drafts a spec from a file and prints it,
-touching no catalog and writing nothing.
+something any agent surface should be able to name. `sequence` is `ingest` in an order: several
+declared loads from one manifest, stopping at the first refusal and reporting what landed, because
+Iceberg's unit is the table and there is no cross-table transaction to pretend to. `infer` runs
+before any of them and is the only command that reads a schema instead of being told one: it drafts
+a spec from a file and prints it, touching no catalog and writing nothing.
 """
 
 from __future__ import annotations
@@ -590,6 +592,120 @@ def _render_load(result, title: str) -> str:
             lines.append(f"    hint: {hint}")
     if result.failures:
         lines.append("  nothing was written.")
+    return "\n".join(lines)
+
+
+def cmd_sequence(args) -> int:
+    """Run one declared sequence of loads, in order, and record that they were one run.
+
+    It takes a **sequence name and a manifest**, mirroring `loom ingest`'s entry-and-file exactly:
+    the declared thing, and the file that varies per run. A sequence needs several data files, so
+    the file it takes is the one that names them — which keeps the principle rather than bending it.
+
+    **There is no `--from` or `--only`.** Resuming a partial run and loading a subset are both
+    `loom ingest` per entry, which already exists and already refuses a file it has seen. A flag
+    here would be a second, less careful way to run part of a sequence, and the reported
+    `stoppedAt` is the whole of what an operator needs to pick up by hand."""
+    diag = Diagnostics()
+    try:
+        ontology, config = _load_project(args.path, diag)
+    except SpecErrors as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    from .catalog import SEQUENCE_LOG_TABLE, CatalogError, open_catalogs
+    from .governance import PolicyError
+    from .ingest import IngestError, SequenceError, build_sequences
+    from .mcp.registry import json_safe
+    from .migrate.meta import default_actor
+
+    try:
+        runtime = build_sequences(ontology, config, open_catalogs(config))
+        preview = runtime.run(args.sequence, args.manifest, dry_run=True)
+    except (IngestError, SequenceError, PolicyError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except CatalogError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    print(_render_sequence(preview, str(args.path)), file=sys.stderr)
+    if args.dry_run:
+        print(json.dumps(json_safe(preview.as_json()), indent=2, default=str))
+        return 0 if preview.ok else 1
+
+    # Unlike `cmd_ingest`, a refused preview does **not** run for real. That command runs a refusal
+    # so the log records who tried; here the individual loads still do exactly that, each recording
+    # its own refusal in `_loom_meta.loads`. What running anyway would add is a sequence row for a
+    # run whose first load is already known to refuse — a record of an order that was never
+    # attempted, which is the intention-shaped record `_record` writes after the fact to avoid.
+    if not preview.ok:
+        print("nothing was loaded — the sequence would stop before the end.", file=sys.stderr)
+        return 1
+    if not _confirmed(args.yes, "run"):
+        print("aborted — nothing was written", file=sys.stderr)
+        return 1
+
+    try:
+        result = runtime.run(args.sequence, args.manifest, actor=default_actor())
+    except (IngestError, SequenceError) as e:  # pragma: no cover - the preview met these already
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    print(json.dumps(json_safe(result.as_json()), indent=2, default=str))
+    for step in result.steps:
+        if step.result is None:
+            print(f"error: {step.entry}: the load could not be attempted", file=sys.stderr)
+            continue
+        for failure in step.result.failures:
+            print(f"error: {step.entry}: {failure.code}: {failure.message}", file=sys.stderr)
+    if result.recorded:
+        print(
+            f"note: recorded in {SEQUENCE_LOG_TABLE} as {result.sequence_id}.", file=sys.stderr
+        )
+    elif result.sequence_id:
+        # The loads recorded themselves either way; what is missing is only the grouping.
+        print(
+            "note: the sequence log did not record this run — each load is still in "
+            "_loom_meta.loads under its own id.",
+            file=sys.stderr,
+        )
+    return 0 if result.ok else 1
+
+
+def _render_sequence(result, title: str) -> str:
+    """The order, before the prompt, with what each step would do to its table.
+
+    `render_apply`'s shape rather than `_render_load`'s, because the thing being previewed is a list
+    that stops somewhere — and the sentence at the bottom is the one `apply` already had to write:
+    this is an order, not a transaction."""
+    marks = {"append": "+", "merge": "~", "replace": "-"}
+    lines = [f"Loom sequence — {result.sequence} on {title}", ""]
+    for step in result.steps:
+        load = step.result
+        if load is None:
+            lines.append(f"  ! {step.entry} — the load could not be attempted")
+            continue
+        lines.append(
+            f"  {marks.get(load.mode, '?')} {step.entry}: {load.mode} {load.rows_read} row(s) "
+            f"into {load.object_type} ({load.table})"
+        )
+        lines.append(f"      from  {step.source}")
+        for failure in load.failures:
+            lines.append(f"      ! {failure.code}: {failure.message}")
+    if result.stopped_at is not None:
+        lines.append(f"\n  ! stops at '{result.stopped_at}'.")
+        if result.landed:
+            lines.append(
+                f"    {len(result.landed)} load(s) before it would have landed and would stay "
+                f"landed:"
+            )
+            lines.append(f"    {', '.join(s.entry for s in result.landed)}")
+    lines.append(
+        "\n  Iceberg's unit is the table, so there is no cross-table transaction to be had:"
+        "\n  this sequences the loads, stops at the first refusal, and reports exactly which"
+        "\n  ones landed rather than pretending the run was atomic."
+    )
     return "\n".join(lines)
 
 
@@ -1232,6 +1348,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     i.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     i.set_defaults(func=cmd_ingest)
+
+    sq = sub.add_parser("sequence", help="run a declared order of bulk loads from a manifest")
+    sq.add_argument("sequence", help="the sequence declared in loom.yaml, e.g. nightly")
+    sq.add_argument("manifest", help="path to a YAML mapping of entry name to file path")
+    sq.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")
+    sq.add_argument("--dry-run", action="store_true", help="check every load, but write nothing")
+    sq.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    sq.set_defaults(func=cmd_sequence)
 
     e = sub.add_parser("embed", help="bring the vector sidecars level with the text they describe")
     e.add_argument("path", nargs="?", default="ontology", help="path to the ontology dir")

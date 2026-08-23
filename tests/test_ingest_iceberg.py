@@ -20,16 +20,13 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import json
-import shutil
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-from loom import build
 from loom.catalog.base import LOAD_LOG_TABLE
-from loom.config import IngestEntry, find_config, load_config
-from loom.errors import Diagnostics
+from loom.config import IngestEntry
 from loom.governance import EDIT_LOG_REQUIRED, INGEST_ALLOWED, INGEST_REFUSED
 from loom.ingest import LoadLog, build_ingest
 from loom.ingest.result import APPLIED, CONFLICT, DUPLICATE_LOAD, REFUSED
@@ -38,23 +35,6 @@ pytest.importorskip("pyiceberg", reason="needs the [iceberg] extra")
 pa = pytest.importorskip("pyarrow", reason="needs the [iceberg] extra")
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "retail"
-
-
-@pytest.fixture
-def seeded(tmp_path):
-    """A seeded copy of the example: real Iceberg tables with rows in them, no `loom apply`."""
-    target = tmp_path / "retail"
-    shutil.copytree(EXAMPLE, target, ignore=shutil.ignore_patterns(".warehouse"))
-    spec = importlib.util.spec_from_file_location("ingest_seed", target / "seed.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    module.seed(target)
-
-    diag = Diagnostics()
-    config = load_config(find_config(target / "ontology"), diag)
-    ontology, _ = build(target / "ontology")
-    diag.raise_if_errors()
-    return target, ontology, config
 
 
 def entry(mode="append", fmt="ndjson", object_type="Customer", name="customers", columns=None):
@@ -467,7 +447,6 @@ def test_the_declared_load_lands_exactly_what_the_hand_rolled_write_does(seeded,
     so what the declared entry adds is not different rows, it is the two things the hand-rolled path
     has no way to produce: values checked against the ontology's declared types before they land, and
     a row in `_loom_meta.loads` saying which file became which commit."""
-    import importlib.util
 
     target, _, config = seeded
     spec = importlib.util.spec_from_file_location("perf", target / "sales_performance.py")
@@ -506,7 +485,6 @@ def test_the_declared_load_lands_exactly_what_the_hand_rolled_write_does(seeded,
 def test_the_shipped_example_declares_a_load_the_deployment_permits(seeded, tmp_path):
     """The entry in `examples/retail/loom.yaml` is real rather than illustrative: it resolves
     against the shipped ontology, and the shipped `governance.ingest` permits it."""
-    import importlib.util
 
     target, ontology, config = seeded
     assert [e.name for e in config.ingest] == ["daily-sales"]

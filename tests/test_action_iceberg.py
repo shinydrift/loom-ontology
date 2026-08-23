@@ -11,15 +11,12 @@ It runs the shipped example, seeded, so a broken `examples/retail` fails CI inst
 
 from __future__ import annotations
 
-import importlib.util
-import shutil
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-from loom import build
 from loom.action import (
     APPLIED,
     CONFLICT,
@@ -29,8 +26,6 @@ from loom.action import (
     VALIDATION_FAILED,
     ActionRuntime,
 )
-from loom.config import find_config, load_config
-from loom.errors import Diagnostics
 
 pytest.importorskip("pyiceberg", reason="needs the [iceberg] extra")
 
@@ -40,24 +35,6 @@ EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "retail"
 # `segments` has one it does not (spec §1 defers `array<T>`) — the point being that the runtime
 # treats them identically, because it never looks at either.
 UNMAPPED = {"region", "segments"}
-
-
-@pytest.fixture
-def seeded(tmp_path):
-    """A seeded copy of the example — rows and all, unlike `conftest.project`, because an action
-    needs something to act on."""
-    target = tmp_path / "retail"
-    shutil.copytree(EXAMPLE, target, ignore=shutil.ignore_patterns(".warehouse"))
-    spec = importlib.util.spec_from_file_location("action_seed", target / "seed.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    module.seed(target)
-
-    diag = Diagnostics()
-    config = load_config(find_config(target / "ontology"), diag)
-    ontology, _ = build(target / "ontology")
-    diag.raise_if_errors()
-    return target, ontology, config
 
 
 @pytest.fixture

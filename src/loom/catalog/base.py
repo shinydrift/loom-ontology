@@ -5,10 +5,11 @@ canonical spelling `PropType.iceberg_type()` produces, so physical validation is
 comparison against the type system's own output and nothing above this port needs pyiceberg
 imported to reason about types.
 
-**Seven ports, five planes, and no supersets.** `Catalog` reads. `CatalogWriter` changes a table's
+**Eight ports, five planes, and no supersets.** `Catalog` reads. `CatalogWriter` changes a table's
 *shape*. `RowWriter` changes one of a table's *rows*, keyed. `BulkWriter` changes *many* of them at
-once. `EditLogWriter` and `LoadLogWriter` append to *Loom's own record*. `VectorWriter` maintains
-*Loom's own derived data*. The read path — the
+once. `EditLogWriter`, `LoadLogWriter` and `SequenceLogWriter` append to *Loom's own record* — three
+ports and three tables, because each of those tables is only ever created and so its columns are
+forever. `VectorWriter` maintains *Loom's own derived data*. The read path — the
 resolver, the query engines, `loom serve` — is handed a `Catalog` and cannot write at all. `loom
 apply` asks for a `CatalogWriter` and therefore cannot delete a row: the port has no verb for it. The
 action runtime asks for a `RowWriter` and therefore cannot alter a schema, for the same reason. No
@@ -577,6 +578,60 @@ class LoadLogWriter(Protocol):
         ...
 
 
+SEQUENCE_LOG_TABLE = "_loom_meta.sequences"
+"""The one table `SequenceLogWriter` writes. The third time this argument has been made.
+
+`LOAD_LOG_TABLE` exists because `edits`' columns are forever and a load has four things that table
+can never grow a column for. **A sequence is now in exactly that position with respect to `loads`.**
+The obvious cheaper move — a `sequence_id` column beside `load_id` — is the one thing `LOAD_COLUMNS`
+already forbids in writing: that table is only ever *created*, so a column added today can never
+reach a log that already exists, and every deployment that has run `loom ingest` once has one.
+
+So a sequence gets a table, and the split turns out to be right on its own terms rather than only
+forced. A load's record answers *what did this file do to this table*. A sequence's answers *which
+loads were one run, in what order, and where did it stop* — three of which are properties of the run
+and of no load in it. The one that would have fitted in a column is the id, and an id alone would not
+have made the run readable.
+
+The precedent above it points the same way twice: `_loom_meta.applied` for schemas, `edits` for rows,
+`loads` for batches. What varies is the plane being recorded, and a plane gets a table."""
+
+
+@runtime_checkable
+class SequenceLogWriter(Protocol):
+    """Loom's own record of an ordered run of loads — append-only, to one table, named here.
+
+    `LoadLogWriter` again, verb for verb, and the third instance of a rule worth restating because
+    the cost of breaking it is invisible: **the table is not an argument**. A caller holding this can
+    reach `SEQUENCE_LOG_TABLE` and nothing else.
+
+    The verbs are named apart from the other two logs' for `LoadLogWriter`'s reason — structural
+    `runtime_checkable` checks look at verb names, so two ports sharing a signature would be one
+    capability wearing two labels and `_port_for` could not tell them apart.
+
+    **No delete verb, for the third time and the same permanent reason.** An expired record and a
+    lost one are the same sight to a reader.
+    """
+
+    name: str
+
+    def append_sequence(self, columns: Sequence[Column], row: Mapping[str, Any]) -> None:
+        """Append one record to `SEQUENCE_LOG_TABLE`, creating it with `columns` if it is not there.
+
+        Unconditional and purely additive, for `append_load`'s reason: the caller read nothing and is
+        overwriting nothing, so there is no snapshot to assert."""
+        ...
+
+    def ensure_sequence_log(self, columns: Sequence[Column]) -> None:
+        """Create `SEQUENCE_LOG_TABLE` with `columns` if it is not there, and append nothing.
+
+        `ensure_load_log`'s twin, and it answers the same demand: `governance.edit_log: required` is
+        a demand about *writes*, and a sequence run is how a deployment does several at once. A
+        posture that proved two logs and not the third would leave a deployment able to run an
+        unrecorded sequence while believing it could not."""
+        ...
+
+
 VECTOR_KEY_COLUMN = "key"
 """The column every sidecar is keyed and merged on, defined by the port rather than by its caller.
 
@@ -719,6 +774,18 @@ def load_log_writer_for(catalog: Catalog) -> LoadLogWriter:
     """Exchange a read handle for one that can append to Loom's record of ingests. Ingest asks."""
     return _port_for(
         catalog, LoadLogWriter, "load-log writes", "an ingest to record what it loaded in"
+    )
+
+
+def sequence_log_writer_for(catalog: Catalog) -> SequenceLogWriter:
+    """Exchange a read handle for one that can append to Loom's record of sequence runs.
+
+    Asked for by `loom sequence` and by nothing else — including `loom ingest`, which records a load
+    and has no run to record. That is the whole reason this is a separate exchange point rather than
+    a second verb pair on `load_log_writer_for`'s port: a single load must not be able to reach the
+    table that says several of them were one run."""
+    return _port_for(
+        catalog, SequenceLogWriter, "sequence-log writes", "a sequence to record its run in"
     )
 
 
