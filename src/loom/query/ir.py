@@ -1,10 +1,19 @@
 """The logical plan node set — the engine-agnostic read IR.
 
-Deliberately *not* a general relational algebra. There are exactly three shapes a read can take
-in Loom — fetch one object by key, filter a set of objects, walk one link — and each is a node
-here. That bound is the point: it's what guarantees an engine adapter is a few hundred lines
-rather than a query planner, and it's what makes "the LLM never gets raw SQL" a property of the
-type system instead of a promise.
+Deliberately *not* a general relational algebra. There are exactly four shapes a read can take
+in Loom — fetch one object by key, filter a set of objects, walk one link, rank a set by meaning —
+and each is a node here. That bound is the point: it's what guarantees an engine adapter is a few
+hundred lines rather than a query planner, and it's what makes "the LLM never gets raw SQL" a
+property of the type system instead of a promise.
+
+**It was three for nine milestones, and the fourth is worth saying why it had to be a node.** A
+`Match` is not a `Search` with an extra filter: the other three *decide* rows, each one true or
+false, with `order_by` pinned to the primary key so a page means something. A similarity clause
+decides nothing — it **ranks**, which needs an ordering the caller did not give and a `k` this
+grammar has nowhere to put. Spelling it as a comparison would also make `{similar} AND {tier: gold}`
+have two answers, rank-then-filter and filter-then-rank, with nothing in the node set to choose
+between them. A node makes the choice structural: the filters are the conjunction they always were,
+and the ranking happens over what survives them.
 
 Every plan is rooted in a `Project`, which is where ontology *property* names re-enter — nodes
 below it speak only physical columns.
@@ -302,7 +311,78 @@ class ThroughRef:
     to_column: str
 
 
-Source = GetByKey | Search | Traverse
+@dataclass(frozen=True)
+class VectorRef:
+    """The sidecar side of a `Match`: where this object type's vectors live, and what makes one
+    comparable to the query vector.
+
+    **It carries no predicate, and that is `ThroughRef`'s answer rather than a second one.** A
+    mapping table stands for no object type, so no policy names it; neither does a sidecar. What
+    governs a ranked read is the predicate on `Match.table`, at the one point a type becomes a table
+    — a governed row does not lose the ranking, it *does not exist* for that caller, so there is
+    nothing for a policy on this end to add.
+
+    **`model`, `dims` and `property` are the comparability guard, and it is neither a filter nor a
+    policy.** A vector produced by a different model, at a different width, or *from a different
+    property* is not a worse match: the arithmetic over it denotes nothing. So a row that is not
+    provably about the same text, embedded the same way, is not a candidate at all. Slice 2 wrote all
+    three columns for exactly this reader — `model` so a swap is a fact rather than an inference,
+    `dims` so a truncated vector is visible without loading the model that produced it, and
+    `property` for the case a spec moves `semantic:` from one column to another — and the guard is
+    load-bearing twice over: without the width, a sidecar holding two of them makes the distance
+    function *raise* rather than answer.
+
+    The `property` half closes the narrowest window and the least visible one. Re-pointing
+    `semantic:` changes every `source_hash`, so a reconcile fixes it — but between the deploy and the
+    reconcile the sidecar holds vectors of the *old* text under the new spec, and without this clause
+    they would be ranked, silently, under an envelope naming the new property.
+
+    The column names arrive from above rather than being known here, for `ThroughRef`'s reason: this
+    layer speaks physical columns and never spells one itself."""
+
+    table: TableRef
+    key_column: str
+    vector_column: str
+    model_column: str
+    dims_column: str
+    property_column: str
+    model: str
+    property: str
+
+
+@dataclass(frozen=True)
+class Match:
+    """Rows of `table`, ranked by how near their stored vector is to `query`.
+
+    The one read in Loom that returns an ordering the caller did not name, which is why `score_as` is
+    a field: the score is a column of no table, so a plan has to say what to call it. `Project`
+    cannot carry it — that maps physical columns to property names, and this is neither.
+
+    **`filters` narrows before the ranking, always, and that is a rule rather than a heuristic.**
+    Choosing per query by estimated selectivity is a query planner and Loom does not have one. The
+    consequence is stated rather than hidden: the distance is computed over every surviving row, so
+    the *arithmetic* is linear in the filtered set. That is also why there is no index —
+    pre-filtering means brute-forcing the survivors anyway, and the case an HNSW index helps is the
+    unfiltered one. The *I/O* is a different size and is stated where an adapter can see it: see
+    `DuckDBEngine._compile_match` on why a filter cannot narrow what the sidecar reads.
+
+    `order_by` is the **tie-break**, not the order: the score comes first and these follow, which is
+    what makes the total order total. Without them two rows at the same distance would swap between
+    calls, and page 2 of a ranking would be unrelated to page 1 — `Search.order_by`'s argument,
+    reached by the same route."""
+
+    table: TableRef
+    vectors: VectorRef
+    key_column: str  # the object's own primary-key column, joined to `vectors.key_column`
+    query: tuple[float, ...]
+    score_as: str
+    filters: tuple[Comparison, ...] = ()
+    order_by: tuple[str, ...] = ()  # physical columns on `table`; the tie-break, after the score
+    limit: int | None = None
+    offset: int = 0
+
+
+Source = GetByKey | Search | Traverse | Match
 
 
 def tables_of(source: Source) -> tuple[TableRef, ...]:
@@ -311,11 +391,14 @@ def tables_of(source: Source) -> tuple[TableRef, ...]:
     One function so an adapter has one way to ask "what am I reading?", which is what makes *every
     governed end of every plan is filtered* a claim a compiler can keep rather than a list a
     compiler author has to. A `Traverse` names two, and forgetting the anchor end is precisely the
-    hole this exists to close."""
+    hole this exists to close. A `Match` names two as well, and only one of them can be governed —
+    see `VectorRef`."""
     if isinstance(source, GetByKey):
         return (source.table,)
     if isinstance(source, Search):
         return (source.table,)
+    if isinstance(source, Match):
+        return (source.table, source.vectors.table)
     tables = (source.to_table, source.from_table)
     return tables + ((source.through.table,) if source.through is not None else ())
 

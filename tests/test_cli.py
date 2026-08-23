@@ -803,3 +803,20 @@ governance:
     assert main(["embed", str(ontology)]) == 1
     err = capsys.readouterr().err
     assert "semantic property" in err and "gradient" in err
+
+
+def test_a_vector_stamp_prints_as_utc_whatever_the_hosts_zone_is():
+    """`loom embed` reads an `embedded_at` back through pyarrow and `loom query --match` reads the
+    same value through DuckDB, which converts a `timestamptz` to the *host's* zone. Both print a
+    trailing `Z`, so the letter has to be earned rather than assumed: on a machine in New York the
+    unconverted form said `05:14Z` for a vector embedded at `09:14Z`, and the two commands disagreed
+    about one value."""
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    from loom.cli import _zulu
+
+    when = datetime(2026, 8, 23, 9, 14, tzinfo=UTC)
+    assert _zulu(when) == "2026-08-23 09:14Z"
+    assert _zulu(when.astimezone(ZoneInfo("America/New_York"))) == "2026-08-23 09:14Z"
+    assert _zulu(when.astimezone(ZoneInfo("Asia/Tokyo"))) == "2026-08-23 09:14Z"
