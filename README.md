@@ -259,8 +259,8 @@ spelling — the hints are ANDed, so one per value would prune to the rows match
 | Bulk ingest — a declared load, checked and recorded | ✅ `loom ingest`, `_loom_meta.loads` |
 | Semantic search — the grammar | ✅ `semantic:`, `mcp.embedding`, `vector_search` negotiated |
 | Semantic search — the vectors | ✅ `loom embed`, a sidecar per type in `_loom_meta` |
-| Semantic search — a tool that ranks | ✅ `match_<object>(text, filter, page)`, brute force, filtered first |
-| Semantic search — ranking across a link (`via`) | 🔨 M10 slice 4 |
+| Semantic search — a tool that ranks | ✅ `match_<object>(text, filter, via, page)`, brute force, filtered first |
+| Semantic search — ranking across a link (`via`) | ✅ `via: {placedBy: {tier: gold}}` — existential, semi-joined, governed both ends |
 | Drafting a spec from a file | ✅ `loom infer` — parquet, writes nothing, does not validate |
 | Ordered loads | ✅ `sequences:` + `loom sequence` — stops at the first refusal, `_loom_meta.sequences` |
 

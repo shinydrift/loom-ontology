@@ -159,7 +159,6 @@ def cmd_query(args) -> int:
 
     from .catalog import CatalogError, open_catalogs
     from .embed import EmbeddingError
-    from .filters import MEMBERSHIP
     from .governance import PolicyError
     from .mcp.registry import json_safe
     from .negotiate import CapabilityError
@@ -177,41 +176,19 @@ def cmd_query(args) -> int:
     if args.match is not None and (args.key or args.link):
         print("error: --match cannot be combined with --key or --link", file=sys.stderr)
         return 1
-    # `PROP=VALUE` and `PROP.OP=VALUE` — the two spellings the generated tool takes, in the one
-    # encoding a shell has. A property name cannot contain a dot, so the split is unambiguous; a
-    # null filter is the one thing not expressible here, because every CLI value is a string.
-    #
-    # `in` takes a list, and the list is built by **repeating the flag** — `tier.in=gold
-    # --filter tier.in=platinum` — rather than by splitting one value on a separator. A comma is a
-    # legal character inside a string value, so `tier.in=a,b` would have to either forbid it or
-    # silently split a single value into two wrong ones, and this command's whole job is to mirror
-    # what the generated tool would do with the same filter.
-    filters: dict[str, Any] = {}
-    for pair in args.filter or []:
-        if "=" not in pair:
-            print(f"error: --filter expects PROP=VALUE or PROP.OP=VALUE, got '{pair}'", file=sys.stderr)
-            return 1
-        name, value = pair.split("=", 1)
-        name, _, op = name.partition(".")
-        if not op:
-            if name in filters:
-                print(f"error: --filter gives '{name}' both a bare value and operators", file=sys.stderr)
-                return 1
-            filters[name] = value
-        elif isinstance(filters.setdefault(name, {}), dict):
-            ops = filters[name]
-            if op == MEMBERSHIP:
-                ops.setdefault(op, []).append(value)
-            elif op in ops:
-                # Only `in` accumulates. Repeating any other operator used to keep the last value
-                # silently, which is a filter the caller did not write being answered as if they had.
-                print(f"error: --filter gives '{name}.{op}' twice", file=sys.stderr)
-                return 1
-            else:
-                ops[op] = value
-        else:
-            print(f"error: --filter gives '{name}' both a bare value and operators", file=sys.stderr)
-            return 1
+    # `via` is an argument of `match_<object>` and of nothing else, so the dev command has it in
+    # exactly the same place. Mirroring the generated tools is this command's whole job: offering a
+    # cross-object filter on a read the surface does not offer one on would be a back door with a
+    # tidy spelling.
+    if args.via and args.match is None:
+        print("error: --via requires --match", file=sys.stderr)
+        return 1
+    try:
+        filters = _filter_pairs(args.filter or [], "--filter")
+        via = _via_pairs(args.via or [])
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
 
     ranked = None
     try:
@@ -220,7 +197,7 @@ def cmd_query(args) -> int:
         open_cats = open_catalogs(config)
         resolver = build_resolver(ontology, config, open_cats)
         if args.match is not None:
-            ranked = _cli_match(ontology, config, open_cats, resolver, args, filters)
+            ranked = _cli_match(ontology, config, open_cats, resolver, args, filters, via)
             # The tool's shape, not a flattened one: `score` beside the object rather than merged
             # into it, so this command shows what `match_<object>` shows. Merging would also
             # reintroduce the collision `Resolver.match` exists to keep impossible.
@@ -261,6 +238,76 @@ def cmd_query(args) -> int:
     return 0
 
 
+def _filter_pairs(pairs: list[str], flag: str) -> dict[str, Any]:
+    """`PROP=VALUE` and `PROP.OP=VALUE` as the filter object the generated tool takes.
+
+    The two spellings the tool accepts, in the one encoding a shell has. A property name cannot
+    contain a dot, so the split is unambiguous; a null filter is the one thing not expressible here,
+    because every CLI value is a string.
+
+    `in` takes a list, and the list is built by **repeating the flag** — `--filter tier.in=gold
+    --filter tier.in=platinum` — rather than by splitting one value on a separator. A comma is a
+    legal character inside a string value, so `tier.in=a,b` would have to either forbid it or
+    silently split one value into two wrong ones, and this command's job is to mirror what the
+    generated tool would do with the same filter.
+
+    **One function for two flags**, which is `via`'s doing: a hop takes the identical grammar
+    against a different type, so `--via placedBy.tier=gold` has to parse the way `--filter tier=gold`
+    parses or the dev command would have two filter grammars where the surface has one. `flag` is
+    only what the refusals name."""
+    from .filters import MEMBERSHIP
+
+    out: dict[str, Any] = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise ValueError(f"{flag} expects PROP=VALUE or PROP.OP=VALUE, got '{pair}'")
+        name, value = pair.split("=", 1)
+        name, _, op = name.partition(".")
+        if not op:
+            if name in out:
+                raise ValueError(f"{flag} gives '{name}' both a bare value and operators")
+            out[name] = value
+        elif isinstance(out.setdefault(name, {}), dict):
+            ops = out[name]
+            if op == MEMBERSHIP:
+                ops.setdefault(op, []).append(value)
+            elif op in ops:
+                # Only `in` accumulates. Repeating any other operator used to keep the last value
+                # silently, which is a filter the caller did not write being answered as if they had.
+                raise ValueError(f"{flag} gives '{name}.{op}' twice")
+            else:
+                ops[op] = value
+        else:
+            raise ValueError(f"{flag} gives '{name}' both a bare value and operators")
+    return out
+
+
+def _via_pairs(pairs: list[str]) -> dict[str, Any]:
+    """`LINK`, `LINK.PROP=VALUE` and `LINK.PROP.OP=VALUE` as the `via` object the tool takes.
+
+    One level deeper than `--filter` and with one spelling of its own: a bare `--via orders` is the
+    existence test, `{}`, which is what the argument means when a hop names no filters. It has to be
+    expressible here or the flag could say *orders from a gold customer* and not *orders that have a
+    customer at all*, and the second is the one a to-many link makes interesting."""
+    hops: dict[str, list[str]] = {}
+    shape = "--via expects LINK, LINK.PROP=VALUE or LINK.PROP.OP=VALUE"
+    for pair in pairs:
+        link, dot, rest = pair.partition(".")
+        # Checked on both branches, not only the bare one. A link name cannot contain `=`, and
+        # `--via 'orders=x.total=5'` splits at the *dot* — so testing it only where there is no dot
+        # let a malformed flag through as a link literally named `orders=x`, to be refused by the
+        # resolver after a catalog had been opened. This check exists to happen before that.
+        if "=" in link:
+            raise ValueError(f"{shape}, got '{pair}' — a hop names a link before the property")
+        if not dot:
+            hops.setdefault(link, [])
+        elif "=" not in rest:
+            raise ValueError(f"{shape}, got '{pair}'")
+        else:
+            hops.setdefault(link, []).append(rest)
+    return {link: _filter_pairs(ps, f"--via {link}") for link, ps in hops.items()}
+
+
 def _zulu(when: datetime) -> str:
     """An `embedded_at` as a UTC wall clock, because the `Z` on the end has to be earned.
 
@@ -272,7 +319,7 @@ def _zulu(when: datetime) -> str:
     return f"{when.astimezone(UTC):%Y-%m-%d %H:%M}Z"
 
 
-def _cli_match(ontology, config, catalogs, resolver, args, filters):
+def _cli_match(ontology, config, catalogs, resolver, args, filters, via):
     """`--match` through the same `Matcher` the tool uses, or the refusal a deployment has earned.
 
     A separate function only because it has one refusal of its own: `bind_matching` answers `None`
@@ -295,7 +342,7 @@ def _cli_match(ontology, config, catalogs, resolver, args, filters):
             "no objectType in this ontology declares a 'semantic:' property, so there is nothing "
             "to rank by meaning"
         )
-    return matcher.match(resolver, args.object_type, args.match, filters, limit=args.limit)
+    return matcher.match(resolver, args.object_type, args.match, filters, via, limit=args.limit)
 
 
 def cmd_run(args) -> int:
@@ -1314,6 +1361,15 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "repeatable search filter, ANDed — e.g. tier=gold, salesDate.gte=2026-01-01; "
             "repeat PROP.in=VALUE to build a membership list"
+        ),
+    )
+    q.add_argument(
+        "--via",
+        action="append",
+        metavar="LINK[.PROP[.OP]=VALUE]",
+        help=(
+            "with --match, narrow by a linked object — e.g. placedBy.tier=gold keeps only rows "
+            "with such a linked object; a bare LINK keeps the rows that have one at all"
         ),
     )
     q.add_argument("--limit", type=int, default=None)

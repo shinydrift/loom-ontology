@@ -25,6 +25,7 @@ from ..ir import (
     Contains,
     GetByKey,
     In,
+    LinkFilter,
     Match,
     Not,
     Or,
@@ -91,6 +92,9 @@ class DuckDBEngine:
         # one that can contribute a parameter *before* the FROM clause. Empty for the other three.
         select_extra: str = ""
         select_params: Sequence[Any] = ()
+        # Aliases whose governance predicate a source compiler has already rendered somewhere the
+        # top-level `WHERE` cannot reach. Empty for three of the four nodes; see `_compile_match`.
+        scoped: frozenset[str] = frozenset()
         src = plan.source
         if isinstance(src, GetByKey):
             frm, where, params, scans = self._compile_get(src, plan)
@@ -102,7 +106,9 @@ class DuckDBEngine:
             frm, where, params, scans = self._compile_traverse(src, plan)
             tail, tail_params = self._order_and_page(src.to_table.alias, src.order_by, src.limit, src.offset)
         elif isinstance(src, Match):
-            select_extra, select_params, frm, where, params, scans = self._compile_match(src, plan)
+            select_extra, select_params, frm, where, params, scans, scoped = self._compile_match(
+                src, plan
+            )
             tail, tail_params = self._order_and_page(
                 src.table.alias, src.order_by, src.limit, src.offset, rank=src.score_as
             )
@@ -112,7 +118,21 @@ class DuckDBEngine:
         # Every table the plan reads, not the one it projects: a traverse's anchor end is governed
         # too, or the link is the way around a policy on the type you cannot search. `tables_of` is
         # what makes that structural rather than remembered — see `ir.TableRef`.
-        governed, governed_params = self._governance(tables_of(src))
+        known = {t.alias for t in tables_of(src)}
+        if not scoped <= known:
+            # A backstop, and modest on purpose — the guarantee is not here. What would be dangerous
+            # is an alias reported as governed whose predicate was never emitted, since its policy
+            # would then be dropped by both clauses at once; that is prevented *structurally*, by
+            # `_semi_join` reporting only from the branch that renders one, rather than checked
+            # after the fact. This catches the remaining shape a report can take — a claim naming no
+            # table of this plan, which can only be a claim about nothing. The opposite slip needs
+            # no help at all: an unreported governed table falls through to `_governance`, where its
+            # alias is out of scope and DuckDB refuses the query.
+            raise EngineError(  # pragma: no cover - an adapter bug, not a caller's
+                f"{type(src).__name__} reports governing {sorted(scoped - known)}, which this plan "
+                "does not read"
+            )
+        governed, governed_params = self._governance(tables_of(src), scoped)
         clauses = [c for c in (where, governed) if c]
 
         sql = f"SELECT {select}{select_extra} FROM {frm}"
@@ -250,7 +270,24 @@ class DuckDBEngine:
         has none. So the vector column is materialized whole on every call: the distance arithmetic
         is linear in the filtered set and the I/O is linear in the sidecar. What would fix it is the
         same channel the range-pushdown backlog entry describes, or partitioning the sidecar; neither
-        is this slice's, and both are optimisations rather than corrections."""
+        is this slice's, and both are optimisations rather than corrections.
+
+        **A `via` hop is a semi-join and not a JOIN, and the reason is the projection.** Joining the
+        far table would duplicate the near row once per far row that matches, which on a to-many link
+        is silently a different answer: the same object several times, each with the same score, and
+        the page it fills is smaller than it looks. `DISTINCT` repairs that only when the projection
+        is unique, and a §6.1 mask can remove the primary key from it — so the repair is a function
+        of the deployment's policy, which is exactly the kind of thing this codebase refuses to
+        depend on. `IN (SELECT …)` says *some* once, in the grammar's own vocabulary, and cannot
+        multiply a row whatever the projection holds.
+
+        **Each hop's governance predicate is rendered inside its own subquery, and the roadmap said
+        otherwise.** *A `via` inherits cross-object governance for free* was true of where the
+        predicate comes from — `Resolver._table`, the one place a type becomes a table — and not of
+        where it is *placed*: `compile` ANDs every `tables_of` predicate into the top-level `WHERE`,
+        where a semi-joined alias is out of scope, and the parameters concatenate slot by slot so a
+        clause in one slot cannot have its parameters in another. Both halves fail together, which is
+        why this returns the aliases it has already governed and `_governance` covers the rest."""
         alias, v = src.table.alias, src.vectors
         valias = v.table.alias
         dims = len(src.query)
@@ -273,6 +310,20 @@ class DuckDBEngine:
         referenced = self._columns_for(plan, src, alias) | {src.key_column} | set(src.order_by)
         clauses, filter_params = self._filter_clauses(src.filters, referenced)
         params.extend(filter_params)
+
+        link_scans: tuple[ScanRequest, ...] = ()
+        scoped: set[str] = set()
+        for link in src.links:
+            referenced.add(link.near_column)
+            clause, link_params, hop_scans, hop_scoped = self._semi_join(link, plan, src)
+            clauses.append(clause)
+            params.extend(link_params)
+            link_scans += hop_scans
+            # Taken from what `_semi_join` reports it *rendered*, never from the link it was handed.
+            # A skip list assembled here in parallel would be a second statement about the same
+            # thing, and the direction it could get wrong — claiming an alias whose predicate was
+            # never emitted — is the one that silently drops a policy.
+            scoped |= hop_scoped
 
         vector_columns = self._columns_for(plan, src, valias) | {
             v.key_column,
@@ -300,7 +351,7 @@ class DuckDBEngine:
                     (v.property_column, v.property),
                 ),
             ),
-        )
+        ) + link_scans
         # `FLOAT[n]` on both sides — the fixed-width spelling `Capabilities.vector_search` claims,
         # and the one the distance function needs. The sidecar column arrives from Iceberg as a
         # variable-length `list<float>`, so the width the ranking happens at is *stated* in the SQL
@@ -309,7 +360,69 @@ class DuckDBEngine:
         score = (
             f", array_cosine_similarity({stored}, CAST(? AS FLOAT[{dims}])) AS {_quote(src.score_as)}"
         )
-        return score, (list(src.query),), join, " AND ".join(guard + clauses), params, scans
+        return (
+            score,
+            (list(src.query),),
+            join,
+            " AND ".join(guard + clauses),
+            params,
+            scans,
+            frozenset(scoped),
+        )
+
+    def _semi_join(self, link: LinkFilter, plan: Project, src: Match):
+        """One hop as `near IN (SELECT far …)`, with that hop's own governance inside it.
+
+        The far end's rows are the rows this deployment shows — the predicate arrived on
+        `link.table` from `Resolver._table` like every other one — and it is ANDed *here*, after the
+        hop's filters, because this subquery is the only scope its alias exists in.
+
+        A mapping table joins in the middle when the link declares one, and it carries no predicate
+        for `ThroughRef`'s reason: it stands for no object type, so no policy names it. What the
+        subquery selects then changes ends — the mapping table's near-side column rather than the far
+        table's join column — because that is the column the near row's value has to be found in."""
+        alias = link.table.alias
+        far_columns = self._columns_for(plan, src, alias) | {link.far_column}
+        clauses, params = self._filter_clauses(link.filters, far_columns)
+
+        if link.through is None:
+            frm = _quote(alias)
+            selected = _ref(alias, link.far_column)
+            scans: tuple[ScanRequest, ...] = ()
+        else:
+            th = link.through
+            frm = (
+                f"{_quote(th.table.alias)} JOIN {_quote(alias)} "
+                f"ON {_ref(alias, link.far_column)} = {_ref(th.table.alias, th.to_column)}"
+            )
+            selected = _ref(th.table.alias, th.from_column)
+            scans = (
+                ScanRequest(
+                    alias=th.table.alias,
+                    catalog=th.table.catalog,
+                    table=th.table.table,
+                    columns=tuple(sorted({th.from_column, th.to_column})),
+                ),
+            )
+
+        scoped: frozenset[str] = frozenset()
+        if link.table.predicate is not None:
+            clauses.append(self._predicate(link.table.predicate, params))
+            # Reported from the branch that emitted it, so *governed here* and *skipped there* are
+            # one fact rather than two that could disagree.
+            scoped = frozenset({alias})
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        scans += (
+            ScanRequest(
+                alias=alias,
+                catalog=link.table.catalog,
+                table=link.table.table,
+                columns=tuple(sorted(far_columns)),
+                predicates=tuple(pushdown_hints(link.filters)),
+            ),
+        )
+        clause = f"{_ref(src.table.alias, link.near_column)} IN (SELECT {selected} FROM {frm}{where})"
+        return clause, params, scans, scoped
 
     @staticmethod
     def _columns_for(plan: Project, src, alias: str) -> set[str]:
@@ -329,18 +442,26 @@ class DuckDBEngine:
 
     # ---- governance ------------------------------------------------------------
 
-    def _governance(self, tables: Sequence[TableRef]) -> tuple[str, list[Any]]:
+    def _governance(
+        self, tables: Sequence[TableRef], scoped: frozenset[str] = frozenset()
+    ) -> tuple[str, list[Any]]:
         """Every governed table's predicate, ANDed, in the order the plan names them.
 
         Never a `ScanRequest` predicate: that channel is a documented pushdown *hint* an adapter
         may ignore and the resolver re-applies, which is right for a caller's filter and wrong for
         a policy. A governance predicate lives in the `WHERE` clause and nowhere else, which is
         also what makes it filter *before* `LIMIT`/`OFFSET` — a page thinned after the fact would
-        make `hasMore` and `offset` lie."""
+        make `hasMore` and `offset` lie.
+
+        `scoped` names the aliases a source compiler has already governed somewhere this clause
+        cannot see. It is a skip list rather than a second rule about which tables matter: every
+        table is still governed, and this says only that one of them was governed *there*. Only
+        `Match` populates it, and only for a `via` hop, whose alias exists inside a subquery and
+        nowhere else."""
         clauses: list[str] = []
         params: list[Any] = []
         for table in tables:
-            if table.predicate is not None:
+            if table.predicate is not None and table.alias not in scoped:
                 clauses.append(self._predicate(table.predicate, params))
         return " AND ".join(clauses), params
 

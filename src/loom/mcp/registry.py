@@ -40,6 +40,13 @@ level of the argument tree belongs entirely to one vocabulary, and they alternat
 Loom's, `filter` the spec's, per-property Loom's again. A property name never appears where an
 operator does, so nothing can shadow anything, and a spec may declare a property called `gte`.
 
+`match_`'s `via` is where that rule earns its keep a second time, and it sharpens it. The spec has
+*two* vocabularies, not one — link names and property names — and they must not share a level
+either: a `placedBy.tier` key inside `filter` would make an ontology with a link and a property of
+the same name unable to say which one it meant. So `via` is a top-level argument of its own, and
+what alternates is not Loom/spec but **one namespace per level**: `via` Loom's, the link name the
+spec's links, the property name the spec's properties, the operator Loom's again.
+
 **Where the read tools and the write tools differ, and where they don't.** A `run_` tool takes a
 runtime instead of a resolver, because a modify must see the whole physical row and the resolver
 projects one down to declared properties. Everything else is the same bargain: the name comes from
@@ -76,6 +83,17 @@ TEXT_ARG = "text"
 What a caller passes is *not* a value of the semantic property — it is the question, in the caller's
 own words, which is the entire reason this plane exists. Naming it after the property would say the
 opposite."""
+
+VIA_ARG = "via"
+"""`match_`'s cross-object narrowing, keyed by **link name** — and that is why it is a top-level
+argument rather than a dotted key inside `filter`.
+
+`filter` is the spec's vocabulary one level down, and it is shared with `search_` through
+`_filterable`: its keys are property names. A `placedBy.tier` key inside it would put link names and
+property names in one namespace, which §7's rule exists to prevent — the alternation is *top level
+Loom's, `filter` the spec's, per-property Loom's again*, and a link name is a third thing. So it gets
+its own level, and the tree alternates the same way underneath it: `via` Loom's, link name the
+spec's, then a filter object that is the spec's again keyed by property, then operators."""
 
 PARAMETERS_ARG = "parameters"
 DRY_RUN_ARG = "dryRun"
@@ -441,6 +459,44 @@ def _page(obj: ObjectType, rows: list[dict], args: dict, masked: Sequence[str] =
 # ---- match ---------------------------------------------------------------------
 
 
+def _via_arg(resolver: Resolver, obj: ObjectType) -> dict | None:
+    """The `via` argument's schema — one key per link out of this type — or None for a type with
+    none.
+
+    **Omitted rather than advertised empty**, which is the opposite of what `filter` does and for a
+    reason the two do not share. A `filter` with no filterable properties still describes a real
+    argument: the search takes one, and a deployment that withheld every property is a fact the
+    description says out loud. A `via` on a type no link leaves has nothing it could ever accept, so
+    advertising `{}` would be an argument whose only legal value says nothing — and `argument_refusal`
+    then names it correctly as not an argument of this tool.
+
+    Each hop's value is the far type's own `filter` schema, built by the same two functions the far
+    type's own tools are built from. That is what carries a mask one join out without a second rule:
+    a property withheld on `Customer` is absent from `via.placedBy` exactly as it is absent from
+    `search_customer`'s `filter`, and `Resolver._filters` refuses it there for the same reason it
+    refuses it here."""
+    directions = resolver.links_of(obj.api_name)
+    if not directions:
+        return None
+    hops: dict[str, Any] = {}
+    for d in directions:
+        far = resolver.ontology.object_types[d.target_object_type]
+        schema = _filter_arg(_filterable(far, resolver.masked(far.api_name)))
+        schema["description"] = (
+            f"{far.api_name} filters, ANDed — keeps a {obj.api_name} only if at least one "
+            f"{far.api_name} it links to by '{d.name}' matches. {{}} keeps the ones that have any"
+        )
+        hops[d.name] = schema
+    return {
+        "type": "object",
+        "properties": hops,
+        "additionalProperties": False,
+        "description": (
+            "narrow by the objects on the other end of a declared link, ANDed with `filter`"
+        ),
+    }
+
+
 def _match_tool(
     resolver: Resolver, obj: ObjectType, matcher: Matcher, program: PolicyProgram | None = None
 ) -> ToolSpec:
@@ -463,11 +519,19 @@ def _match_tool(
 
     **The tool is built from the spec and the deployment's provider, never from the lake.** Whether
     anything has actually been embedded is a fact that changes while the process runs, so it is
-    answered per call — as a refusal, not an empty page. `Matcher.match` says why."""
+    answered per call — as a refusal, not an empty page. `Matcher.match` says why.
+
+    **`via` is what makes the ranking answerable.** Without it this tool can rank orders by meaning
+    and cannot say *belonging to a gold-tier customer*, which is the query anyone actually has — and
+    the two halves are not interchangeable, because a ranking is over the rows that survive
+    narrowing. It is announced in the description as well as the schema for the reason every other
+    affordance is: an agent reads descriptions afresh every session, and a nested argument it does
+    not know to look for is one it will not use."""
     masked = resolver.masked(obj.api_name)
     prop = obj.semantic_property
     assert prop is not None  # `matcher.stores` is keyed by the types that declare one
     filterable = _filterable(obj, masked)
+    hops = _via_arg(resolver, obj)
 
     schema = {
         "type": "object",
@@ -481,6 +545,7 @@ def _match_tool(
                 ),
             },
             "filter": _filter_arg(filterable),
+            **({VIA_ARG: hops} if hops else {}),
             **_PAGE_SCHEMA,
         },
         "required": [TEXT_ARG],
@@ -493,6 +558,7 @@ def _match_tool(
             obj.api_name,
             args[TEXT_ARG],
             args.get("filter") or {},
+            args.get(VIA_ARG) or {},
             limit=args.get("limit"),
             offset=args.get("offset", 0),
         )
@@ -517,6 +583,14 @@ def _match_tool(
         if filterable
         else ""
     )
+    crossed = (
+        f" Narrow by a linked object with `via` ({', '.join(hops['properties'])}) — "
+        f"`via: {{{next(iter(hops['properties']))}: {{...}}}}` keeps a {obj.api_name} only if at "
+        "least one object on the other end of that link matches, and an empty `{}` keeps the ones "
+        "that have any."
+        if hops
+        else ""
+    )
     return ToolSpec(
         name=f"match_{snake_case(obj.api_name)}",
         description=_described(
@@ -524,7 +598,7 @@ def _match_tool(
             f"Rank {_subject(obj)} by how close {prop.name} is in meaning to your words. Use this "
             f"when the answer is in the text but you do not know the data's wording — "
             f"search_{snake_case(obj.api_name)} finds rows that *say* a word, this finds rows that "
-            f"*mean* one." + narrowed + " Each result carries a `score` beside the object, nearest "
+            f"*mean* one." + narrowed + crossed + " Each result carries a `score` beside the object, nearest "
             "first: it is a cosine similarity, comparable between rows and between calls of this "
             "deployment and meaningless against any other model. Only rows that have been embedded "
             "can be ranked — `embeddedAsOf` says how current the oldest of these is.",

@@ -351,6 +351,44 @@ class VectorRef:
 
 
 @dataclass(frozen=True)
+class LinkFilter:
+    """One hop's **existential** test: keep a near row only if some row on the far end matches.
+
+    **A fragment carried on `Match`, not a fifth source node**, and the rule the two entries produce
+    together is worth stating once: *a read whose result shape is unchanged does not get a node*.
+    `Match` earned one because it returns something the other three do not — an ordering the caller
+    never gave, and a score belonging to no table. This returns the same objects the same `Match`
+    already returned, in the same order, and only fewer of them. That is what a filter is, so it goes
+    where `filters` goes.
+
+    It is deliberately **not** a field on `Search`. `search_` can already say *belonging to a
+    gold-tier customer* by traversing from the customer, and a field nothing populates is
+    `loom.managed` a second time — a column written and never read is a check nobody is doing. The
+    day a `search_` wants it, this fragment is what it gets, unchanged.
+
+    **Existential always, stated because on a to-one link it is invisible.** *Orders whose customer
+    is gold* reads the same either way when a link is many-to-one; on a to-many link the two readings
+    diverge and only one of them is a filter — *some order over 500* narrows the customers, *every
+    order over 500* is a quantifier this grammar has no spelling for and `traverse` answers by
+    handing the caller the rows. An empty `filters` is therefore an existence test rather than a
+    no-op: *orders that have a customer at all*.
+
+    **`table` is the far end and carries its own predicate**, which is the whole of how a hop is
+    governed: it comes from `Resolver._table` exactly as the near end does. Where it is *placed* is
+    the adapter's problem and not the same question — see `DuckDBEngine._compile_match`, which
+    corrects the roadmap's claim that this came for free.
+
+    `through` carries the mapping table when the link declares one, as `Traverse` does, and for the
+    same reason: a many-to-many hop has a table in the middle that stands for no object type."""
+
+    table: TableRef
+    near_column: str  # on the `Match`'s own table — the near end of the link
+    far_column: str  # on `table`
+    filters: tuple[Comparison, ...] = ()
+    through: ThroughRef | None = None
+
+
+@dataclass(frozen=True)
 class Match:
     """Rows of `table`, ranked by how near their stored vector is to `query`.
 
@@ -377,6 +415,11 @@ class Match:
     query: tuple[float, ...]
     score_as: str
     filters: tuple[Comparison, ...] = ()
+    links: tuple[LinkFilter, ...] = ()
+    """Cross-object narrowing, ANDed with `filters` and with each other — `LinkFilter` says why it
+    is a field here rather than a node of its own. Several hops along one link name it once each,
+    because the argument above is keyed by link name; several *different* links are several
+    entries."""
     order_by: tuple[str, ...] = ()  # physical columns on `table`; the tie-break, after the score
     limit: int | None = None
     offset: int = 0
@@ -392,13 +435,25 @@ def tables_of(source: Source) -> tuple[TableRef, ...]:
     governed end of every plan is filtered* a claim a compiler can keep rather than a list a
     compiler author has to. A `Traverse` names two, and forgetting the anchor end is precisely the
     hole this exists to close. A `Match` names two as well, and only one of them can be governed —
-    see `VectorRef`."""
+    see `VectorRef` — plus two per hop of `links`, which is the same hole reopened one join further
+    out: a `via` whose far table went unnamed here would be an ungoverned read of a type the caller
+    may not be allowed to see the rows of.
+
+    **Naming a table here is not the same as saying where its predicate goes.** A hop's is rendered
+    inside its own subquery, because the alias is out of scope in the top-level `WHERE` — so an
+    adapter reports back which aliases it has already governed and `_governance` covers the rest.
+    That split is `DuckDBEngine._compile_match`'s to explain; what this function still owes is the
+    complete list, and it is complete."""
     if isinstance(source, GetByKey):
         return (source.table,)
     if isinstance(source, Search):
         return (source.table,)
     if isinstance(source, Match):
-        return (source.table, source.vectors.table)
+        return (source.table, source.vectors.table) + tuple(
+            t
+            for link in source.links
+            for t in ((link.table,) + ((link.through.table,) if link.through else ()))
+        )
     tables = (source.to_table, source.from_table)
     return tables + ((source.through.table,) if source.through is not None else ())
 

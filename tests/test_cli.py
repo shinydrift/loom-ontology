@@ -95,6 +95,61 @@ def test_an_operator_other_than_in_given_twice_is_refused(tmp_path, capsys):
     assert "gives 'ltv.gte' twice" in capsys.readouterr().err
 
 
+def test_via_without_a_match_is_refused_before_any_catalog_is_opened(tmp_path, capsys):
+    """`via` is an argument of `match_<object>` and of nothing else. The dev command mirrors the
+    generated tools, so offering a cross-object filter on a read the surface offers none on would be
+    a back door with a tidy spelling."""
+    ontology = _project(tmp_path, config=UNREACHABLE_CONFIG)
+    assert main(["query", "Customer", str(ontology), "--via", "orders.orderId=o1"]) == 1
+    assert "--via requires --match" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", ["orders=o1", "orders=o1.total=5"])
+def test_a_via_that_names_no_property_is_refused(tmp_path, capsys, bad):
+    """A hop names a link *before* a property, so `--via orders=o1` is not a shorter spelling of
+    anything — it is the flag missing its middle.
+
+    The second case is why the check is not on the bare branch alone: `orders=o1.total=5` splits at
+    the *dot*, so a link segment holding an `=` used to sail past this refusal and be reported as an
+    unknown link — after a catalog had been opened, which is precisely what checking the argument
+    shape first exists to avoid."""
+    ontology = _project(tmp_path, config=UNREACHABLE_CONFIG)
+    argv = ["query", "Customer", str(ontology), "--match", "x", "--via", bad]
+    assert main(argv) == 1
+    err = capsys.readouterr().err
+    assert "--via expects LINK, LINK.PROP=VALUE or LINK.PROP.OP=VALUE" in err
+    assert "catalog" not in err  # refused on shape, before anything was opened
+
+
+def test_a_hop_parses_with_the_same_grammar_a_filter_does(tmp_path):
+    """One function for two flags, which is what stops the dev command from growing a second filter
+    grammar where the surface has one. A bare link is the existence test the argument means by
+    `{}`."""
+    from loom.cli import _via_pairs
+
+    assert _via_pairs(["orders"]) == {"orders": {}}
+    assert _via_pairs(["orders.total.gte=100", "orders.total.lt=500"]) == {
+        "orders": {"total": {"gte": "100", "lt": "500"}}
+    }
+    assert _via_pairs(["orders.tier.in=gold", "orders.tier.in=silver"]) == {
+        "orders": {"tier": {"in": ["gold", "silver"]}}
+    }
+    # Two hops in one call, each keyed by its own link name.
+    assert _via_pairs(["orders.orderId=o1", "billedTo"]) == {
+        "orders": {"orderId": "o1"},
+        "billedTo": {},
+    }
+
+
+def test_a_hop_given_one_operator_twice_is_refused_naming_the_hop(tmp_path):
+    """The refusals come from the shared parser, so they say which flag and which hop rather than
+    reporting a filter the caller never wrote."""
+    from loom.cli import _via_pairs
+
+    with pytest.raises(ValueError, match="--via orders gives 'total.gte' twice"):
+        _via_pairs(["orders.total.gte=1", "orders.total.gte=2"])
+
+
 def test_link_without_a_key_is_refused_before_any_catalog_is_opened(tmp_path, capsys):
     ontology = _project(tmp_path, config=UNREACHABLE_CONFIG)
     assert main(["query", "Customer", str(ontology), "--link", "orders"]) == 1
