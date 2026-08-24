@@ -1,13 +1,14 @@
 # A **second deployment of the same spec.**
 #
-# `../loom.yaml` is the one the README's walkthrough uses: stdio, read-only, the shape you point a
-# desktop MCP client at. This file serves the identical `../ontology` over a socket with writes on,
-# because a dashboard is a different deployment of the same ontology rather than a different
-# ontology — no spec was edited to get here, and that is the claim the directory exists to make.
+# `../loom.yaml` is the one the guide's walkthrough uses (docs/guide/quickstart.md): stdio,
+# read-only, the shape you point a desktop MCP client at. This file serves the identical
+# `../ontology` over a socket with writes on, because a dashboard is a different deployment of the
+# same ontology rather than a different ontology — no spec was edited to get here, and that is the
+# claim the directory exists to make.
 #
 # It is deliberately *not* discovered by `find_config`, which looks inside the ontology dir, then
 # beside it, then in the cwd. `app.py` names this file explicitly. So `loom serve
-# examples/retail/ontology` keeps meaning exactly what the README says it means, and running the
+# examples/retail/ontology` keeps meaning exactly what the guide says it means, and running the
 # dashboard cannot change what any other command does.
 
 version: 0
@@ -51,9 +52,9 @@ mcp:
   # to write down is the name of the thing doing the writing.
   actor: agent:retail-dashboard
 
-# What this deployment withholds. Nothing, as shipped — and the README walks you through turning it
-# on, because the interesting part is watching it change what the dashboard can see *without the
-# dashboard changing*.
+# What this deployment withholds. Nothing, as shipped — docs/guide/dashboard.md walks you through
+# turning it on, because the interesting part is watching it change what the dashboard can see
+# *without the dashboard changing*.
 #
 # Uncomment either policy, restart `app.py`, reload:
 #

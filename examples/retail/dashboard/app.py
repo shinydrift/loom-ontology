@@ -62,7 +62,7 @@ def load_project(config_path: Path):
     """The spec from `../ontology`, the deployment from this directory's own `loom.yaml`.
 
     Named explicitly rather than discovered. `find_config` would walk from the ontology dir up to
-    `../loom.yaml` — the stdio, read-only deployment the README documents — and quietly serve that
+    `../loom.yaml` — the stdio, read-only deployment the guide documents — and quietly serve that
     instead, which is the sort of thing you find out about three panels later."""
     from loom import build
     from loom.config import load_config
