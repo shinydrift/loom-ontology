@@ -72,7 +72,12 @@ def test_apply_creates_every_table_the_spec_backs(example):
     seed.bootstrap(ontology, open_catalogs(config))
 
     cat = catalog(config)
-    for table in ("crm.customers", "sales.orders", "sales.daily_sales_performance"):
+    for table in (
+        "crm.customers",
+        "sales.orders",
+        "support.tickets",
+        "sales.daily_sales_performance",
+    ):
         assert cat.table_exists(table)
 
 
@@ -88,12 +93,13 @@ def test_the_rows_arrive_through_the_declared_sequence(example):
     cat = catalog(config)
     assert len(cat.scan("crm.customers").to_pylist()) == 4
     assert len(cat.scan("sales.orders").to_pylist()) == 6
+    assert len(cat.scan("support.tickets").to_pylist()) == 14
 
     loads = cat.scan(LOAD_LOG_TABLE).to_pylist()
-    assert {r["entry"] for r in loads} == {"customers", "orders"}
+    assert {r["entry"] for r in loads} == {"customers", "orders", "tickets"}
     assert {r["actor"] for r in loads} == {"seed.py"}
     (run,) = cat.scan(SEQUENCE_LOG_TABLE).to_pylist()
-    assert run["sequence"] == "seed" and run["landed"] == 2
+    assert run["sequence"] == "seed" and run["landed"] == 3
 
 
 def test_the_loaded_rows_are_only_the_declared_properties(example):
@@ -210,7 +216,7 @@ def test_it_is_not_in_the_sequence_because_it_reads_what_the_sequence_writes(exa
     _, _, _, config = example
     (sequence,) = config.sequences
     assert "daily-sales" not in sequence.loads
-    assert [e.name for e in config.ingest] == ["customers", "orders", "daily-sales"]
+    assert [e.name for e in config.ingest] == ["customers", "orders", "tickets", "daily-sales"]
 
 
 def test_the_handover_file_is_not_left_behind(example):
@@ -224,6 +230,7 @@ def test_the_handover_file_is_not_left_behind(example):
         "customers.ndjson",
         "manifest.yaml",
         "orders.ndjson",
+        "tickets.ndjson",
     ]
 
 

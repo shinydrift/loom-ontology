@@ -8,3 +8,4 @@
 # drop is the files sitting beside it.
 customers: customers.ndjson
 orders: orders.ndjson
+tickets: tickets.ndjson

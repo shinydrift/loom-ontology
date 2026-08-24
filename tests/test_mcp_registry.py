@@ -279,7 +279,7 @@ def test_the_ranked_read_is_held_to_the_same_agreement(ontology):
 def test_descriptions_come_from_the_spec(ontology):
     tools = _tools(ontology)
     assert "by its customerId" in tools["get_customer"].description
-    assert "orders -> Order (many_to_one)" in tools["traverse"].description
+    assert "orders -> Order (one_to_many)" in tools["traverse"].description
 
 
 def test_paging_caps_are_advertised_in_the_schema(ontology):
@@ -327,8 +327,29 @@ def test_traverse_result_names_the_type_it_returned(ontology):
         {"objectType": "Customer", "key": "c2", "link": "orders"}
     )
     assert result["targetObjectType"] == "Order"
-    assert result["cardinality"] == "many_to_one"
     assert result["objects"] == [{"orderId": "o1"}]
+
+
+def test_traverse_reports_the_cardinality_of_the_direction_not_the_link(ontology):
+    """`orders` is the reverse of a `many_to_one` link, so the hop is `one_to_many`.
+
+    Reported the other way until a live probe read the envelope back: `cardinality: many_to_one`
+    arrived beside a `count` of 5 and `hasMore: true`, which is the surface contradicting itself in
+    one object. A caller reading *at most one* off a route that returns as many rows as exist stops
+    paging."""
+    reverse = _tools(ontology, rows=[{"orderId": "o1"}])["traverse"].handler(
+        {"objectType": "Customer", "key": "c2", "link": "orders"}
+    )
+    assert reverse["cardinality"] == "one_to_many"
+
+    forward = _tools(ontology, rows=[{"customerId": "c2"}])["traverse"].handler(
+        {"objectType": "Order", "key": "o1", "link": "placedBy"}
+    )
+    assert forward["cardinality"] == "many_to_one"
+
+    catalogue = {t.name: t for t in _tools(ontology).values()}["traverse"].description
+    assert "orders -> Order (one_to_many)" in catalogue
+    assert "placedBy -> Customer (many_to_one)" in catalogue
 
 
 def test_decimals_survive_as_strings_not_floats():

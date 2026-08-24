@@ -15,6 +15,7 @@ three-valued logic under a negation.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 
 import pyarrow as pa
@@ -149,6 +150,37 @@ def test_incomparable_operands_are_refused(customer):
     ont, obj = customer
     (problem,) = check(_expr("object.ltv == 'gold'"), obj, ont.object_types)
     assert "compares 'double' with 'string'" in problem
+
+
+def test_a_decimal_compares_against_a_number_the_way_the_evaluator_always_has(customer):
+    """`object.total < 1000` on a decimal property, which was refused at load until a probe.
+
+    Found from the far end of a `via`: a governance policy over `Order` could not be written at all,
+    because no literal in the expression language *has* the type `decimal` — an integer literal is a
+    `long`, a fractional one is a `double`, and a quoted one is a `string`. So every `decimal`
+    property in every ontology was structurally impossible to filter rows by, and the refusal cited
+    a rule the other two planes do not follow: `evaluate.py` compares a `Decimal` against a literal
+    `1` deliberately ("numbers compare across their Python types"), and the validator type-checks the
+    same expression language for an action's rules without this restriction.
+
+    Comparison is not storage, which is why `comparable_to` keeps its narrower answer — see
+    `PropType.comparable_in_a_comparison`."""
+    ont = build(VALID)[0]
+    order = ont.object_types["Order"]
+    assert order.properties["total"].type.kind == "decimal"
+
+    assert check(_expr("object.total < 1000"), order, ont.object_types) == []
+    assert check(_expr("object.total >= 1000.50"), order, ont.object_types) == []
+    assert check(_expr("object.total != 0"), order, ont.object_types) == []
+
+    # Still not a free-for-all: a decimal is a number and a string is not.
+    (problem,) = check(_expr("object.total < 'a lot'"), order, ont.object_types)
+    assert "compares 'decimal' with 'string'" in problem
+
+    # And the in-process plane answers it, over the value domain the read path really produces.
+    row = {"orderId": "o1", "customerId": "c1", "total": Decimal("1299.99")}
+    assert admits(_expr("object.total < 1000"), row) is False
+    assert admits(_expr("object.total > 1000"), row) is True
 
 
 def test_a_predicate_that_reads_no_property_is_refused(customer):

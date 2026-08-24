@@ -1,0 +1,30 @@
+objectType:
+  apiName: SupportTicket
+  displayName: Support ticket
+  description: A message a customer sent us about an order or their account
+  primaryKey: ticketId
+  title: ticketId
+  backing: { catalog: local, table: support.tickets }
+  properties:
+    - { name: ticketId,   type: string, column: id, unique: true }
+    - { name: customerId, type: string, column: customer_id }
+    # Nullable because not every ticket is about a purchase — a password reset and an erasure
+    # request belong to a customer and to no order. It is also the one link property in this example
+    # that can be null, which is what makes a `via` hop over a to-one link demonstrable in both
+    # directions: `via: {about: {}}` keeps the tickets that are about an order at all.
+    - { name: orderId,    type: string, column: order_id, nullable: true }
+    - { name: status,     type: enum, values: [open, waiting, resolved], column: status }
+    - { name: body,       type: string, column: body }
+    - { name: openedAt,   type: timestamp, column: opened_at }
+  # `body` is in both lists, and having it in both is the demonstration rather than an oversight.
+  # `searchable` gates `contains`, so `search_support_ticket` can be asked for the tickets whose
+  # body *says* "refund" — and against this data it returns nothing, because not one of these
+  # customers wrote that word. `semantic` is what makes the same question answerable: the rows are
+  # there, worded as people actually word them ("I want the money back", "raised it with my bank"),
+  # and a ranking is what reaches them. Put the two calls side by side and the milestone's claim is
+  # a thing you can see rather than a thing the description asserts.
+  searchable: [status, openedAt, body]
+  # One property, and the key is a name rather than a list: see docs/roadmap/m10-semantic-search.md.
+  # Only a string may be embedded — `status` is a closed set that `eq` answers exactly and `openedAt`
+  # is ordered, so a similarity over either would be a fuzzy answer to a precise question.
+  semantic: body

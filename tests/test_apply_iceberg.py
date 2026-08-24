@@ -61,9 +61,10 @@ def test_apply_bootstraps_an_empty_warehouse(project):
         "crm.customers",
         "sales.daily_sales_performance",
         "sales.orders",
+        "support.tickets",
     ]
     # Namespaces did not exist a moment ago; apply created them rather than failing.
-    assert [o.namespace_created for o in result.applied] == ["crm", "sales", ""]
+    assert [o.namespace_created for o in result.applied] == ["crm", "sales", "", "support"]
 
     schema = catalogs["local"].describe("crm.customers")
     assert {c.name: c.iceberg_type for c in schema.columns.values()} == {

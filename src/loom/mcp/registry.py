@@ -641,7 +641,7 @@ def _traverse_tool(resolver: Resolver, program: PolicyProgram | None = None) -> 
         directions = resolver.links_of(name)
         if directions:
             routes[name] = [
-                f"{d.name} -> {d.target_object_type} ({d.link.cardinality}"
+                f"{d.name} -> {d.target_object_type} ({d.cardinality}"
                 + (f", {d.link.status}" if d.link.status != "active" else "")
                 + ")"
                 for d in directions
@@ -683,7 +683,10 @@ def _traverse_tool(resolver: Resolver, program: PolicyProgram | None = None) -> 
             "key": json_safe(args["key"]),
             "link": args["link"],
             "targetObjectType": direction.target_object_type,
-            "cardinality": direction.link.cardinality,
+            # The direction's cardinality rather than the link's declared one: this envelope
+            # describes the hop the caller just made, and a `many_to_one` link followed from its
+            # `to` end is a `one_to_many` hop. See `LinkDirection.cardinality`.
+            "cardinality": direction.cardinality,
             **_paged(args, len(rows)),
             # The target's mask, not the source's: a traverse projects the objects at the other end,
             # so what is withheld here is a fact about where you landed. Read per call rather than

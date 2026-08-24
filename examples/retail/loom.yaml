@@ -16,6 +16,28 @@ engine:
 mcp:
   name: loom-retail
   transport: stdio
+  # What this deployment embeds with, and it is the deployment's to say rather than the spec's:
+  # `semantic: body` on SupportTicket is true of the model wherever it runs, and a model name is
+  # true of one machine. A spec can no more demand `text-embedding-3` than it can demand a transport.
+  #
+  # Switching this on adds one tool — `match_support_ticket` — and takes nothing away. Comment it out
+  # and the server still starts and still serves the other tools: an absent provider withholds the
+  # ranked plane, it does not refuse the deployment, exactly as `writes: false` serves without
+  # actions. (A spec whose *engine* had no array arithmetic is the different case, and that one is a
+  # contradiction `loom serve` refuses at startup.)
+  #
+  # Nothing here is loaded at boot. `provider: local` is fastembed, a ~130MB model download that
+  # happens on the first call that needs a vector — so `loom serve` starts as fast as it always did,
+  # and a machine that never ranks never fetches it.
+  #
+  # `model` is required and there is deliberately no `dims` key. The model name is folded into every
+  # stored vector's hash, so a default Loom could change in a later release would silently invalidate
+  # every warehouse that took it; and `dims` is a property of the model, so a file that could state
+  # it is a file that could state it wrong — vectors of the declared width would be written, ranked
+  # against each other, and mean nothing.
+  embedding:
+    provider: local
+    model: BAAI/bge-small-en-v1.5
   # Uncomment to expose the three declared actions as `run_` tools. Off by default: declaring an
   # action and serving it to every client that connects are different decisions, and `loom serve`
   # was a read-only command for long enough that deployments were pointed at real lakes on that
@@ -110,6 +132,16 @@ ingest:
     mode: append
     format: ndjson
 
+  # The text this example exists to search by meaning. Nothing about the entry is different — a
+  # semantic property is a property, so it loads through the same checked path as a decimal, and
+  # `loom embed` is a separate step afterwards rather than a hook on this one. That split is M10's:
+  # embedding is automatic *derivation* (you never hand Loom a vector) and not automatic *timing*,
+  # and a load of four million rows is exactly the write a per-row hook would have to sit in.
+  - name: tickets
+    objectType: SupportTicket
+    mode: append
+    format: ndjson
+
   # The materialization `sales_performance.py` computes. `mode: replace` because a daily aggregate
   # is a whole answer rather than a set of edits: recomputing it and appending would leave two rows
   # per day, and merging would leave yesterday's answer for a day the source no longer has.
@@ -133,7 +165,7 @@ ingest:
 # up, about tables.
 sequences:
   - name: seed
-    loads: [customers, orders]
+    loads: [customers, orders, tickets]
 
 # What this deployment withholds, and what it permits. Uncomment `policies:` and `loom query`,
 # `loom run` and every generated tool

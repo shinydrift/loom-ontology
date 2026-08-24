@@ -142,27 +142,35 @@ def test_list_tools_returns_the_generated_surface(session):
         "get_customer",
         "get_daily_sales_performance",
         "get_order",
+        "get_support_ticket",
         "list_customer",
         "list_daily_sales_performance",
         "list_order",
+        "list_support_ticket",
+        "match_support_ticket",
+        "run_delete_ticket",
         "run_forget_customer",
         "run_record_order",
         "run_upgrade_tier",
         "search_customer",
         "search_daily_sales_performance",
         "search_order",
+        "search_support_ticket",
         "traverse",
     ]
 
 
 def test_a_default_deployment_advertises_no_way_to_write(readonly_session):
-    """The example declares three actions and `mcp.writes` is unset, so the surface is M1's.
+    """The example declares four actions and `mcp.writes` is unset, so the surface is M1's.
 
     This is the assertion that makes the default meaningful: an upgrade does not turn somebody's
     lake writable, and it takes a line in `loom.yaml` rather than a spec edit to change that."""
     _, listing, _ = readonly_session
     assert not [t.name for t in listing.tools if t.name.startswith("run_")]
-    assert len(listing.tools) == 10
+    # Thirteen reads (four object types x three) plus `traverse`, plus `match_support_ticket` —
+    # which is here because `mcp.embedding` is configured and `semantic:` is declared, and is the
+    # one tool on this surface that no amount of `writes: false` withholds.
+    assert len(listing.tools) == 14
 
 
 def test_advertised_schemas_survive_the_protocol(session):

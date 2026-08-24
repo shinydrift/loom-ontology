@@ -79,27 +79,43 @@ Point any MCP client at that last command and the ontology shows up as typed too
 
 ```
 $ loom serve examples/retail/ontology
-loom serve — 3 object type(s), 1 link type(s), 3 action(s) → 10 tool(s) over stdio
-  get_customer  get_daily_sales_performance  get_order  list_customer
-  list_daily_sales_performance  list_order  search_customer  search_daily_sales_performance
-  search_order  traverse
-  read-only · mcp.writes is false, so 3 declared action(s) are not exposed
+loom serve — 4 object type(s), 3 link type(s), 4 action(s) → 14 tool(s) over stdio
+  get_customer  get_daily_sales_performance  get_order  get_support_ticket
+  list_customer  list_daily_sales_performance  list_order  list_support_ticket
+  match_support_ticket  search_customer  search_daily_sales_performance  search_order
+  search_support_ticket  traverse
+  read-only · mcp.writes is false, so 4 declared action(s) are not exposed
     (`loom run` still reaches them — the runtime is not what is switched off, the surface is)
+  semantic search · SupportTicket.body via local/BAAI/bge-small-en-v1.5
+    (match_ ranks by brute force · the arithmetic is linear in the filtered set, so a narrow filter is the lever)
+    (no vector index · the whole sidecar is read on every call, filtered or not — that is the I/O floor,
+     and it grows with the embedded rows rather than with the answer)
+    (a row with no vector is absent from match_, silently — `loom embed` is what reports how many,
+     and how far behind)
 ```
+
+`match_support_ticket` is there because one property in the spec says `semantic: body` and this
+deployment configures a provider — both halves, which is why the three lines under it are
+disclosures rather than settings. Comment `mcp.embedding` out and the tool is simply absent; the
+server still starts, exactly as `writes: false` serves without actions.
 
 Three actions and no `run_` tools, because **serving writes is a choice a deployment makes**, not
 one a spec makes. `loom serve` used to be incapable of changing anything and people pointed it at
 real lakes on that basis; letting an upgrade plus an unrelated spec edit quietly make one mutable is
 not a default worth having. Add two lines under `mcp:` in `loom.yaml` and the same command serves
-thirteen tools:
+four more:
 
 ```
 $ loom serve examples/retail/ontology     # mcp: { writes: true, actor: agent:support-bot }
-loom serve — 3 object type(s), 1 link type(s), 3 action(s) → 13 tool(s) over stdio
-  get_customer  get_daily_sales_performance  get_order  list_customer
-  list_daily_sales_performance  list_order  run_forget_customer  run_record_order  run_upgrade_tier
-  search_customer  search_daily_sales_performance  search_order  traverse
-  writes enabled · 3 action(s) exposed, every run recorded as actor 'agent:support-bot'
+loom serve — 4 object type(s), 3 link type(s), 4 action(s) → 18 tool(s) over stdio
+  get_customer  get_daily_sales_performance  get_order  get_support_ticket
+  list_customer  list_daily_sales_performance  list_order  list_support_ticket
+  match_support_ticket  run_delete_ticket  run_forget_customer  run_record_order
+  run_upgrade_tier  search_customer  search_daily_sales_performance  search_order
+  search_support_ticket  traverse
+  writes enabled · 4 action(s) exposed, every run recorded as actor 'agent:support-bot'
+  semantic search · SupportTicket.body via local/BAAI/bge-small-en-v1.5
+    ...
 ```
 
 The banner counts what is actually exposed rather than what the spec declares, and says which mode
@@ -109,17 +125,20 @@ Change one more line and the same tools are served over a socket instead of a pi
 
 ```
 $ loom serve examples/retail/ontology     # mcp: { transport: http }
-loom serve — 3 object type(s), 1 link type(s), 3 action(s) → 10 tool(s) over http
-  get_customer  get_daily_sales_performance  get_order  list_customer
-  list_daily_sales_performance  list_order  search_customer  search_daily_sales_performance
-  search_order  traverse
-  read-only · mcp.writes is false, so 3 declared action(s) are not exposed
+loom serve — 4 object type(s), 3 link type(s), 4 action(s) → 14 tool(s) over http
+  get_customer  get_daily_sales_performance  get_order  get_support_ticket
+  list_customer  list_daily_sales_performance  list_order  list_support_ticket
+  match_support_ticket  search_customer  search_daily_sales_performance  search_order
+  search_support_ticket  traverse
+  read-only · mcp.writes is false, so 4 declared action(s) are not exposed
     (`loom run` still reaches them — the runtime is not what is switched off, the surface is)
+  semantic search · SupportTicket.body via local/BAAI/bge-small-en-v1.5
+    ...
   listening on http://127.0.0.1:8000/mcp · cleartext HTTP, no TLS — terminate it in front
   one call at a time · tool calls are serialized, so a slow query blocks the server rather than queueing beside another
 ```
 
-The same ten tools, because **a transport is not an input to the surface** — a spec compiles to
+The same fourteen tools, because **a transport is not an input to the surface** — a spec compiles to
 one tool set and both transports are handed it. What differs is what a *process* is. `host`, `port`
 and `path` live in `loom.yaml` rather than on the command line, for the reason `writes` does: a flag
 lets one invocation contradict the file an operator reviews, and "who can reach this" is exactly the
@@ -156,7 +175,9 @@ means validating a bearer token rather than reading a header — until then, the
 ```jsonc
 // traverse({"objectType": "Customer", "key": "c2", "link": "orders", "limit": 2})
 {
-  "targetObjectType": "Order", "cardinality": "many_to_one",
+  // `one_to_many` and not the `many_to_one` the link declares: `orders` is `placedBy` followed
+  // from its `to` end, and the cardinality reported is the direction's rather than the link's.
+  "targetObjectType": "Order", "cardinality": "one_to_many",
   "count": 2, "limit": 2, "offset": 0, "hasMore": true,
   "objects": [
     { "orderId": "o3", "customerId": "c2", "total": "89.95", "placedAt": "2026-02-14T12:00:00+00:00" },

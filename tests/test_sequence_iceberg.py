@@ -29,6 +29,16 @@ CUSTOMERS = [{"customerId": "c9", "name": "Alan Turing", "tier": "bronze", "ltv"
 ORDERS = [
     {"orderId": "o9", "customerId": "c9", "total": "10.00", "placedAt": "2026-04-01T00:00:00Z"}
 ]
+TICKETS = [
+    {
+        "ticketId": "t9000",
+        "customerId": "c9",
+        "orderId": "o9",
+        "status": "open",
+        "body": "The parcel arrived open at one end.",
+        "openedAt": "2026-04-02T00:00:00Z",
+    }
+]
 
 ENTRIES = (
     IngestEntry(name="customers", object_type="Customer", mode="append", format="ndjson"),
@@ -42,18 +52,20 @@ def ndjson(tmp_path, rows, name):
     return path
 
 
-def manifest(tmp_path, customers=CUSTOMERS, orders=ORDERS):
+def manifest(tmp_path, customers=CUSTOMERS, orders=ORDERS, tickets=None):
+    """A manifest supplies exactly what its sequence runs — naming more is refused as loudly as
+    naming fewer. So `tickets` is opt-in: the injected `nightly` sequence below runs two loads and
+    the *shipped* `seed` sequence runs three."""
     import yaml
 
     path = tmp_path / "manifest.yaml"
-    path.write_text(
-        yaml.safe_dump(
-            {
-                "customers": str(ndjson(tmp_path, customers, "c.ndjson")),
-                "orders": str(ndjson(tmp_path, orders, "o.ndjson")),
-            }
-        )
-    )
+    drops = {
+        "customers": str(ndjson(tmp_path, customers, "c.ndjson")),
+        "orders": str(ndjson(tmp_path, orders, "o.ndjson")),
+    }
+    if tickets is not None:
+        drops["tickets"] = str(ndjson(tmp_path, tickets, "t.ndjson"))
+    path.write_text(yaml.safe_dump(drops))
     return path
 
 
@@ -138,7 +150,7 @@ def test_a_dry_run_previews_every_load_and_writes_nothing(guest, tmp_path, capsy
     from loom.cli import main
 
     before = len(rows(guest, "crm.customers"))
-    assert main(["sequence", "seed", str(manifest(tmp_path)), shipped(guest), "--dry-run"]) == 0
+    assert main(["sequence", "seed", str(manifest(tmp_path, tickets=TICKETS)), shipped(guest), "--dry-run"]) == 0
 
     out = capsys.readouterr()
     assert "customers:" in out.err and "orders:" in out.err
@@ -150,7 +162,7 @@ def test_a_dry_run_previews_every_load_and_writes_nothing(guest, tmp_path, capsy
 def test_the_command_runs_the_sequence_and_names_the_record(guest, tmp_path, capsys):
     from loom.cli import main
 
-    assert main(["sequence", "seed", str(manifest(tmp_path)), shipped(guest), "-y"]) == 0
+    assert main(["sequence", "seed", str(manifest(tmp_path, tickets=TICKETS)), shipped(guest), "-y"]) == 0
     assert f"recorded in {SEQUENCE_LOG_TABLE}" in capsys.readouterr().err
     assert len(rows(guest, SEQUENCE_LOG_TABLE)) == 1
 
@@ -162,7 +174,7 @@ def test_a_sequence_that_would_stop_is_refused_before_anything_is_written(guest,
 
     bad = [{"orderId": "o9", "customerId": "c9", "total": "nope", "placedAt": "2026-04-01T00:00:00Z"}]
     before = len(rows(guest, "crm.customers"))
-    assert main(["sequence", "seed", str(manifest(tmp_path, orders=bad)), shipped(guest), "-y"]) == 1
+    assert main(["sequence", "seed", str(manifest(tmp_path, orders=bad, tickets=TICKETS)), shipped(guest), "-y"]) == 1
 
     assert "nothing was loaded" in capsys.readouterr().err
     assert len(rows(guest, "crm.customers")) == before
@@ -172,5 +184,5 @@ def test_a_sequence_that_would_stop_is_refused_before_anything_is_written(guest,
 def test_an_unknown_sequence_is_reported_by_the_command(guest, tmp_path, capsys):
     from loom.cli import main
 
-    assert main(["sequence", "weekly", str(manifest(tmp_path)), shipped(guest)]) == 1
+    assert main(["sequence", "weekly", str(manifest(tmp_path, tickets=TICKETS)), shipped(guest)]) == 1
     assert "no sequence named 'weekly'" in capsys.readouterr().err
