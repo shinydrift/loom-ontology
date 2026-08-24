@@ -875,3 +875,20 @@ def test_a_vector_stamp_prints_as_utc_whatever_the_hosts_zone_is():
     assert _zulu(when) == "2026-08-23 09:14Z"
     assert _zulu(when.astimezone(ZoneInfo("America/New_York"))) == "2026-08-23 09:14Z"
     assert _zulu(when.astimezone(ZoneInfo("Asia/Tokyo"))) == "2026-08-23 09:14Z"
+
+
+def test_physical_validation_reports_an_unopenable_catalog_rather_than_crashing(tmp_path, capsys):
+    """A catalog that will not open is the ordinary state of a checkout nobody has seeded, so it is
+    the first thing the guide's reader meets — and `cmd_validate` was the one catalog-touching
+    command that did not catch `CatalogError`, so it met a stack trace with the operator's hint
+    printed at the bottom of it."""
+    ontology = _project(tmp_path, config=LOCAL_CONFIG)
+    (tmp_path / ".warehouse").rmdir()
+
+    assert main(["validate", "--physical", str(ontology)]) == 1
+
+    err = capsys.readouterr().err
+    assert err.startswith("error: could not open catalog 'rest_main'")
+    assert "Traceback" not in err
+    # The hint the error already carried, now the thing a reader sees first rather than last.
+    assert "does not exist — create it, or run your seed step first" in err

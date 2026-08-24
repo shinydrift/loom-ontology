@@ -119,11 +119,18 @@ above the prompt rather than keeping it in a docstring.
   separate exchange point rather than a second verb pair on the load log's port: a single load has no
   run to record, and a port it holds should not be able to say that several of them were one.
 
-- **A refused *preview* does not run for real, unlike `loom ingest`'s.** That command runs a refusal
-  so the log records who tried; here the individual loads already do exactly that, each recording its
-  own refusal in `_loom_meta.loads`. What running anyway would add is a sequence row for an order
-  that was never attempted — precisely the intention-shaped record that writing after the fact
-  exists to avoid.
+- **A refused *preview* does not run the order for real, unlike `loom ingest`'s.** What running
+  anyway would add is a sequence row for an order that was never attempted — precisely the
+  intention-shaped record that writing after the fact exists to avoid.
+
+  This bullet used to go on to say that the individual loads recorded their own refusals, and an
+  end-user probe found that they did not: the rehearsal is a dry run, and a dry run records nothing,
+  so the same bad batch left a `refused` row through `loom ingest` and no row anywhere through
+  `loom sequence`. The order is still not run; the one load that stopped it now
+  is, through `SequenceRuntime.record_stop`, which is `cmd_ingest`'s own move. Two things stayed
+  wrong for the same reason and both are worth naming: the claim was made in a code comment as well
+  as here, and neither was reachable by a test that asserted the sequence's behaviour against the
+  sequence's own docstring.
 
 - **The preview gate is the run's own `dry_run`, not its status.** Found by a test rather than by
   argument: a preview that stops halfway reports `partial`, because it is describing what *would*

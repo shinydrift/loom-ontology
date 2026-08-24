@@ -100,14 +100,30 @@ def cmd_infer(args) -> int:
             f"lost: see the comments above each one.",
             file=sys.stderr,
         )
-    print(
-        "note: this draft does not validate yet — fill in the TODOs, then run 'loom validate'.",
-        file=sys.stderr,
-    )
+    if draft.blocking:
+        print(
+            "note: this draft does not validate yet — fill in the TODOs, then run 'loom validate'.",
+            file=sys.stderr,
+        )
+    else:
+        # `--key`, `--catalog` and `--table` are the placeholders answered on the command line, so
+        # there is nothing left to refuse this draft. Saying otherwise would put this command in
+        # contradiction with `loom validate`, which is the one thing a scaffold must not do — the
+        # header's remaining prompts are questions worth answering, not a failure waiting to happen.
+        print(
+            "note: the placeholders are answered — this draft validates as it stands. Read it "
+            "before you commit it: `title`, `searchable` and any enum are still unanswered.",
+            file=sys.stderr,
+        )
     return 0
 
 
 def cmd_validate(args) -> int:
+    # Bound before the `try`, not inside the `--physical` branch, so the `except` clause below has
+    # the name whichever half ran. It costs nothing: `loom.catalog` reaches pyiceberg only through
+    # `factory`, which imports it per catalog type at open time.
+    from .catalog import CatalogError
+
     diag = Diagnostics()
     suffix = ""
     try:
@@ -137,6 +153,14 @@ def cmd_validate(args) -> int:
             ontology, diag = build(args.path)
     except SpecErrors as e:
         print(str(e), file=sys.stderr)
+        return 1
+    except CatalogError as e:
+        # `--physical` is the only half of this command that opens anything, and a catalog that
+        # will not open is the ordinary state of a checkout nobody has seeded yet — it is the first
+        # thing the guide's reader hits. `CatalogError` already carries the operator's hint; every
+        # other catalog-touching command in this module catches it, and this one not doing so
+        # printed that hint at the bottom of a stack trace.
+        print(f"error: {e}", file=sys.stderr)
         return 1
     for w in diag.warnings:
         print(f"warning: {w.render()}", file=sys.stderr)
@@ -660,9 +684,9 @@ def cmd_sequence(args) -> int:
         print(str(e), file=sys.stderr)
         return 1
 
-    from .catalog import SEQUENCE_LOG_TABLE, CatalogError, open_catalogs
+    from .catalog import LOAD_LOG_TABLE, SEQUENCE_LOG_TABLE, CatalogError, open_catalogs
     from .governance import PolicyError
-    from .ingest import IngestError, SequenceError, build_sequences
+    from .ingest import LOG_FAILED, IngestError, SequenceError, build_sequences
     from .mcp.registry import json_safe
     from .migrate.meta import default_actor
 
@@ -681,13 +705,26 @@ def cmd_sequence(args) -> int:
         print(json.dumps(json_safe(preview.as_json()), indent=2, default=str))
         return 0 if preview.ok else 1
 
-    # Unlike `cmd_ingest`, a refused preview does **not** run for real. That command runs a refusal
-    # so the log records who tried; here the individual loads still do exactly that, each recording
-    # its own refusal in `_loom_meta.loads`. What running anyway would add is a sequence row for a
-    # run whose first load is already known to refuse — a record of an order that was never
-    # attempted, which is the intention-shaped record `_record` writes after the fact to avoid.
+    # Unlike `cmd_ingest`, a refused preview does not run the **order** for real: what that would add
+    # is a sequence row for a run whose first load is already known to refuse — a record of an order
+    # nobody attempted, which is the intention-shaped record `_record` writes after the fact to avoid.
+    #
+    # The load that stopped it is a different question, and this used to get it wrong. The claim here
+    # was that the individual loads record their own refusals — but the rehearsal above is a dry run,
+    # and a dry run records nothing, so the refusal was recorded nowhere at all. `record_stop` runs
+    # that one entry for real, which is `cmd_ingest`'s own move and makes the claim true rather than
+    # merely stated: the same refusal now leaves the same row whichever command met it.
     if not preview.ok:
+        recorded = runtime.record_stop(preview, actor=default_actor())
         print("nothing was loaded — the sequence would stop before the end.", file=sys.stderr)
+        if recorded is not None and recorded.load_id and not any(
+            f.code == LOG_FAILED for f in recorded.failures
+        ):
+            print(
+                f"note: the load that stopped it is recorded in {LOAD_LOG_TABLE} as "
+                f"{recorded.load_id}.",
+                file=sys.stderr,
+            )
         return 1
     if not _confirmed(args.yes, "run"):
         print("aborted — nothing was written", file=sys.stderr)

@@ -400,3 +400,103 @@ def test_a_catalog_with_no_sequence_log_port_is_reported_not_crashed(ontology, t
     result = sequencing(ontology, catalog).run("nightly", drop(tmp_path))
     assert result.status == APPLIED
     assert result.recorded is False
+
+
+# ---- what a refused rehearsal owes the log ----------------------------------------
+#
+# Found by driving the CLI as an operator rather than by a unit test, and the reason no unit test
+# could have found it is worth keeping: every assertion here is about the *seam* between
+# `cmd_sequence`'s preview and `SequenceRuntime`, which each half satisfied on its own.
+
+
+def test_the_load_that_stops_a_rehearsal_records_its_own_refusal(ontology, tmp_path):
+    """The claim `cmd_sequence` used to make in a comment, now the thing it does.
+
+    A refused preview does not run the order — but the load that stopped it was read, checked and
+    declined, which is exactly what `loom ingest` writes a `refused` row for. Until `record_stop`,
+    the same bad batch left a row through one command and nothing at all through the other."""
+    catalog = FakeSequenceCatalog()
+    bad = [{"orderId": "o9", "customerId": "c9", "total": "nope", "placedAt": "2026-01-01T00:00:00Z"}]
+    runtime = sequencing(ontology, catalog)
+    preview = runtime.run("nightly", drop(tmp_path, orders=bad), dry_run=True)
+    assert catalog.loads == []  # the rehearsal itself still records nothing
+
+    recorded = runtime.record_stop(preview, actor="operator")
+
+    assert recorded is not None and recorded.status == REFUSED
+    assert [r["entry"] for r in catalog.loads] == ["orders"]
+    assert catalog.loads[0]["status"] == REFUSED
+    assert catalog.loads[0]["actor"] == "operator"
+
+
+def test_recording_the_stop_lands_no_rows_and_no_sequence_row(ontology, tmp_path):
+    """The half of the old design that was right, and is kept: the *order* was never attempted, so
+    nothing says it was. Only the refusal is recorded, and a refusal writes no data."""
+    catalog = FakeSequenceCatalog()
+    bad = [{"orderId": "o9", "customerId": "c9", "total": "nope", "placedAt": "2026-01-01T00:00:00Z"}]
+    runtime = sequencing(ontology, catalog)
+    preview = runtime.run("nightly", drop(tmp_path, orders=bad), dry_run=True)
+
+    runtime.record_stop(preview)
+
+    assert catalog.runs == []
+    assert catalog.writes == []
+
+
+def test_only_the_entry_that_stopped_is_re_run(ontology, tmp_path):
+    """Not the loads before it — they were previewed and wrote nothing, so they have nothing to
+    record — and not the loads after, which were never reached."""
+    catalog = FakeSequenceCatalog()
+    bad = [{"orderId": "o9", "customerId": "c9", "total": "nope", "placedAt": "2026-01-01T00:00:00Z"}]
+    runtime = sequencing(ontology, catalog)
+    preview = runtime.run("nightly", drop(tmp_path, orders=bad), dry_run=True)
+    assert [s.entry for s in preview.steps] == ["customers", "orders"]
+
+    runtime.record_stop(preview)
+
+    assert [r["entry"] for r in catalog.loads] == ["orders"]
+
+
+def test_a_run_that_did_not_stop_has_nothing_to_record(ontology, tmp_path):
+    catalog = FakeSequenceCatalog()
+    runtime = sequencing(ontology, catalog)
+    preview = runtime.run("nightly", drop(tmp_path), dry_run=True)
+
+    assert runtime.record_stop(preview) is None
+    assert catalog.loads == []
+
+
+def test_a_refused_posture_refuses_the_sequence_rather_than_its_first_entry(ontology, tmp_path):
+    """`governance.ingest: refused` is a fact about the deployment, so it is raised before the
+    manifest is read, beside `read_manifest`'s own refusals.
+
+    `_Load` reports the same posture per load, because a single `--dry-run` still has an answer to
+    give about its one batch. A sequence has none: reporting it per entry printed `stops at
+    'customers'` over a run in which no entry could have worked and the manifest was never at
+    fault."""
+    from loom.governance import INGEST_REFUSED
+
+    catalog = FakeSequenceCatalog()
+    runtime = sequencing(ontology, catalog)
+    runtime.ingest.posture = INGEST_REFUSED
+
+    with pytest.raises(SequenceError) as e:
+        runtime.run("nightly", drop(tmp_path))
+
+    assert "'governance.ingest' is 'refused'" in str(e.value)
+    assert "nightly" in str(e.value)
+    # Named as the deployment's refusal, never as an entry's.
+    assert "customers" not in str(e.value)
+    assert catalog.loads == [] and catalog.runs == []
+
+
+def test_a_refused_posture_is_refused_on_a_preview_too(ontology, tmp_path):
+    """There is nothing a preview could add: `_Load` returns before it opens the file either way,
+    so the batch is never checked and the only answer available is the one already given."""
+    from loom.governance import INGEST_REFUSED
+
+    runtime = sequencing(ontology, FakeSequenceCatalog())
+    runtime.ingest.posture = INGEST_REFUSED
+
+    with pytest.raises(SequenceError):
+        runtime.run("nightly", drop(tmp_path), dry_run=True)

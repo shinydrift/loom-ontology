@@ -309,3 +309,60 @@ def test_the_command_writes_nothing(tmp_path):
     before = sorted(p.name for p in tmp_path.iterdir())
     assert main(["infer", str(source), "--as", "Customer", "--key", "id"]) == 0
     assert sorted(p.name for p in tmp_path.iterdir()) == before
+
+
+# ---- and the note that has to agree with them ------------------------------------
+#
+# The pair above asserts what `loom validate` does with a draft. These assert that the command
+# *says* the same thing — which it did not: the note was unconditional, so the invocation the guide's
+# own example uses printed "does not validate yet" over a draft that validates. Found by running the
+# guide, not by running the suite, because each half was tested only against itself.
+
+
+def test_a_draft_given_every_answer_has_nothing_left_that_blocks(tmp_path):
+    filled = infer_draft(
+        customers(tmp_path), "Customer", key="id", catalog="local", table="crm.customers"
+    )
+    assert filled.blocking == ()
+    assert infer_draft(customers(tmp_path), "Customer").blocking == (TODO_PRIMARY_KEY, TODO_CATALOG)
+
+
+def test_the_header_does_not_claim_a_refusal_that_will_not_happen(tmp_path):
+    """Asserted against `build` in the same test, so the line and the loader cannot drift apart."""
+    draft = infer_draft(
+        customers(tmp_path), "Customer", key="id", catalog="local", table="crm.customers"
+    )
+    rendered = render_draft(draft)
+    assert "does not validate yet" not in rendered
+    assert "validates as it stands" in rendered
+
+    root = project(tmp_path, rendered)
+    build(root / "ontology")  # and it does
+
+
+def test_the_header_still_says_so_when_a_placeholder_is_left(tmp_path):
+    rendered = render_draft(infer_draft(customers(tmp_path), "Customer"))
+    assert "does not validate yet" in rendered
+    assert "validates as it stands" not in rendered
+
+
+def test_a_partly_answered_draft_still_blocks(tmp_path):
+    """`--catalog` without `--table` leaves `backing` half-written, which validate refuses by name.
+    The prompts are per-question and the block is per-placeholder, so answering one of two is not
+    answering the question."""
+    draft = infer_draft(customers(tmp_path), "Customer", key="id", catalog="local")
+    assert draft.blocking == (TODO_TABLE,)
+    assert "does not validate yet" in render_draft(draft)
+
+
+def test_the_command_says_the_draft_validates_when_it_does(tmp_path, capsys):
+    from loom.cli import main
+
+    args = ["infer", str(customers(tmp_path)), "--as", "Customer", "--key", "id",
+            "--catalog", "local", "--table", "crm.customers"]
+    assert main(args) == 0
+    err = capsys.readouterr().err
+    assert "does not validate yet" not in err
+    assert "validates as it stands" in err
+    # The questions a file cannot answer are still put, because they are still worth answering.
+    assert "searchable" in err
