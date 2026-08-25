@@ -18,6 +18,7 @@ a spec from a file and prints it, touching no catalog and writing nothing.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 import tempfile
@@ -485,7 +486,12 @@ def _render_run(result, title: str) -> str:
         return json.dumps(json_safe(value), default=str)
 
     lines = [f"Loom run — {result.action} on {title}", ""]
-    lines.append(f"  {result.operation} {result.object_type} {show(result.key)}")
+    # A run that was refused before it could bind a key has no key, and `null` is not the name of
+    # one. It read `modify Customer null`, which is a sentence about a row rather than about the
+    # binding that never happened — and the failure underneath already says which parameter was
+    # missing. Say what is true instead: the target is undetermined.
+    target = show(result.key) if result.key is not None else "(no key bound)"
+    lines.append(f"  {result.operation} {result.object_type} {target}")
     before, after = result.before or {}, result.after or {}
     if result.operation == "delete":
         for name in sorted(before):
@@ -1375,6 +1381,16 @@ def _confirmed(assume_yes: bool, action: str = "apply") -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     from .migrate.meta import loom_version
+
+    # One narrative, two streams, and the order has to survive `2>&1`. Every command here writes
+    # its report to stdout and its errors and notes to stderr; stdout is block-buffered the moment
+    # it is redirected, so a refusal written *after* a report would land *above* it in any captured
+    # log — which is how a refused `loom rollback` came to be read as "restored, then refused".
+    # Line buffering costs nothing at this scale and makes the two streams interleave as written.
+    # Suppressed rather than guarded: a captured stdout under pytest is not always reconfigurable,
+    # and ordering is not what those tests are checking.
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(line_buffering=True)
 
     parser = argparse.ArgumentParser(prog="loom", description="Loom ontology framework")
     # The one thing every other surface could already answer and the CLI could not. `loom_version`

@@ -39,7 +39,14 @@ Five things shape it, and the first is what the rest are for:
   read assert a snapshot — an append puts no row over another, which is what lets two pipelines load
   one table without refusing each other.
 - **It never migrates.** A batch that does not fit is refused naming the column, and the fix is
-  `loom plan` / `loom apply`. The port a load holds has no DDL verb at all.
+  `loom plan` / `loom apply`. The port a load holds has no DDL verb at all. A column the *spec has
+  no name for* — `array<T>`, `struct`, `map` — has no such fix, and that is the one place the
+  on-ramp does not close on itself: [`loom infer`](./drafting-a-spec.md) drafts a type and an
+  `ingest:` entry from a file, and if that file holds one of those, the drafted entry cannot load
+  the file it was drafted from. Loom will not narrow the batch for you — a column no property
+  claims is refused rather than dropped, precisely so a load can never quietly discard somebody's
+  data — so the route is to load a file without the column and let whatever writes it keep filling
+  it. The refusal says so.
 - **A refusal is whole, and re-running is a refusal too.** One bad value refuses the batch, because a
   partial load leaves the lake in a state nobody declared; `--reject-to` quarantines the rows that
   failed their own checks and loads the rest. And a load's id is derived from the entry, the mode and

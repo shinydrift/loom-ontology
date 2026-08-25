@@ -134,12 +134,22 @@ def _render_left_behind(
 
 def _render_files(changes: FileChanges) -> list[str]:
     """Named before the prompt, deletions included: nobody should be asked to approve a write to a
-    file they have open without being shown which files."""
+    file they have open without being shown which files.
+
+    **Written as intent, because that is what it is.** This block is part of the plan — it is
+    printed before the DDL runs and before the files are touched, and a rollback that is refused or
+    that fails writes none of them. It used to read `~ book.yaml — restored`, past tense, so a
+    refused rollback ended by announcing a restore that had not happened and would not; the line
+    correcting it goes to stderr, which under any merged capture lands *above* the report rather
+    than after it. `loom plan` had already settled the rule this follows — say what would happen,
+    then say what did."""
     if not changes.any:
         return ["", "Spec files: already exactly what that version recorded."]
-    lines = ["", "Spec files:"]
-    lines += [f"  ~ {name} — restored" for name in changes.written]
-    lines += [f"  - {name} — deleted; it did not exist at that version" for name in changes.deleted]
+    lines = ["", "Spec files, if this runs:"]
+    lines += [f"  ~ {name} — to restore" for name in changes.written]
+    lines += [
+        f"  - {name} — to delete; it did not exist at that version" for name in changes.deleted
+    ]
     return lines
 
 
