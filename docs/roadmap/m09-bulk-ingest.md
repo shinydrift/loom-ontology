@@ -144,6 +144,20 @@ of the table or N scans of it, and one is cheaper. Correctness does not depend o
 applied in the runtime regardless), and the channel that would fix it is exactly the one the
 range-pushdown backlog entry describes.
 
+**Probed as a client (2026-08-25): a quarantine described itself as a refusal.** A three-row drop
+with two bad rows, loaded with `--reject-to`, applies — one row written, two set aside, exit 0,
+`status: applied`. It said otherwise at every step. The preview above the `y/N` marked the
+set-aside rows with `!`, the refusal mark, and then printed `nothing was written.` — telling the
+operator the opposite of what pressing `y` was about to do. The summary afterwards printed one
+`error:` line per quarantined row, which is the same text a genuinely refused load prints, so
+nothing reading the output could tell the two apart.
+
+`QUARANTINABLE` moved out of the runtime and into `ingest.result` so the CLI and the runtime decide
+"is this a row `--reject-to` absorbed" with one set rather than two spellings. A quarantined row now
+renders `·` and reports as `rejected:`; `nothing was written.` is printed only when something
+actually refused. A row failure with no `--reject-to` is unchanged — the same code, the same
+message, still a refusal.
+
 ---
 
 [← M8](./m08-in-filter.md) · [M10 →](./m10-semantic-search.md) · [backlog](./backlog.md)

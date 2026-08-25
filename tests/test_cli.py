@@ -674,6 +674,47 @@ def test_ingest_reject_to_survives_the_preview_and_loads_the_good_rows(tmp_path,
     assert "were rejected and written to" in out.err
 
 
+def test_a_quarantined_row_is_not_reported_as_an_error_the_run_had(tmp_path, capsys):
+    """A `--reject-to` load that applies described itself, at every step, as a load that refused.
+
+    The preview above the y/N printed the set-aside rows under `!` and then `nothing was written.`
+    — for a run that was about to write — and the summary printed one `error:` line per row after
+    exiting 0 with `status: applied`. Nothing downstream could tell that apart from a refusal, and
+    the preview was telling the operator the opposite of what pressing `y` would do."""
+    ontology = _seeded(tmp_path, INGEST_CONFIG)
+    batch = tmp_path / "batch.ndjson"
+    batch.write_text(
+        BATCH + '{"customerId": "c10", "name": "K J", "tier": "platinum", "ltv": 1.0}\n'
+    )
+    rejects = tmp_path / "rejects.ndjson"
+
+    assert main(["ingest", "customers", str(batch), str(ontology),
+                 "--reject-to", str(rejects), "--yes"]) == 0
+    err = capsys.readouterr().err
+
+    assert "nothing was written." not in err
+    assert "error: type_error" not in err
+    assert "rejected: type_error" in err
+    assert "· type_error" in err
+
+
+def test_a_row_failure_with_no_reject_to_is_still_a_refusal(tmp_path, capsys):
+    """The other half of the same test, because the code is identical and only the outcome differs:
+    without `--reject-to` the same bad row refuses the batch, and it must keep saying so."""
+    ontology = _seeded(tmp_path, INGEST_CONFIG)
+    batch = tmp_path / "batch.ndjson"
+    batch.write_text(
+        BATCH + '{"customerId": "c10", "name": "K J", "tier": "platinum", "ltv": 1.0}\n'
+    )
+
+    assert main(["ingest", "customers", str(batch), str(ontology), "--yes"]) == 1
+    err = capsys.readouterr().err
+
+    assert "nothing was written." in err
+    assert "error: type_error" in err
+    assert "rejected: type_error" not in err
+
+
 def test_ingest_records_a_refusal_the_operator_actually_hit(tmp_path, capsys):
     """The command previews first and a preview records nothing, so a refused preview used to leave
     no trace at all — *who tried to replace this table* answerable only for loads that worked. When

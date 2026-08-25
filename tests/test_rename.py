@@ -193,7 +193,10 @@ def test_a_rename_is_emitted_before_the_other_edits_to_its_column(tmp_path):
     """One table, one `alter_table`, so the edits are one ordered list. Everything after the rename
     names the column by its new name, which only exists once the rename has happened — and the
     pyiceberg adapter needs to *see* the rename first to translate those later edits back."""
-    live = {"id": BEFORE["id"], "old_score": Column("old_score", "int", required=True, field_id=2)}
+    # `float` and not `int`: `score` is declared `double`, and Iceberg promotes `float -> double`
+    # but not `int -> double`, so an int here would plan as breaking rather than as the promotion
+    # this ordering test needs to sit behind the rename.
+    live = {"id": BEFORE["id"], "old_score": Column("old_score", "float", required=True, field_id=2)}
     plan, _ = _plan(_widget(tmp_path), live)
 
     assert _columns(plan) == [
@@ -204,7 +207,7 @@ def test_a_rename_is_emitted_before_the_other_edits_to_its_column(tmp_path):
     # The comparisons behind promote/loosen ran against the *old* column, because that is the one
     # that exists — a rename carries its type and nullability across with its field id.
     promote = plan.changes[0].columns[1]
-    assert promote.detail == "int -> double"
+    assert promote.detail == "float -> double"
     assert "field id 2" in promote.reason
 
 

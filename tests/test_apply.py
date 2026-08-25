@@ -195,7 +195,10 @@ def test_every_edit_to_a_table_is_applied_in_a_single_call(ontology, snapshot):
     Iceberg transaction, so two calls would be two commits and a window where half of a column's
     migration had landed. `lifetime_value` here needs both halves: a widening and a loosening."""
     live = dict(CUSTOMERS)
-    live["lifetime_value"] = Column("lifetime_value", "int", required=True, field_id=4)
+    # `float`, because Iceberg's promotion set is `int -> long` and `float -> double` — an `int`
+    # column under this `double` property reads fine and cannot be *altered* into one, which is a
+    # breaking plan rather than the two-edit alter this test is about.
+    live["lifetime_value"] = Column("lifetime_value", "float", required=True, field_id=4)
     catalog = FakeWritableCatalog(tables={"crm.customers": live, "sales.orders": ORDERS})
 
     result = apply_plan(_plan(ontology, catalog), {catalog.name: catalog}, snapshot)
@@ -224,7 +227,7 @@ def test_a_missing_optional_column_is_added(ontology, snapshot):
 
 def test_a_promotion_is_applied_as_a_type_update(ontology, snapshot):
     narrowed = dict(CUSTOMERS)
-    narrowed["lifetime_value"] = Column("lifetime_value", "int", required=False, field_id=4)
+    narrowed["lifetime_value"] = Column("lifetime_value", "float", required=False, field_id=4)
     catalog = FakeWritableCatalog(tables={"crm.customers": narrowed, "sales.orders": ORDERS})
 
     apply_plan(_plan(ontology, catalog), {catalog.name: catalog}, snapshot)

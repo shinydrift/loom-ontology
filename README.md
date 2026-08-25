@@ -148,9 +148,15 @@ Each of those sentences was a decision with an argument behind it, and the argum
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 1091 tests
+pytest                              # 1177 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 3 action(s)
 ```
+
+`embed` is not in that list, and this page gets as far as the ranked plane. Add it —
+`.[dev,iceberg,duckdb,mcp,embed]` — or leave it out and everything below still runs except
+`loom embed` and `match_support_ticket`, both of which name the missing extra rather than failing
+on an import. (`.[dev,all]` is the same list plus `auth`, which attested identity needs and this
+page does not.)
 
 Then run the whole stack against a real Iceberg warehouse — `examples/retail` ships the worked
 example plus a seed script that builds one locally, with no services to start:
@@ -160,7 +166,7 @@ python examples/retail/seed.py                        # build the warehouse
 loom query Customer examples/retail/ontology --key c1 # → one row, through DuckDB
 loom run upgradeTier examples/retail/ontology \
   --param customer=c3 --param newTier=gold            # → one row rewritten, one row recorded
-loom serve examples/retail/ontology                   # → 10 MCP tools over stdio
+loom serve examples/retail/ontology                   # → 14 MCP tools over stdio
 ```
 
 The validator accumulates every problem and reports them in one pass with source locations:

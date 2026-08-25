@@ -18,6 +18,7 @@ import yaml
 from ._shape import check_keys as _check_keys
 from ._shape import require as _require
 from ._shape import suggest as _suggest
+from .config import CONFIG_FILENAME
 from .errors import Diagnostics, SourceLoc
 from .expr import ExprError
 from .expr import parse as parse_expr
@@ -58,10 +59,21 @@ class _Loaded:
 
 
 def load_dir(root: str | Path, diag: Diagnostics) -> _Loaded:
+    """Every `*.yaml` under `root` is a spec file — except the project config, if it sits here.
+
+    `config.find_config` looks for `loom.yaml` *inside* the ontology directory before it looks
+    beside it, so that placement is supported and an operator who takes it gets no warning from
+    the config layer. Loading it as a spec is what turned it into `a spec file must declare
+    exactly one of ('objectType', 'linkType', 'action')` on every command — a fatal error naming
+    neither file's real job. Only the one at `root` is skipped: a nested `loom.yaml` is not a
+    location `find_config` would ever read, so silently ignoring it would be the worse answer."""
     root = Path(root)
+    config = (root / CONFIG_FILENAME).resolve()
     files = sorted(p for p in root.rglob("*.yaml")) + sorted(p for p in root.rglob("*.yml"))
     out = _Loaded()
     for f in files:
+        if f.resolve() == config:
+            continue
         _load_file(f, diag, out)
     return out
 

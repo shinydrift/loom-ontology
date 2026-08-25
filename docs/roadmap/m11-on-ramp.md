@@ -249,6 +249,15 @@ hand, which is a strange thing for a milestone's headline feature to be.
 - **Nothing infers a *link*.** `loom infer` drafts one object type from one file; two files with a
   shared key are a `linkType` nobody drafts, and the shape of that guess is unexplored.
 
+**Probed as a client (2026-08-25): the by-name refusal was unreachable.** `loom infer` refuses CSV
+and JSON by name, with the reason — a CSV declares no types, JSON has no decimal and no date — and
+that refusal fired only when the operator typed `--format csv`, which is the one thing nobody does
+when the extension already says so. `--format` defaults to parquet and is deliberately never
+*derived* from the filename, so `loom infer drop.csv --as X` opened a CSV as parquet and handed
+back pyarrow's `Parquet magic bytes not found in footer`. The extension still picks no reader; it
+now picks which refusal the operator gets to read, and `.json` folds into `ndjson`'s because the
+reason is about JSON's type system rather than about a spelling.
+
 ---
 
 [← M10](./m10-semantic-search.md) · [backlog](./backlog.md)

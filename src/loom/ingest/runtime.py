@@ -86,6 +86,7 @@ from .result import (
     MISSING_COLUMN,
     NULL_KEY,
     PREVIEWED,
+    QUARANTINABLE,
     REFUSED,
     SOURCE_ERROR,
     TABLE_MISSING,
@@ -350,7 +351,7 @@ class _Load:
 
         The gate on the two refusal branches after step 4: row-level failures are the operator's to
         absorb by quarantining, and anything else refuses the load whatever they asked for."""
-        return all(f.code in (TYPE_ERROR, NULL_KEY) for f in self.failures)
+        return all(f.code in QUARANTINABLE for f in self.failures)
 
     # ---- 3. the batch ----------------------------------------------------------
 

@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 from ..errors import Diagnostics
 from ..model import Ontology
-from ..types import promotable
+from ..types import iceberg_alterable
 from .schema import DesiredColumn, DesiredTable, TableKey, apply_renames, desired_tables
 
 if TYPE_CHECKING:  # type-only, as in the validator: planning a spec needs no catalog imported
@@ -324,9 +324,16 @@ def _unmergeable(col: DesiredColumn, old: Column, table: str) -> ColumnChange:
 
 
 def _retyped(col: DesiredColumn, current: str, field_id: int | None) -> ColumnChange:
-    """Iceberg's own promotion rules decide this one, so `types.promotable` is the single
-    authority — the same function physical validation uses to accept a column it didn't create."""
-    if promotable(current, col.iceberg_type):
+    """Iceberg's own promotion rules decide this one, so `types.iceberg_alterable` is the single
+    authority.
+
+    Not `promotable`, which is the question physical validation asks — *is the live column readable
+    as the declared type* — and which is true of strictly more pairs. An `int` column under a
+    `double` property reads fine and cannot be altered into one: `loom validate --physical` is
+    right to accept it and this is right to refuse to call the change free. Before the two were
+    separated, a plan said `int -> double  physical-safe` and `loom apply` met pyiceberg's `Cannot
+    change column type` half way through the run."""
+    if iceberg_alterable(current, col.iceberg_type):
         held = f"field id {field_id}" if field_id is not None else "the column's field id"
         return ColumnChange(
             kind="promote",
