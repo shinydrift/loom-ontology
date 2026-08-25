@@ -335,7 +335,10 @@ class _Load:
         and would create `_loom_meta.loads` in a catalog whose operator was only asking a question.
         What keeps the audit claim true is the command rather than this method: when the operator did
         not pass `--dry-run`, `cmd_ingest` runs the load for real after a refused preview, so the
-        refusal that gets recorded belongs to a run somebody actually attempted."""
+        refusal that gets recorded belongs to a run somebody actually attempted. `cmd_sequence` owes
+        the same debt and pays it the same way, through `SequenceRuntime.record_stop` — it declines to
+        run the *order* after a refused rehearsal, but still runs the one load that stopped it, or the
+        refusal would be recorded nowhere."""
         if self.dry_run:
             return self._result(REFUSED, load_id=identity, batch=batch, snapshot=snapshot)
         return self._record(

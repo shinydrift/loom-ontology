@@ -994,3 +994,24 @@ def test_a_load_refused_after_quarantine_reports_no_rejected_rows(ontology, tmp_
     assert result.rows_rejected == 0
     assert not rejects.exists()  # refused before the file was written
     assert catalog.writes == []
+
+
+def test_a_refusal_message_carries_no_python_internals(ontology, tmp_path):
+    """`decimal.InvalidOperation` stringifies to its own signal list — `[<class
+    'decimal.ConversionSyntax'>]` — and that repr was reaching the operator, the `failures` column of
+    `_loom_meta.loads`, and the JSON a caller reads. `_as_decimal` guarded against an *empty* message
+    and the signal list is truthy, so the guard never fired.
+
+    Asserted as an absence of `<class` rather than as an exact string, because the point is the
+    class of leak and not this one type's wording."""
+    catalog = FakeBulkCatalog()
+    orders = IngestEntry(name="orders", object_type="Order", mode="append", format="ndjson")
+    rows = [{"orderId": "o9", "customerId": "c9", "total": "12,50",
+             "placedAt": "2026-01-01T00:00:00Z"}]
+    result = runtime(ontology, catalog, entries=[orders]).load("orders", ndjson(tmp_path, rows))
+
+    assert result.status == REFUSED
+    message = result.failures[0].message
+    assert "<class" not in message and "ConversionSyntax" not in message
+    assert "cannot read '12,50' as decimal (not a number)" in message
+    assert "<class" not in json.dumps(result.as_json())

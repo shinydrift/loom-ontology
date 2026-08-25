@@ -110,6 +110,27 @@ class Draft:
     def entry_name(self) -> str:
         return self.entry or _kebab(self.api_name)
 
+    @property
+    def blocking(self) -> tuple[str, ...]:
+        """The placeholders that make `loom validate` fail, in the order they are rendered.
+
+        There are exactly two, and they are exactly the two a file cannot answer: which column
+        addresses a row, and which table this type reads. `--key`, `--catalog` and `--table` answer
+        them on the command line, which is a person answering them — so a draft that was given all
+        three has nothing left that blocks, and saying otherwise would be this command's own note
+        contradicting `loom validate`.
+
+        The other prompts in the header (`title`, `searchable`, enum values) are *questions*, not
+        placeholders: a draft is poorer for leaving them, and validates either way. Keeping them
+        separate is what lets the note be true — a note that cried TODO over a draft that validates
+        is a note nobody reads by the third time."""
+        todos = []
+        if self.primary_key is None:
+            todos.append(TODO_PRIMARY_KEY)
+        if self.catalog == TODO_CATALOG or self.table == TODO_TABLE:
+            todos.append(TODO_CATALOG if self.catalog == TODO_CATALOG else TODO_TABLE)
+        return tuple(todos)
+
 
 # ---- reading the file ------------------------------------------------------------
 
@@ -310,8 +331,24 @@ def _header(draft: Draft) -> list[str]:
         "# Still to decide, none of which a file can answer:",
         *[f"#   - {t}" for t in todos],
         "#",
-        "# It does not validate yet, on purpose. Fill the TODOs in, then `loom validate`.",
+        _closing(draft),
     ]
+
+
+def _closing(draft: Draft) -> str:
+    """The last line of the header, which has to agree with `loom validate`.
+
+    It used to say *it does not validate yet* unconditionally, which was false for the invocation
+    the guide's own example uses — `--key`, `--catalog` and `--table` leave no placeholder behind,
+    and the draft validates. The prompts above stay either way, because they are still worth
+    answering; what changes is whether this line claims a refusal that is not going to happen."""
+    if draft.blocking:
+        return "# It does not validate yet, on purpose. Fill the TODOs in, then `loom validate`."
+    return (
+        "# The placeholders are answered, so this validates as it stands — run `loom validate`. "
+        "Everything\n# above is still worth a pass by hand: a draft that validates is not yet a "
+        "spec somebody meant."
+    )
 
 
 def _object_type(draft: Draft) -> list[str]:

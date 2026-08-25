@@ -275,7 +275,12 @@ def _as_decimal(prop_type: PropType, value: object) -> Decimal:
     try:
         out = Decimal(str(value))
     except InvalidOperation as e:
-        raise ValueError(str(e) or "not a decimal") from e
+        # Never `str(e)`: `InvalidOperation` stringifies to its own signal list —
+        # `[<class 'decimal.ConversionSyntax'>]` — which is a Python internal wearing the costume of
+        # an explanation. It is truthy, so an `or` fallback never fires; the wording has to be ours.
+        # Worded as what the value is rather than as what it is not, because the caller wraps this in
+        # "cannot read X as decimal (…)" and "(not a decimal)" would only say that again.
+        raise ValueError("not a number") from e
     if not out.is_finite():
         raise ValueError("not a finite decimal")
     precision, scale = prop_type.precision or 0, prop_type.scale or 0

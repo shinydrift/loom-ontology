@@ -37,6 +37,7 @@ import yaml
 
 from ..catalog.base import SEQUENCE_LOG_TABLE, CatalogError, Column, sequence_log_writer_for
 from ..config import IngestSequence, LoomConfig
+from ..governance import INGEST_ALLOWED
 from ..migrate.meta import loom_version
 from .log import UNKNOWN_ACTOR
 from .result import APPLIED, PREVIEWED, REFUSED, IngestResult
@@ -241,6 +242,18 @@ class SequenceRuntime:
             known = ", ".join(sorted(self.sequences)) or "none are declared"
             raise SequenceError(f"no sequence named '{name}' in loom.yaml — declared: {known}")
 
+        if self.ingest.posture != INGEST_ALLOWED:
+            # Raised up front, unlike `_Load`, which reports the same posture per load so a
+            # `--dry-run` of one entry still answers. A sequence has no such answer to give: the
+            # posture is a fact about the deployment, so attributing it to the first entry prints
+            # `stops at 'customers'` over a run in which no entry could have worked and the manifest
+            # was never at fault. It joins the refusals `read_manifest` makes before anything opens.
+            raise SequenceError(
+                f"this deployment does not perform bulk loads — 'governance.ingest' is "
+                f"'{self.ingest.posture}', so sequence '{name}' cannot run any of its "
+                f"{len(sequence.loads)} load(s)"
+            )
+
         files = read_manifest(manifest, sequence)
         result = SequenceResult(
             sequence=name,
@@ -266,6 +279,37 @@ class SequenceRuntime:
                 return self._record(result, actor, dry_run)
 
         return self._record(result, actor, dry_run)
+
+    def record_stop(self, preview: SequenceResult, *, actor: str = UNKNOWN_ACTOR) -> IngestResult | None:
+        """Run the one load that stopped a rehearsal for real, so the refusal is recorded.
+
+        **What this exists to repair.** `cmd_sequence` previews before it runs, and a refused preview
+        does not go on to run the order — which is right, because a sequence row for an order nobody
+        attempted is the intention-shaped record `_record` writes after the fact to avoid. But a
+        preview records nothing, so until this method the refusal was recorded *nowhere*: the same
+        bad batch left a `refused` row in `_loom_meta.loads` through `loom ingest` and no row at all
+        through `loom sequence`. Under `governance.edit_log: required` — a posture whose whole claim
+        is that a deployment which cannot record what it writes must not run — *who tried to replace
+        this table* had no answer for anything attempted through a sequence.
+
+        **Only the entry that stopped, and only ever that one.** The loads before it were previewed
+        and wrote nothing, so there is nothing of theirs to record; the loads after it were never
+        reached. Re-running the stopping entry is `cmd_ingest`'s own move — it runs a refused preview
+        for real for exactly this reason — and it is safe for the same reason: the refusal is a
+        property of the batch and the log, so it refuses again and `_refuse` records it.
+
+        Returns the recorded result, or `None` when there is nothing to record: a run that did not
+        stop, or one that stopped above `_refuse`'s gate, where a load never named itself and the row
+        would cite nothing."""
+        stopped = next((s for s in preview.steps if not s.ok), None)
+        if stopped is None:
+            return None
+        try:
+            return self.ingest.load(stopped.entry, stopped.source, actor=actor)
+        except IngestError:
+            # The rehearsal already reported this one; a load that cannot be attempted has no id and
+            # would leave no row anyway, so there is nothing here a second failure could add.
+            return None
 
     def _record(
         self, result: SequenceResult, actor: str, dry_run: bool, note: str | None = None
