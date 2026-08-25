@@ -44,8 +44,22 @@ loom validate --physical examples/retail/ontology
 loom query Customer examples/retail/ontology --key c1
 loom query DailySalesPerformance examples/retail/ontology --filter salesDate.gte=2026-02-01
 loom run upgradeTier examples/retail/ontology --param customer=c3 --param newTier=gold
+
+# the ranked plane. `embed` downloads a ~130MB model the first time and reconciles the
+# sidecar; nothing about the server needs it until then.
+loom embed examples/retail/ontology
+loom query SupportTicket examples/retail/ontology --filter body.contains=refund   # nothing
+loom query SupportTicket examples/retail/ontology --match 'payment dispute'       # three of them
+loom query SupportTicket examples/retail/ontology --match 'never turned up' --via raisedBy.tier=gold
+
 loom serve examples/retail/ontology
 ```
+
+Those two `SupportTicket` calls are the example's shortest argument for M10. Not one of the
+fourteen tickets contains the word *refund*, so the substring filter answers nothing; the ranked
+call finds the customer who wrote *I would rather have the money back*, the one who *raised this
+with my bank*, and the one charged twice. The last call adds the question slices 1-3 could not ask:
+the same ranking, narrowed to the tickets a gold-tier customer sent.
 
 `examples/retail/loom.yaml` is the deployment: stdio, read-only, governance commented out. It is
 heavily annotated — most of the file is prose explaining what each key would do and why it is off.
@@ -53,10 +67,12 @@ heavily annotated — most of the file is prose explaining what each key would d
 ### What's in the spec
 
 - **`Customer`** · `customerId` / `name` / `tier` (enum) / `ltv` (nullable) — searchable by name, tier and ltv
-- **`Order`** · `orderId` / `customerId` / `total` (decimal) / `placedAt`
+- **`Order`** · `orderId` / `customerId` / `total` (decimal) / `placedAt` — searchable by orderId and total
+- **`SupportTicket`** · `ticketId` / `customerId` / `orderId` (nullable) / `status` (enum) / `body` / `openedAt` — `semantic: body`, so this is the type `match_support_ticket` ranks
 - **`DailySalesPerformance`** · a precomputed daily rollup with refresh and source provenance, keyed by date
 - **`placedBy`** · `Order → Customer`, many-to-one, with the reverse hop named `orders`
-- **`upgradeTier`** (modify, with a validation rule) · **`recordOrder`** (create) · **`forgetCustomer`** (delete)
+- **`raisedBy`** · `SupportTicket → Customer` · **`about`** · `SupportTicket → Order` — the two hops `match_`'s `via` crosses, which is why there are two: `via` is keyed by *link name*, and one link cannot show that
+- **`upgradeTier`** (modify, with a validation rule) · **`recordOrder`** (create) · **`forgetCustomer`** (delete) · **`deleteTicket`** (delete, and the one whose target owns a vector — it prunes the sidecar before the row)
 
 ---
 
@@ -73,7 +89,7 @@ No build step, no `npm install`, no CDN. One Python file, one HTML file, hand-ro
 
 The point is not that Loom can draw a chart. It is that **the dashboard has no privileged access.**
 Every number on the page arrives through `get_` / `search_` / `list_` / `traverse` / `run_` — the
-same thirteen tools an agent gets — and the rail down the right-hand side shows you each call as it
+same seventeen tools an agent gets — and the rail down the right-hand side shows you each call as it
 happens, with its arguments and its response.
 
 That constraint is enforced by shape rather than by discipline. The browser-facing data plane is a

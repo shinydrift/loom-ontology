@@ -142,6 +142,11 @@ class MatchResult:
     embedded_as_of: datetime | None = None
 
 
+_REVERSED_CARDINALITY = {"many_to_one": "one_to_many", "one_to_many": "many_to_one"}
+"""The two cardinalities that are not symmetric, and therefore the whole of what a reverse hop
+changes about one. See `LinkDirection.cardinality`."""
+
+
 @dataclass(frozen=True)
 class LinkDirection:
     """A named way out of an object type: a link plus which end you're standing on.
@@ -160,6 +165,21 @@ class LinkDirection:
     @property
     def source_object_type(self) -> str:
         return self.link.frm.object_type if self.forward else self.link.to.object_type
+
+    @property
+    def cardinality(self) -> str:
+        """The cardinality **of this direction**, which is not always the link's own.
+
+        `target_object_type` and `source_object_type` already flip with `forward`, and this is the
+        third fact about a hop that has to: a `many_to_one` link traversed from its `to` end is a
+        `one_to_many` hop, and reporting the declared word there tells a caller *at most one* about
+        a route that returns as many rows as exist. The self-contradiction was visible in the
+        envelope that carried it — `cardinality: many_to_one` beside a `count` of 5 and `hasMore`.
+
+        `one_to_one` and `many_to_many` are symmetric, so they read the same from either end."""
+        if self.forward:
+            return self.link.cardinality
+        return _REVERSED_CARDINALITY.get(self.link.cardinality, self.link.cardinality)
 
 
 @dataclass

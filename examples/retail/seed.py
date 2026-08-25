@@ -214,7 +214,12 @@ def seed(example_dir: Path = EXAMPLE_DIR, fresh: bool = True):
 def main() -> int:
     config, catalog = seed()
     warehouse = config.catalogs["local"].warehouse
-    identifiers = ["crm.customers", "sales.orders", "sales.daily_sales_performance"]
+    identifiers = [
+        "crm.customers",
+        "sales.orders",
+        "support.tickets",
+        "sales.daily_sales_performance",
+    ]
     print(f"seeded {len(identifiers)} table(s) into {warehouse}")
     for identifier in identifiers:
         n = catalog.load_table(identifier).scan().to_arrow().num_rows
@@ -222,12 +227,21 @@ def main() -> int:
     print("\n  crm.customers also holds region and segments, which no property maps: added after")
     print("  the load by something that is not Loom, and left alone by everything Loom does from")
     print("  here (spec-v0 §2 rule 7).")
+    print("\n  support.tickets holds the text this example searches by *meaning*. Nothing is")
+    print("  embedded yet — a spec may declare `semantic:` and be served before a reconcile has")
+    print("  ever run, so `match_` refuses with the command below rather than answering empty.")
     print("\nnext:")
     print("  loom validate --physical examples/retail/ontology")
     print("  loom query Customer examples/retail/ontology --key c1")
     print("  loom query DailySalesPerformance examples/retail/ontology --key 2026-02-11")
     print("  loom run upgradeTier examples/retail/ontology --param customer=c3 --param newTier=gold")
-    print("  loom serve examples/retail/ontology")
+    print("\n  # the ranked plane: reconcile once (downloads a ~130MB model), then ask it something")
+    print("  # nobody in the data actually wrote")
+    print("  loom embed examples/retail/ontology")
+    print("  loom query SupportTicket examples/retail/ontology --match 'payment dispute'")
+    print("  loom query SupportTicket examples/retail/ontology --match 'never turned up' \\")
+    print("      --via raisedBy.tier=gold")
+    print("\n  loom serve examples/retail/ontology")
     return 0
 
 

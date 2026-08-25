@@ -404,6 +404,48 @@ The cross-object half, and the one sentence above it had to correct.
   wrong — which is the outcome a probe is allowed to have, and it still moved coverage from a string
   comparison to an executed join.
 
+## Probed as a client, after the milestone closed
+
+M10 shipped without the thing that shows it works: `examples/retail` declared no `semantic:`
+property, and neither `Customer` nor `Order` had a free-text column worth embedding. So the example
+gained `SupportTicket` — fourteen tickets worded the way people word them, `semantic: body`, and two
+links (`raisedBy`, `about`) because `via` is keyed by *link name* and one link cannot demonstrate
+that. `search_support_ticket` filtering `body.contains=refund` returns nothing, because not one
+customer wrote that word; `match_support_ticket("payment dispute")` returns the one charged twice,
+the one who went to their bank, and the one who wants the money rather than a credit note. That pair
+of calls is the milestone's claim, runnable.
+
+Then the whole plane was driven as a real MCP client — stdio and http, ~60 calls, plus five
+governance variants and the sidecar's full lifecycle. **The ranked plane itself came back clean.**
+Filters and hops narrow before the ranking; `limit`/`offset` page without overlap and refuse over the
+cap; the mask-over-`semantic:` refusal fires at startup; a row policy on the near type removes rows
+from the ranking and from `get_` alike; a policy on the far end of a `via` is applied inside that
+hop's subquery, which is slice 4's late correction holding up; erasure prunes the vector with the
+row and leaves the reconcile nothing to do; blank text is counted apart and never becomes pending; a
+model swap refuses exactly, ranks nothing until `--remodel`, and comes back whole afterwards.
+
+Two things it found, and neither is in this milestone — which is what a probe is for:
+
+- **`traverse` reported the link's declared cardinality rather than the direction's.** Following
+  `orders` off a `Customer` — the reverse of a `many_to_one` — answered `cardinality: many_to_one`
+  beside a `count` of 5 and `hasMore: true`, so the envelope contradicted itself in one object, and
+  an agent reading *at most one* off a route that returns as many rows as exist stops paging. The
+  route catalogue in the tool description said the same thing. `LinkDirection` already flipped
+  `target_object_type` and `source_object_type` with `forward`; `cardinality` is the third fact that
+  has to, and it was the one nothing flipped. The quickstart had the wrong word printed in it too.
+
+- **No `decimal` property could be named in a governance row predicate.** Trying to govern the far
+  end of a `via` — *tickets about an order under £1000* — was refused at load: `a row predicate
+  compares 'decimal' with 'long'`. No literal in the expression language *has* the type `decimal`
+  (an integer is a `long`, a fractional one a `double`, a quoted one a `string`), so the refusal was
+  total rather than about the literal chosen, and it cited "the same rule a validation rule's
+  operands follow" — a rule the validator does not apply to comparisons at all, and one
+  `evaluate.py` deliberately contradicts on the plane that actually runs ("numbers compare across
+  their Python types"). Three answers to one question. `comparable_to` keeps its narrower meaning,
+  which is about a value *standing in for* a type — a link's join columns, an effect's key, an
+  effect's value — and comparisons now ask `comparable_in_a_comparison`, which adds exactly one
+  rule: every numeric kind compares with every other.
+
 ## Refused, permanently
 
 - **Blending vectors across a link** — ranking Customer by the meaning of its Orders' text, via a

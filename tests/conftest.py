@@ -79,6 +79,16 @@ _ORDERS = (
         ("o6", "c4", "640.25", (2026, 3, 17)),
     ],
 )
+# The third table the shipped `seed` sequence loads. Two rows rather than the example's fourteen:
+# this fixture is a lake for the tests whose subject is the *record* a load leaves, so it holds
+# enough for a hop to have two ends and nothing more.
+_TICKETS = (
+    ["id", "customer_id", "order_id", "status", "body", "opened_at"],
+    [
+        ("t1", "c1", "o1", "resolved", "The charge came off my card twice.", (2026, 1, 6)),
+        ("t2", "c3", None, "open", "Take my details off your systems.", (2026, 3, 14)),
+    ],
+)
 
 
 @pytest.fixture
@@ -146,7 +156,37 @@ def guest(tmp_path):
         ),
     )
 
-    for identifier, rows in (("crm.customers", customers), ("sales.orders", orders)):
+    ticket_ids, ticket_customers, ticket_orders, statuses, bodies, opened = map(
+        list, zip(*_TICKETS[1], strict=True)
+    )
+    tickets = pa.table(
+        {
+            "id": ticket_ids,
+            "customer_id": ticket_customers,
+            "order_id": ticket_orders,
+            "status": statuses,
+            "body": bodies,
+            "opened_at": [dt.datetime(*d, 12, 0, tzinfo=dt.UTC) for d in opened],
+        },
+        schema=pa.schema(
+            [
+                pa.field("id", pa.string(), nullable=False),
+                pa.field("customer_id", pa.string(), nullable=False),
+                # The one nullable link property in the example: a ticket about the account rather
+                # than about a purchase.
+                pa.field("order_id", pa.string(), nullable=True),
+                pa.field("status", pa.string(), nullable=False),
+                pa.field("body", pa.string(), nullable=False),
+                pa.field("opened_at", pa.timestamp("us", tz="UTC"), nullable=False),
+            ]
+        ),
+    )
+
+    for identifier, rows in (
+        ("crm.customers", customers),
+        ("sales.orders", orders),
+        ("support.tickets", tickets),
+    ):
         namespace = identifier.split(".")[0]
         if (namespace,) not in catalog.list_namespaces():
             catalog.create_namespace(namespace)

@@ -343,11 +343,12 @@ def _compare(node: Binary, ctx: _Ctx) -> None:
             "value you can test with '==' or '!=', not one you can order"
         )
         return
-    if left is not None and right is not None and not left.comparable_to(right):
+    if left is not None and right is not None and not left.comparable_in_a_comparison(right):
         what = "a policy guard" if ctx.in_a_guard else "a row predicate"
         problems.append(
-            f"{what} compares '{left.kind}' with '{right.kind}', which are not comparable "
-            "types — the same rule a validation rule's operands follow"
+            f"{what} compares '{left.kind}' with '{right.kind}', which have no comparison — every "
+            "numeric kind compares with every other, an enum compares as its string storage, and "
+            "otherwise the two sides must be the same kind"
         )
         return
     _enum_membership(node, left, right, ctx)

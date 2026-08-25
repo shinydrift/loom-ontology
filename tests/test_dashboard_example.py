@@ -70,8 +70,18 @@ def test_the_dashboard_is_a_deployment_of_the_shipped_ontology(app_module):
     module, target = app_module
     ontology, config = module.load_project(target / "dashboard" / "loom.yaml")
 
-    assert sorted(ontology.object_types) == ["Customer", "DailySalesPerformance", "Order"]
-    assert sorted(ontology.actions) == ["forgetCustomer", "recordOrder", "upgradeTier"]
+    assert sorted(ontology.object_types) == [
+        "Customer",
+        "DailySalesPerformance",
+        "Order",
+        "SupportTicket",
+    ]
+    assert sorted(ontology.actions) == [
+        "deleteTicket",
+        "forgetCustomer",
+        "recordOrder",
+        "upgradeTier",
+    ]
     # The same spec `../loom.yaml` serves, loaded through the ordinary discovery path.
     shipped, _ = module.load_project(target / "loom.yaml")
     assert sorted(shipped.object_types) == sorted(ontology.object_types)
@@ -104,15 +114,19 @@ def test_the_dashboard_surface_is_the_spec_plus_writes(app_module):
         "get_customer",
         "get_daily_sales_performance",
         "get_order",
+        "get_support_ticket",
         "list_customer",
         "list_daily_sales_performance",
         "list_order",
+        "list_support_ticket",
+        "run_delete_ticket",
         "run_forget_customer",
         "run_record_order",
         "run_upgrade_tier",
         "search_customer",
         "search_daily_sales_performance",
         "search_order",
+        "search_support_ticket",
         "traverse",
     ]
 

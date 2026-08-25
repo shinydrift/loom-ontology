@@ -10,4 +10,8 @@ objectType:
     - { name: customerId, type: string, column: customer_id }
     - { name: total,      type: decimal, precision: 12, scale: 2, column: total_amount }
     - { name: placedAt,   type: timestamp, column: created_at }
-  searchable: [orderId]
+  # `total` is here for the cross-object half of M10: `match_support_ticket`'s `via` hop builds the
+  # far type's filter schema from the far type's own `searchable` list, so *rank these tickets by
+  # meaning, but only the ones about an order over £1000* is expressible exactly when `Order` says a
+  # total may be filtered on. One list, read from two directions.
+  searchable: [orderId, total]

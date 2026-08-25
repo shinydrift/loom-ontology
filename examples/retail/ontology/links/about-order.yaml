@@ -1,0 +1,11 @@
+linkType:
+  apiName: about
+  description: The order this ticket is about, if it is about one
+  cardinality: many_to_one
+  from: { objectType: SupportTicket, property: orderId }
+  to:   { objectType: Order,         property: orderId }
+  # The second hop out of SupportTicket, and the reason there are two: `via` is keyed by *link name*
+  # rather than by target type, so a type with one link cannot show that the key is the link. It
+  # also gives the tool two hops to AND together — tickets about an expensive order, sent by a
+  # gold-tier customer, ranked by what they say.
+  reverseName: tickets

@@ -191,21 +191,26 @@ def test_the_server_identifies_itself_from_loom_yaml(session):
 
 
 def test_the_advertised_surface_is_the_one_stdio_advertises(session):
-    """A transport is not an input to §7. The same thirteen tools, from the same spec, over a socket."""
+    """A transport is not an input to §7. The same seventeen tools, from the same spec, over a socket."""
     _, listing, _ = session
     assert sorted(t.name for t in listing.tools) == [
         "get_customer",
         "get_daily_sales_performance",
         "get_order",
+        "get_support_ticket",
         "list_customer",
         "list_daily_sales_performance",
         "list_order",
+        "list_support_ticket",
+        "match_support_ticket",
+        "run_delete_ticket",
         "run_forget_customer",
         "run_record_order",
         "run_upgrade_tier",
         "search_customer",
         "search_daily_sales_performance",
         "search_order",
+        "search_support_ticket",
         "traverse",
     ]
 
@@ -504,7 +509,7 @@ def test_every_human_facing_line_goes_to_stderr(served):
     assert served.stdout.read_text() == ""
 
     banner = served.stderr.read_text()
-    assert "13 tool(s) over http" in banner
+    assert "18 tool(s) over http" in banner
     assert f"listening on {served.url}" in banner
     assert f"every run recorded as actor '{ACTOR}'" in banner
     # The scaling claim, said rather than discovered. A server that quietly answers one request at a

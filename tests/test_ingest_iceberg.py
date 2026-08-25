@@ -493,11 +493,11 @@ def test_the_shipped_example_declares_a_load_the_deployment_permits(seeded, tmp_
     against the shipped ontology, and the shipped `governance.ingest` permits it."""
 
     target, ontology, config = seeded
-    assert [e.name for e in config.ingest] == ["customers", "orders", "daily-sales"]
-    # The first two are how the example seeds itself since M11's third slice; `daily-sales` is the
-    # one nothing shipped runs yet, which is what makes loading it here worth asserting.
+    assert [e.name for e in config.ingest] == ["customers", "orders", "tickets", "daily-sales"]
+    # The first three are how the example seeds itself since M11's third slice; `daily-sales` is
+    # the one nothing shipped runs yet, which is what makes loading it here worth asserting.
     assert [s.name for s in config.sequences] == ["seed"]
-    assert config.sequences[0].loads == ("customers", "orders")
+    assert config.sequences[0].loads == ("customers", "orders", "tickets")
     assert config.ingest_posture == INGEST_ALLOWED
 
     spec = importlib.util.spec_from_file_location("perf2", target / "sales_performance.py")

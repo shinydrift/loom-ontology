@@ -37,6 +37,11 @@ _PROMOTIONS = frozenset(
     {("int", "long"), ("int", "double"), ("long", "double"), ("float", "double")}
 )
 
+# Every kind that denotes a number, which is a different set from the widening pairs above:
+# `decimal` is here and appears in no promotion, because nothing may widen *into* it or out of it
+# without changing what the spec asked for. See `PropType.comparable_in_a_comparison`.
+_NUMERIC_KINDS = frozenset({"int", "long", "float", "double", "decimal"})
+
 
 @dataclass(frozen=True)
 class PropType:
@@ -96,12 +101,37 @@ class PropType:
         return None
 
     def comparable_to(self, other: PropType) -> bool:
-        """Whether two types can be compared/joined (link join props, expr comparisons).
-        Same kind, or a numeric widening pair. enum compares as its string storage."""
+        """Whether a value of one type may **stand in for** the other — a link's two join
+        properties, an effect key against a primary key, an effect value against the property it is
+        written to. Same kind, or a numeric widening pair. enum compares as its string storage.
+
+        Deliberately not the rule for *comparisons*: standing in for a type is a claim about storage
+        and a comparison is a question with a yes/no answer. See `comparable_in_a_comparison`."""
         a, b = self._numeric_base(), other._numeric_base()
         if a == b:
             return True
         return (a, b) in _PROMOTIONS or (b, a) in _PROMOTIONS
+
+    def comparable_in_a_comparison(self, other: PropType) -> bool:
+        """Whether `<`, `>`, `==` between these two types has an answer at run time.
+
+        Wider than `comparable_to` by exactly one rule — **any two numeric kinds compare, decimal
+        included** — and the reason it is a second method rather than a widening of the first is
+        that `_PROMOTIONS` is also Iceberg's physical promotion set. A `decimal` may not back a
+        `long` column and may not be joined to one; asking whether it is *less than* one is a
+        different question, and `evaluate.py` has always answered it: numbers compare across their
+        Python types, so a `Decimal('1299.99')` read out of a row compares against the `1000` an
+        author wrote.
+
+        Found by a probe. The offline check refused `object.total < 1000` in a governance policy —
+        for a property whose *type* the read path advertises as a string and whose *filter* grammar
+        accepts an integer as lossless — while the evaluator that would have run it, and the
+        validator that checks the same expression language for an action, both permitted it. Three
+        answers to one question, and the refusal was the odd one out: it made every `decimal`
+        property structurally impossible to write a row policy over."""
+        if self.kind in _NUMERIC_KINDS and other.kind in _NUMERIC_KINDS:
+            return True
+        return self.comparable_to(other)
 
     def _numeric_base(self) -> str:
         return "string" if self.kind == "enum" else self.kind

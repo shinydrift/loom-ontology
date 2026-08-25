@@ -1,0 +1,14 @@
+{"ticketId": "t1", "customerId": "c1", "orderId": "o1", "status": "resolved", "body": "The charge came off my card twice and I would like one of them sent back.", "openedAt": "2026-01-06T09:12:00Z"}
+{"ticketId": "t2", "customerId": "c1", "orderId": "o2", "status": "open", "body": "Box turned up with the corner crushed and everything inside rattling around.", "openedAt": "2026-02-13T15:40:00Z"}
+{"ticketId": "t3", "customerId": "c2", "orderId": "o3", "status": "open", "body": "Still nothing at my door, three weeks after the confirmation email came through.", "openedAt": "2026-03-07T08:05:00Z"}
+{"ticketId": "t4", "customerId": "c2", "orderId": "o4", "status": "waiting", "body": "I have raised this with my bank, because I never authorised the payment in the first place.", "openedAt": "2026-03-11T11:23:00Z"}
+{"ticketId": "t5", "customerId": "c2", "orderId": "o5", "status": "resolved", "body": "Wrong size arrived - I ordered the large and a small turned up instead.", "openedAt": "2026-03-12T17:55:00Z"}
+{"ticketId": "t6", "customerId": "c3", "orderId": null, "status": "waiting", "body": "Please take my details off your systems entirely, I do not want to be on file anywhere.", "openedAt": "2026-03-14T10:02:00Z"}
+{"ticketId": "t7", "customerId": "c4", "orderId": null, "status": "open", "body": "I shut the account down last year and you are still taking money out every month.", "openedAt": "2026-03-15T07:48:00Z"}
+{"ticketId": "t8", "customerId": "c1", "orderId": "o1", "status": "resolved", "body": "The courier left the parcel with a neighbour I have never spoken to in my life.", "openedAt": "2026-01-09T13:31:00Z"}
+{"ticketId": "t9", "customerId": "c2", "orderId": "o3", "status": "resolved", "body": "Do you do this one in a wider fitting, or is it only the standard width?", "openedAt": "2026-02-16T09:20:00Z"}
+{"ticketId": "t10", "customerId": "c1", "orderId": null, "status": "open", "body": "Your checkout will not take my new card - it just spins and then throws me back to the basket.", "openedAt": "2026-03-18T19:14:00Z"}
+{"ticketId": "t11", "customerId": "c3", "orderId": null, "status": "resolved", "body": "The reset link you send me has already expired by the time it lands in my inbox.", "openedAt": "2026-02-28T21:07:00Z"}
+{"ticketId": "t12", "customerId": "c2", "orderId": "o4", "status": "waiting", "body": "I would rather have the money back than a credit note to spend with you again.", "openedAt": "2026-03-19T12:44:00Z"}
+{"ticketId": "t13", "customerId": "c4", "orderId": null, "status": "open", "body": "Nobody has come back to me on either of the last two emails I sent about this.", "openedAt": "2026-03-20T16:26:00Z"}
+{"ticketId": "t14", "customerId": "c1", "orderId": "o2", "status": "open", "body": "The zip gave out after a fortnight of fairly light use, which I did not expect.", "openedAt": "2026-03-21T10:53:00Z"}

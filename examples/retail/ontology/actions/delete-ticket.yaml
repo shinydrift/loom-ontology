@@ -1,0 +1,23 @@
+action:
+  apiName: deleteTicket
+  displayName: Delete ticket
+  description: Erase a support ticket, including the vector derived from its text
+  targetObjectType: SupportTicket
+  operation: delete
+  parameters:
+    - { name: ticket, type: objectRef, objectType: SupportTicket }
+  effects:
+    - deleteObject:
+        key: "{{ ticket }}"
+# The one action in this example whose target type declares `semantic:`, and that is what it is here
+# to show. An embedding is not a fingerprint — it is a lossy, partially invertible copy, and
+# inversion works best on exactly the short text worth embedding. So a row erased from its table
+# would otherwise leave recoverable text in the sidecar: unreachable through `match_`, because the
+# join to a deleted row returns nothing, and readable by anyone with warehouse access.
+#
+# So this run prunes `_loom_meta.vectors__SupportTicket` **before** it deletes the row, and **fails
+# if it cannot** — the one place the best-effort rule does not apply. The two failures are not
+# symmetric: a failed embed leaves a row briefly missing from search, and a failed vector delete
+# leaves personal data outliving the request that erased it. The ordering is what makes the promise
+# keepable, and the inverse failure (prune lands, row delete loses its race) is the harmless
+# direction, since a row with no vector is exactly what the next reconcile exists to notice.

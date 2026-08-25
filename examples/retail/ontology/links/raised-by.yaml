@@ -1,0 +1,10 @@
+linkType:
+  apiName: raisedBy
+  description: The customer who sent this ticket
+  cardinality: many_to_one
+  from: { objectType: SupportTicket, property: customerId }
+  to:   { objectType: Customer,      property: customerId }
+  # What `match_support_ticket`'s `via` hops across: *rank these tickets by meaning, but only the
+  # ones a gold-tier customer sent*. Slices 1-3 could rank the text and could not ask that, which is
+  # why M10 does not close until `via` ships.
+  reverseName: supportTickets
