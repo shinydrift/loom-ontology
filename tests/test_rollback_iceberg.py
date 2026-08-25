@@ -143,7 +143,7 @@ def test_a_spec_file_added_since_is_deleted_and_its_table_left_whole(project, ca
     assert main(["rollback", str(ontology), "--yes"]) == 0
     out = capsys.readouterr().out
 
-    assert "- person.yaml — deleted; it did not exist at that version" in out
+    assert "- person.yaml — to delete; it did not exist at that version" in out
     assert not (ontology / "person.yaml").exists()
     assert _local(config).table_exists("hr.people")
     assert "local.hr.people — the whole table, created after version 1" in out

@@ -34,7 +34,7 @@ from loom.migrate import (
     restore_files,
     snapshot_spec,
 )
-from loom.migrate.meta import META_TABLE, STATUS_PARTIAL
+from loom.migrate.meta import META_TABLE, STATUS_FAILED, STATUS_PARTIAL
 from loom.ontology import build
 from test_apply import FakeWritableCatalog
 
@@ -82,7 +82,7 @@ def _rollback(root: Path, catalogs, version=None, *, execute=True):
     changes = file_changes(root, target.snapshot)
 
     result = apply_plan(plan, catalogs, target.snapshot, rollback_of=target.version) if execute else None
-    if execute and result.status != REFUSED:
+    if execute and not result.touched_nothing:
         restore_files(root, target.snapshot, changes)
     return target, plan, left, changes, result, diag
 
@@ -352,18 +352,71 @@ def test_the_default_target_is_one_step_back(project):
 
 def test_a_partial_apply_is_restorable_and_says_so(project):
     """A row recorded as `partial` is still the text that was attempted, which is the thing being
-    restored — but a reader deserves to know the lake was mid-flight when it was written."""
+    restored — but a reader deserves to know the lake was mid-flight when it was written.
+
+    Two tables, and the *second* is the one that fails: `partial` is the word for a run that left
+    the lake between two specs, so a test of it has to actually leave one there."""
     root, catalog, catalogs = project
+    (root / "gadget.yaml").write_text(GADGET.format(catalog="rest_main"))
     _spec(root, f"{LTV}\n{REGION}")
     catalog.fail_on = "demo.widgets"
     assert _apply(root, catalogs).status != APPLIED
     catalog.fail_on = None
+    assert catalog.table_exists("demo.gadgets"), "the first table has to have landed"
     assert MetaStore(catalog).latest().status == STATUS_PARTIAL
 
     target, plan, left, changes, _, _ = _rollback(root, catalogs, version=2, execute=False)
 
     assert target.status == STATUS_PARTIAL
     assert "recorded as 'partial'" in render_rollback(target, plan, left, changes)
+
+
+def test_an_apply_that_landed_nothing_is_recorded_failed_not_partial(project):
+    """`partial` and `failed` are two facts, and they were one word.
+
+    A probe planned an `int -> double` change Iceberg cannot execute: one table, it failed, and the
+    history said `partial` — the word for a half-landed migration — about a run in which no table
+    moved. *Which of my applies half-landed?* asked of `_loom_meta.applied` came back with false
+    positives, and this version would then be offered to `loom rollback` as a restorable one."""
+    root, catalog, catalogs = project
+    _spec(root, f"{LTV}\n{REGION}")
+    catalog.fail_on = "demo.widgets"
+
+    result = _apply(root, catalogs)
+    catalog.fail_on = None
+
+    assert result.status != APPLIED
+    assert result.applied == (), "nothing committed"
+    assert result.touched_nothing
+    assert MetaStore(catalog).latest().status == STATUS_FAILED
+
+    target, plan, left, changes, _, _ = _rollback(root, catalogs, version=2, execute=False)
+    assert "recorded as 'failed'" in render_rollback(target, plan, left, changes)
+    assert "no table in that apply landed at all" in render_rollback(target, plan, left, changes)
+
+
+def test_a_rollback_that_changed_nothing_leaves_the_working_tree_alone(project):
+    """The promise a *refused* rollback already made, extended to the one that fails.
+
+    Both leave the lake exactly as they found it, so both have to leave the checkout exactly as
+    they found it: a restored spec beside a lake that never moved describes something that does not
+    exist, and the next `loom plan` reads it as a migration to perform rather than one that
+    failed."""
+    root, catalog, catalogs = project
+    # A rename, because it is the one op that actually reverses — rolling back an *add* is a no-op
+    # (Loom never drops), and a run with no DDL to attempt cannot fail at it.
+    _spec(root, LTV_RENAMED)
+    assert _apply(root, catalogs).status == APPLIED
+    on_disk = (root / "widget.yaml").read_text()
+
+    catalog.fail_on = "demo.widgets"
+    _, _, _, _, result, _ = _rollback(root, catalogs, version=1)
+    catalog.fail_on = None
+
+    assert result.touched_nothing
+    assert MetaStore(catalog).latest().status == STATUS_FAILED
+    assert "lifetime_value" in catalog.tables["demo.widgets"], "the lake did not move"
+    assert (root / "widget.yaml").read_text() == on_disk
 
 
 def test_a_catalog_with_no_history_that_far_back_is_named_not_refused(tmp_path):

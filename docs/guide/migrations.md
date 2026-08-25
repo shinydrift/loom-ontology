@@ -98,6 +98,16 @@ source, its content hash, a version, who ran it, and what it did. It lives in th
 beside the YAML because a state file only ever describes the checkout it sits in — and it is
 history, never the planner's input.
 
+Its `status` is one of three words, and the last two are different news:
+
+| `applied` | every table change committed |
+| `partial` | some committed, then one failed — the lake is between two specs and someone has to look |
+| `failed`  | nothing committed; the lake is exactly where it was |
+
+`partial` used to cover both of the last two, which made the one question the history exists to
+answer — *which of my applies half-landed?* — return false positives, and offered `loom rollback` a
+version that never happened as a restorable one.
+
 ## Renaming a column
 
 Change a property's `column` and the planner has no way to know the old one and the new one are
@@ -191,8 +201,11 @@ the chain if there were several).
 
 **It reverses DDL and only DDL.** `apply` never wrote a row, so `rollback` never deletes one — no
 snapshot rollback, no expiry. Rows written since are not Loom's to throw away. Spec files are the
-last thing it writes and only if the run wasn't refused, so a rollback you decline leaves the lake
-*and* the working tree exactly as they were.
+last thing it writes and **only if the run changed something**, so a rollback you decline — or one
+whose first table fails — leaves the lake *and* the working tree exactly as they were. Those are
+the same fact about the lake told two ways, and a restored spec sitting beside a lake that never
+moved is worse than no rollback at all: the next `loom plan` reads it as a migration to perform
+rather than one that failed.
 
 ---
 

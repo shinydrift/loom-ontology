@@ -382,6 +382,20 @@ class _Load:
                 f"{len(unmapped)} column(s) in the source are not mapped by any property of "
                 f"{self.target.api_name}: {', '.join(sorted(unmapped))}",
                 {"columns": sorted(unmapped)},
+                # The refusal is the right one and it used to end here, which left the most natural
+                # first journey with nowhere to go: `loom infer` drafts a type *and* an `ingest:`
+                # entry from a file, and if that file holds one `array<T>`/`struct`/`map` column —
+                # which the spec has no name for — the drafted entry cannot load the file it was
+                # drafted from. `loom infer` says so, in a comment, in the file the operator
+                # redirected somewhere else. Saying it here is saying it where it happens.
+                hint=(
+                    f"a column no property claims is refused rather than dropped, so this batch "
+                    f"cannot be narrowed for you — either map {'it' if len(unmapped) == 1 else 'them'} "
+                    f"by adding a property to {self.target.api_name} (`loom plan` then `loom apply` "
+                    f"for the column), or leave the column unmanaged and load a file without it. A "
+                    f"column whose type the spec has no name for — `array<T>`, `struct`, `map` — can "
+                    f"only take the second route"
+                ),
                 hint_columns=sorted(self.target.properties),
             )
 

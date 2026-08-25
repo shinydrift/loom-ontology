@@ -18,6 +18,7 @@ a spec from a file and prints it, touching no catalog and writing nothing.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 import tempfile
@@ -485,7 +486,12 @@ def _render_run(result, title: str) -> str:
         return json.dumps(json_safe(value), default=str)
 
     lines = [f"Loom run — {result.action} on {title}", ""]
-    lines.append(f"  {result.operation} {result.object_type} {show(result.key)}")
+    # A run that was refused before it could bind a key has no key, and `null` is not the name of
+    # one. It read `modify Customer null`, which is a sentence about a row rather than about the
+    # binding that never happened — and the failure underneath already says which parameter was
+    # missing. Say what is true instead: the target is undetermined.
+    target = show(result.key) if result.key is not None else "(no key bound)"
+    lines.append(f"  {result.operation} {result.object_type} {target}")
     before, after = result.before or {}, result.after or {}
     if result.operation == "delete":
         for name in sorted(before):
@@ -1332,8 +1338,17 @@ def cmd_rollback(args) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     print(render_apply(result))
-    if result.status == REFUSED:
-        print("nothing was rolled back — no spec file was written either", file=sys.stderr)
+    if result.touched_nothing:
+        # Two ways in: the plan was refused, or its first table failed. The lake is identical
+        # either way, so the working tree has to be too — a restored spec beside a lake that never
+        # moved is a checkout describing something that does not exist, and the next `loom plan`
+        # would read it as a migration to perform rather than one that failed.
+        why = (
+            "no spec file was written either"
+            if result.status == REFUSED
+            else "no table changed, so no spec file was written either"
+        )
+        print(f"nothing was rolled back — {why}", file=sys.stderr)
         return 1
 
     restore_files(Path(args.path), target.snapshot, changes)
@@ -1365,7 +1380,29 @@ def _confirmed(assume_yes: bool, action: str = "apply") -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .migrate.meta import loom_version
+
+    # One narrative, two streams, and the order has to survive `2>&1`. Every command here writes
+    # its report to stdout and its errors and notes to stderr; stdout is block-buffered the moment
+    # it is redirected, so a refusal written *after* a report would land *above* it in any captured
+    # log — which is how a refused `loom rollback` came to be read as "restored, then refused".
+    # Line buffering costs nothing at this scale and makes the two streams interleave as written.
+    # Suppressed rather than guarded: a captured stdout under pytest is not always reconfigurable,
+    # and ordering is not what those tests are checking.
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(prog="loom", description="Loom ontology framework")
+    # The one thing every other surface could already answer and the CLI could not. `loom_version`
+    # is the same function `_loom_meta` stamps into every recorded apply and every recorded load,
+    # so `loom --version` and the `loom_version` column in a history row can never disagree about
+    # which build wrote what.
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"loom {loom_version()}",
+        help="print the installed loom-ontology version",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     n = sub.add_parser("infer", help="draft an objectType from a data file (writes nothing)")
