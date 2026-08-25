@@ -273,7 +273,21 @@ def build_app(client: LoomClient, config, *, writes: bool):
         )
 
     async def call(request: Request):
-        body = await request.json()
+        # A body that is not a JSON object is a 400 rather than the 500 an unguarded
+        # `request.json()` produced. Nothing the page sends can reach it — every call the UI makes
+        # is `JSON.stringify`d — so this is for the other client this route has: a person with curl,
+        # reading the rail and reproducing a call by hand. Telling them the request was malformed is
+        # the whole of what a 500 was failing to do, and "the server broke" is a worse thing to
+        # believe about a demo than "you sent something odd".
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "request body is not valid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": 'request body must be a JSON object: {"name": ..., "arguments": {...}}'},
+                status_code=400,
+            )
         name = body.get("name")
         if not isinstance(name, str) or not any(t["name"] == name for t in client.tools):
             # Not a permission check — the server would refuse an unknown tool by itself, and says

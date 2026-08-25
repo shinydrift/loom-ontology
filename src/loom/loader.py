@@ -15,6 +15,7 @@ from pathlib import Path
 
 import yaml
 
+from . import _yaml
 from ._shape import check_keys as _check_keys
 from ._shape import require as _require
 from ._shape import suggest as _suggest
@@ -108,7 +109,7 @@ def load_dir(root: str | Path, diag: Diagnostics) -> _Loaded:
 def _load_file(path: Path, diag: Diagnostics, out: _Loaded) -> None:
     rel = str(path)
     try:
-        doc = yaml.safe_load(path.read_text())
+        doc = _yaml.load(path.read_text())
     except yaml.YAMLError as e:
         diag.error(f"invalid YAML: {e}", SourceLoc(rel))
         return

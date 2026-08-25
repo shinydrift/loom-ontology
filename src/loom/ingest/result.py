@@ -70,6 +70,28 @@ deployment declining to be the kind of thing that does this, and it is reported 
 than raised so that `--dry-run` against a refused deployment still tells an operator whether the load
 *would* have worked."""
 
+MASKED_PROPERTY = "masked_property"
+"""A `governance.policies` mask withholds a property of the object type this entry loads.
+
+The bulk-plane spelling of the refusal `bind_policies` makes about an action: *withhold the property
+or perform the write, not both*. A mask is a statement that nobody reading this deployment may see a
+value, and a load is a write of that value — `append` sets it, `replace` sets it for every row in the
+table, and `merge` reads it to carry it across. A deployment doing both says two things about one
+column, and the one that would go unnoticed is the write: a masked column is invisible in every tool,
+every `loom query` and every action's `before`/`after`, so nobody reading this deployment could ever
+see what the load put there.
+
+**Per entry, not per deployment**, which is where it differs from the action refusal. An action names
+the properties it writes in its own effects, so the pairing of a spec and a policy is decidable
+whole and a deployment that cannot stand refuses to start. An entry names an object type and a file
+supplies the columns, so the decidable unit is *this entry loading that type* — and refusing the
+deployment would take down loads of every other type with it, including the ones a governed
+deployment exists to keep running (the retail dashboard masks `Customer.ltv` and refreshes
+`DailySalesPerformance` on a timer).
+
+Reported rather than raised, for `DEPLOYMENT_REFUSED`'s reason: `--dry-run` against a load this
+deployment will not perform should still say so, and say it before the file is opened."""
+
 SOURCE_ERROR = "source_error"
 """The file could not be read as the format the entry declares."""
 
