@@ -20,6 +20,7 @@ from loom import build
 from loom.errors import Diagnostics
 from loom.migrate import (
     APPLIED,
+    FAILED,
     REFUSED,
     UP_TO_DATE,
     MetaStore,
@@ -260,6 +261,64 @@ objectType:
     # The catalog was never asked, so the live schema is untouched and the rows are still readable.
     assert _local(config).describe("hr.people").columns["score"].iceberg_type == "int"
     assert impl.load_table("hr.people").scan().to_arrow().to_pylist() == [{"id": "p1", "score": 7}]
+
+
+def test_an_apply_that_lands_nothing_records_failed_rather_than_partial(project):
+    """The status column, against a real catalog, after a real DDL failure.
+
+    `partial` had been carrying two meanings — some tables landed and then one failed, versus the
+    very first one failed and no table moved. A probe hit the second and read `partial` back out of
+    `_loom_meta.applied`, which makes *which of my applies half-landed?* unanswerable from the
+    history and offers `loom rollback` a version that never happened as a restorable one.
+
+    The failure here is a real race rather than a stub: the table is dropped between deriving the
+    plan and executing it, which is exactly the shape of the thing that goes wrong at 3am."""
+    import pyarrow as pa
+    from pyiceberg.catalog.sql import SqlCatalog
+    from pyiceberg.schema import Schema
+    from pyiceberg.types import NestedField, StringType
+
+    from loom.migrate.meta import STATUS_FAILED
+
+    target, ontology, config = project
+    # Bootstrap the example first, so the only thing left pending below is the one table this test
+    # is about — otherwise the retail creates land ahead of it and the run really is `partial`.
+    assert _apply(target, ontology, _catalogs(config)).status == APPLIED
+
+    cfg = config.catalogs["local"]
+    impl = SqlCatalog("local", uri=cfg.uri, warehouse=cfg.warehouse)
+    impl.create_namespace("hr")
+    impl.create_table(
+        "hr.people", schema=Schema(NestedField(1, "id", StringType(), required=True))
+    ).append(pa.table({"id": ["p1"]}, schema=pa.schema([pa.field("id", pa.string(), nullable=False)])))
+
+    (target / "ontology" / "person.yaml").write_text(
+        """
+objectType:
+  apiName: Person
+  primaryKey: id
+  title: id
+  backing: { catalog: local, table: hr.people }
+  properties:
+    - { name: id, type: string, column: id, unique: true }
+    - { name: nickname, type: string, column: nickname, nullable: true }
+"""
+    )
+    edited, _ = build(target / "ontology")
+    catalogs = _catalogs(config)
+    diag = Diagnostics()
+    plan = diff_ontology(edited, catalogs, diag)
+    diag.raise_if_errors()
+    assert [c.kind for tc in plan.changes for c in tc.columns] == ["add"]
+
+    impl.drop_table("hr.people")  # the race: the plan is now about a table that is not there
+    result = apply_plan(plan, catalogs, snapshot_spec(target / "ontology"))
+
+    assert result.status == FAILED
+    assert result.applied == (), "nothing committed"
+    assert result.touched_nothing
+    recorded = MetaStore(_local(config)).latest()
+    assert recorded.status == STATUS_FAILED, "the lake's own record has to say so too"
 
 
 def _people_table(config, *, column: str = "headcount"):

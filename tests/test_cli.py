@@ -933,3 +933,17 @@ def test_physical_validation_reports_an_unopenable_catalog_rather_than_crashing(
     assert "Traceback" not in err
     # The hint the error already carried, now the thing a reader sees first rather than last.
     assert "does not exist — create it, or run your seed step first" in err
+
+
+def test_the_cli_can_say_which_build_it_is(capsys):
+    """A CLI people are told to `pip install` should be able to answer what it is; `loom --version`
+    printed usage. The string comes from `loom_version` — the same function that stamps
+    `loom_version` into every `_loom_meta.applied` and `_loom_meta.loads` row — so the binary and
+    the history it writes can never disagree about which build did something."""
+    from loom.migrate.meta import loom_version
+
+    with pytest.raises(SystemExit) as e:
+        main(["--version"])
+
+    assert e.value.code == 0
+    assert capsys.readouterr().out.strip() == f"loom {loom_version()}"

@@ -61,6 +61,11 @@ Consciously deferred in v0; each is a self-contained follow-up:
       surface it would drive is exercised.
 - [ ] Docs site / expanded README now that M1 has landed
 - [ ] Type-check (mypy) + lint (ruff) in CI alongside pytest
+- [ ] `examples/retail/dashboard`: a malformed JSON body to `POST /api/call` returns a bare
+      Starlette 500 rather than a 400 naming the problem. Found by the whole-app probe and left
+      here rather than fixed, because the only way to send one is to not be the page — every call
+      the UI makes is `JSON.stringify`d, so this is reachable by curl and by nothing else. Worth a
+      four-line fix the next time the example is open; not worth a slice on its own.
 
 ---
 

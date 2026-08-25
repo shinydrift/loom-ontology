@@ -26,6 +26,7 @@ from ..catalog.base import CatalogError, Column, SchemaEdit, writer_for
 from .diff import ColumnChange, MigrationPlan, Severity, TableChange
 from .meta import (
     STATUS_APPLIED,
+    STATUS_FAILED,
     STATUS_PARTIAL,
     MetaStore,
     SpecSnapshot,
@@ -102,6 +103,17 @@ class ApplyResult:
     def applied(self) -> tuple[TableOutcome, ...]:
         return tuple(t for t in self.tables if t.ok)
 
+    @property
+    def touched_nothing(self) -> bool:
+        """Whether this run left every table exactly as it found it.
+
+        True of a refusal, and true of a failure whose *first* table was the one that refused —
+        which are the same fact about the lake told two ways, and the reason this is a property
+        rather than a status comparison at each call site. `loom rollback` uses it to decide
+        whether restoring the spec files would describe a lake that exists: a rollback that
+        changed nothing must leave the working tree alone, exactly as a refused one does."""
+        return self.status in (REFUSED, FAILED) and not self.applied
+
 
 def apply_plan(
     plan: MigrationPlan,
@@ -154,7 +166,15 @@ def apply_plan(
 
     # Recorded even when a table failed — a partial apply is exactly the run whose history someone
     # will want to read — but marked as such, so the "already applied" check never trusts it.
-    row_status = STATUS_PARTIAL if failure else STATUS_APPLIED
+    #
+    # `partial` and `failed` are two words because they are two facts. A run that committed three
+    # tables and then stopped leaves a lake half-migrated and someone has to go and look; a run
+    # whose first table refused leaves the lake exactly as it was. Both used to record `partial`,
+    # which made the honest question — *which of my applies half-landed?* — unanswerable from the
+    # history, and made a version that never happened look restorable to `loom rollback`.
+    row_status = STATUS_APPLIED
+    if failure:
+        row_status = STATUS_PARTIAL if any(o.ok for o in outcomes) else STATUS_FAILED
     recorded, record_error = _record(
         stores, pending, snapshot, outcomes, version, row_status, actor, now, rollback_of
     )

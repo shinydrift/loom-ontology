@@ -43,7 +43,22 @@ META_NAMESPACE = "_loom_meta"
 META_TABLE = f"{META_NAMESPACE}.applied"
 
 STATUS_APPLIED = "applied"
+"""Every table change in the plan committed."""
+
 STATUS_PARTIAL = "partial"
+"""Some tables committed and then one failed. The run stopped there, so what landed stays landed
+and the rest was never attempted — the summary names both halves."""
+
+STATUS_FAILED = "failed"
+"""The run failed with **nothing** committed: the very first table it tried was the one that
+refused, or the record itself is all that could not be written.
+
+Split out of `partial`, which had been carrying both meanings. A probe hit it by planning an
+`int -> double` change Iceberg cannot execute: one table, it failed, and the history recorded
+`partial` — the word for a half-landed migration — for a run in which no table moved at all. The
+rendered output was right ("0 table change(s) had already been committed") and this column was
+not, so *which applies half-landed?* asked of the lake came back with false positives, and
+`loom rollback` with no `--to` would offer the version as a restorable one."""
 
 # Every column optional but `version` and `applied_at`: this table is written by exactly one
 # writer (Loom) and read by anything with an Iceberg client, so the cost of a required column is

@@ -16,7 +16,7 @@ from collections.abc import Sequence
 
 from .diff import LABELS, ColumnChange, MigrationPlan, Severity, TableChange
 from .executor import APPLIED, REFUSED, UP_TO_DATE, ApplyResult, TableOutcome
-from .meta import STATUS_APPLIED
+from .meta import STATUS_APPLIED, STATUS_FAILED
 from .rollback import FileChanges, LeftBehind, RollbackTarget
 
 _COLUMN_SYMBOL = {"add": "+", "rename": "~", "promote": "~", "loosen": "~", "retype": "!", "tighten": "!"}
@@ -77,9 +77,16 @@ def render_rollback(
         f"(from {', '.join(target.held_by)})."
     )
     if target.status != STATUS_APPLIED:
+        # `partial` and `failed` are different news about the version being restored, and the
+        # difference decides whether restoring it is a repair or a no-op: a partial left the lake
+        # somewhere between two specs, a failure left it where it already was.
+        what = (
+            "no table in that apply landed at all"
+            if target.status == STATUS_FAILED
+            else "that apply did not fully land"
+        )
         lines.append(
-            f"  note: version {target.version} is recorded as '{target.status}' — that apply did "
-            f"not fully land."
+            f"  note: version {target.version} is recorded as '{target.status}' — {what}."
         )
     for name in target.absent_from:
         # Not an error and not a skip: a version selects a spec, and that spec either binds this

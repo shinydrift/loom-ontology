@@ -23,6 +23,7 @@ from typing import Any
 from ..action import ActionError, ActionRuntime
 from ..config import LoomConfig, McpConfig
 from ..embed.match import Matcher
+from ..embed.provider import EmbeddingError
 from ..governance import PolicyProgram
 from ..model import Ontology
 from ..resolver import Resolver, ResolverError
@@ -94,9 +95,16 @@ class LoomMCPServer:
             return refusal, True
         try:
             result = tool.handler(arguments or {})
-        except (ResolverError, ActionError) as e:
+        except (ResolverError, ActionError, EmbeddingError) as e:
+            # Every refusal Loom *authored* reaches a caller as the sentence it was written as.
+            # `EmbeddingError` was not on this list and could reach it — a `match_` call on a
+            # deployment without the `embed` extra came back `EmbeddingError: 'provider: local'
+            # needs fastembed…`, which is the one refusal in the whole surface that hands an agent
+            # a Python class name to parse around.
             return str(e), True
         except Exception as e:
+            # The fallback keeps the class name on purpose: anything arriving here is a bug rather
+            # than a decision, and the type is the most useful thing a bug report can carry.
             return f"{type(e).__name__}: {e}", True
         return json.dumps(result, indent=2, default=str), False
 

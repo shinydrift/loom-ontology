@@ -1332,8 +1332,17 @@ def cmd_rollback(args) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     print(render_apply(result))
-    if result.status == REFUSED:
-        print("nothing was rolled back — no spec file was written either", file=sys.stderr)
+    if result.touched_nothing:
+        # Two ways in: the plan was refused, or its first table failed. The lake is identical
+        # either way, so the working tree has to be too — a restored spec beside a lake that never
+        # moved is a checkout describing something that does not exist, and the next `loom plan`
+        # would read it as a migration to perform rather than one that failed.
+        why = (
+            "no spec file was written either"
+            if result.status == REFUSED
+            else "no table changed, so no spec file was written either"
+        )
+        print(f"nothing was rolled back — {why}", file=sys.stderr)
         return 1
 
     restore_files(Path(args.path), target.snapshot, changes)
@@ -1365,7 +1374,19 @@ def _confirmed(assume_yes: bool, action: str = "apply") -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .migrate.meta import loom_version
+
     parser = argparse.ArgumentParser(prog="loom", description="Loom ontology framework")
+    # The one thing every other surface could already answer and the CLI could not. `loom_version`
+    # is the same function `_loom_meta` stamps into every recorded apply and every recorded load,
+    # so `loom --version` and the `loom_version` column in a history row can never disagree about
+    # which build wrote what.
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"loom {loom_version()}",
+        help="print the installed loom-ontology version",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     n = sub.add_parser("infer", help="draft an objectType from a data file (writes nothing)")

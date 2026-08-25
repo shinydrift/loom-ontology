@@ -397,6 +397,51 @@ def test_an_unknown_tool_name_lists_the_real_ones(ontology):
     assert "unknown tool 'run_sql'" in text and "get_customer" in text
 
 
+def test_a_refusal_loom_wrote_reaches_the_caller_as_prose(ontology):
+    """Every refusal Loom authored is the sentence it was written as. `EmbeddingError` was not.
+
+    A `match_` call on a deployment without the `embed` extra came back
+    `EmbeddingError: 'provider: local' needs fastembed — install the extra: …` — the one refusal in
+    the whole surface handing an agent a Python class name to parse around. Found by probing a venv
+    installed with exactly the extras the quickstart names."""
+    from dataclasses import replace
+
+    from loom.embed.provider import EmbeddingError
+
+    resolver = Resolver(ontology=ontology, engine=StubEngine())
+    server = LoomMCPServer.from_resolver(resolver)
+
+    def raise_embedding_error(_args):
+        raise EmbeddingError("'provider: local' needs fastembed — install the extra")
+
+    server.tools["get_customer"] = replace(
+        server.tools["get_customer"], handler=raise_embedding_error
+    )
+    text, is_error = server.call("get_customer", {"key": "c1"})
+
+    assert is_error is True
+    assert text.startswith("'provider: local' needs fastembed")
+    assert "EmbeddingError" not in text
+
+
+def test_an_unexpected_exception_keeps_its_class_name(ontology):
+    """The other half, and the reason the fallback is not simply `str(e)`: anything arriving there
+    is a bug rather than a decision, and the type is the most useful thing a report can carry."""
+    from dataclasses import replace
+
+    resolver = Resolver(ontology=ontology, engine=StubEngine())
+    server = LoomMCPServer.from_resolver(resolver)
+
+    def raise_bug(_args):
+        raise ZeroDivisionError("division by zero")
+
+    server.tools["get_customer"] = replace(server.tools["get_customer"], handler=raise_bug)
+    text, is_error = server.call("get_customer", {"key": "c1"})
+
+    assert is_error is True
+    assert text == "ZeroDivisionError: division by zero"
+
+
 def test_an_unknown_argument_is_refused_rather_than_dropped(ontology):
     """The failure this closes is a **widening** one, which is why it is not a nicety.
 
