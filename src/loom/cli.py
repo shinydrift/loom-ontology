@@ -593,7 +593,12 @@ def cmd_ingest(args) -> int:
 
     print(json.dumps(json_safe(result.as_json()), indent=2, default=str))
     for failure in result.failures:
-        print(f"error: {failure.code}: {failure.message}", file=sys.stderr)
+        # A quarantined row is not an error this run had: the operator asked for those rows to be
+        # set aside, they were, the load applied and the exit code is 0. Printing `error:` in front
+        # of them made a successful `--reject-to` load indistinguishable from a refused one to
+        # anything reading this output, which is every pipeline that runs this command.
+        label = "rejected" if _quarantined(result, failure) else "error"
+        print(f"{label}: {failure.code}: {failure.message}", file=sys.stderr)
     unlogged = any(f.code == LOG_FAILED for f in result.failures)
     if result.load_id and not unlogged:
         print(f"note: recorded in {LOAD_LOG_TABLE} as {result.load_id}.", file=sys.stderr)
@@ -657,13 +662,30 @@ def _render_load(result, title: str) -> str:
             "\n  an append asserts no snapshot — it reads nothing and puts no row over another."
         )
     for failure in result.failures:
-        lines.append(f"\n  ! {failure.code}: {failure.message}")
+        # `!` is the refusal mark everywhere else in this file, and a quarantined row is not a
+        # refusal — the load is about to apply. Marked `·` for the same reason `rollback` marks the
+        # columns it is leaving live: something happened to them, and it is not the run stopping.
+        quarantined = _quarantined(result, failure)
+        lines.append(f"\n  {'·' if quarantined else '!'} {failure.code}: {failure.message}")
         hint = failure.detail.get("hint")
         if hint:
             lines.append(f"    hint: {hint}")
-    if result.failures:
+    if any(not _quarantined(result, f) for f in result.failures):
         lines.append("  nothing was written.")
     return "\n".join(lines)
+
+
+def _quarantined(result, failure) -> bool:
+    """Whether this failure is a row `--reject-to` set aside rather than a reason the load stopped.
+
+    Both halves are needed. The code has to be one `--reject-to` may absorb, and the load has to
+    have actually gone ahead: the identical `type_error` refuses the whole batch when no
+    `--reject-to` was passed, and describing *that* as a quarantined row would be the same lie in
+    the other direction. `IngestResult.rows_rejected` counts only rows that were really written
+    somewhere, which is what makes it the honest test."""
+    from .ingest import QUARANTINABLE
+
+    return result.ok and bool(result.rows_rejected) and failure.code in QUARANTINABLE
 
 
 def cmd_sequence(args) -> int:

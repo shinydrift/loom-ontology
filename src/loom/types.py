@@ -29,13 +29,30 @@ _ICEBERG = {
     "objectRef": None,  # resolves to the referenced object's primary-key iceberg type
 }
 
-# Iceberg's own promotion rules — widening only. Used when checking a property's declared
-# type against its backing column, and when checking link join-property comparability.
-# ("float", "double") is reachable only from the physical side: Loom has no `float` kind, so a
-# float column can back a double property but no Loom type ever compares as one.
+# Widening pairs — is a value of the first *readable* as the second? Used when checking a
+# property's declared type against its backing column, and when checking link join-property
+# comparability. ("float", "double") is reachable only from the physical side: Loom has no `float`
+# kind, so a float column can back a double property but no Loom type ever compares as one.
+#
+# **This is not Iceberg's ALTER-time promotion set**, and it was written as though it were until a
+# probe ran one into a real catalog. Reading an `int` column as a `double` is fine everywhere Loom
+# reads — DuckDB widens it, the values are exact — but asking Iceberg to *restore* the column as a
+# double is a different question, and its answer is no. See `iceberg_alterable`.
 _PROMOTIONS = frozenset(
     {("int", "long"), ("int", "double"), ("long", "double"), ("float", "double")}
 )
+
+# Iceberg's own schema-evolution promotions: what `UpdateSchema.update_column` will accept, which
+# is a strictly smaller set than the readable-as pairs above. Iceberg promotes `int -> long` and
+# `float -> double` and nothing else among the types Loom can name (decimal widens too, but Loom's
+# physical type carries precision *and* scale and deliberately treats any decimal change as a
+# retype — see `_NUMERIC_KINDS`).
+#
+# Kept beside `_PROMOTIONS` rather than folded into it because the two answer different questions
+# and the migration planner needs this one: a plan that calls `int -> double` physical-safe is a
+# plan `loom apply` cannot execute, and the operator meets the difference as a raw catalog error
+# half way through a migration instead of as a classification before it starts.
+_ICEBERG_ALTERS = frozenset({("int", "long"), ("float", "double")})
 
 # Every kind that denotes a number, which is a different set from the widening pairs above:
 # `decimal` is here and appears in no promotion, because nothing may widen *into* it or out of it
@@ -140,7 +157,23 @@ class PropType:
 def promotable(from_iceberg: str, to_iceberg: str) -> bool:
     """Physical compatibility: is a value of `from_iceberg` readable as `to_iceberg`?
     Used at plan/serve time against live catalog introspection (deferred until we bind a
-    catalog, but the rule lives here next to the type system it belongs to)."""
+    catalog, but the rule lives here next to the type system it belongs to).
+
+    A *read* question, and the reason `loom validate --physical` accepts an `int` column under a
+    `double` property: every value in it is exactly representable and every engine widens it. Do
+    not reach for this to decide whether a migration can run — `iceberg_alterable` is that one."""
     if from_iceberg == to_iceberg:
         return True
     return (from_iceberg, to_iceberg) in _PROMOTIONS
+
+
+def iceberg_alterable(from_iceberg: str, to_iceberg: str) -> bool:
+    """Can Iceberg change a live column's stored type from `from_iceberg` to `to_iceberg`?
+
+    The DDL question, and deliberately not the same one as `promotable`. Iceberg's promotion set is
+    the two pairs that are binary-compatible in the file formats it writes; everything else — an
+    `int` column a spec now calls `double` included — needs the data rewritten, which is a
+    migration Loom does not perform and therefore classifies as breaking rather than proposing."""
+    if from_iceberg == to_iceberg:
+        return True
+    return (from_iceberg, to_iceberg) in _ICEBERG_ALTERS

@@ -119,6 +119,27 @@ def test_the_other_two_formats_are_refused_by_name_with_the_reason(tmp_path, fmt
     assert "decimal" in str(e.value)
 
 
+@pytest.mark.parametrize(
+    ("name", "named"), [("drop.csv", "csv"), ("drop.ndjson", "ndjson"), ("drop.json", "ndjson")]
+)
+def test_a_filename_that_says_csv_gets_the_refusal_rather_than_pyarrow(tmp_path, name, named):
+    """The refusal above was reachable only by typing `--format csv`, which is the one thing nobody
+    does when the extension already says so.
+
+    `--format` defaults to parquet and is deliberately never *derived* from the extension — a `.csv`
+    that is really TSV would be guessed wrong, per invocation. But `loom infer data.csv` then opened
+    it as parquet and handed back `Parquet magic bytes not found in footer`, which says nothing
+    about why Loom reads one format. The extension picks no reader here, only which refusal the
+    operator gets to read."""
+    path = tmp_path / name
+    path.write_text("id,name\n1,ada\n")
+    with pytest.raises(InferError) as e:
+        read_columns(path)
+    assert named in str(e.value)
+    assert "decimal" in str(e.value) or "no date" in str(e.value)
+    assert "magic bytes" not in str(e.value)
+
+
 def test_a_file_with_no_columns_drafts_nothing(tmp_path):
     path = write(tmp_path / "empty.parquet", pa.schema([]))
     with pytest.raises(InferError, match="no columns"):

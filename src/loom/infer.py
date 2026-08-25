@@ -141,12 +141,36 @@ def read_columns(source: str | Path, fmt: str = "parquet") -> tuple[Column, ...]
     Only the schema is read — never the rows. That is not an optimisation: reading rows is how a
     generator starts observing enum values and nullability, and neither is a fact this file has."""
     if fmt not in INFER_FORMATS:
-        why = UNREADABLE_FORMATS.get(fmt)
-        raise InferError(
-            f"'loom infer' reads {', '.join(INFER_FORMATS)}, not '{fmt}'"
-            + (f" — {why}" if why else "")
-        )
-    return _read_parquet(Path(source))
+        raise InferError(_unreadable(fmt))
+    path = Path(source)
+    named = _named_by_suffix(path)
+    if named is not None:
+        # `--format` is never derived from the extension — a `.csv` that is really TSV would be
+        # guessed wrong, per invocation, and the guess is the thing this command does not make. But
+        # the by-name refusal above was then reachable only by typing `--format csv`, which is the
+        # one thing nobody does when the extension already says so: `loom infer data.csv` opened it
+        # as parquet and handed back pyarrow's "Parquet magic bytes not found in footer". The
+        # extension decides no reader here, only which refusal the operator gets to read.
+        raise InferError(_unreadable(named, path=path))
+    return _read_parquet(path)
+
+
+def _named_by_suffix(path: Path) -> str | None:
+    """The unreadable format this filename claims to be, if any. `.json` is folded into `ndjson`:
+    the refusal is about JSON's type system, which neither spelling escapes."""
+    suffix = path.suffix.lower().lstrip(".")
+    if suffix == "json":
+        suffix = "ndjson"
+    return suffix if suffix in UNREADABLE_FORMATS else None
+
+
+def _unreadable(fmt: str, *, path: Path | None = None) -> str:
+    why = UNREADABLE_FORMATS.get(fmt)
+    subject = f"'{path}' is {fmt}, and " if path is not None else ""
+    return (
+        f"{subject}'loom infer' reads {', '.join(INFER_FORMATS)}, not '{fmt}'"
+        + (f" — {why}" if why else "")
+    )
 
 
 def _read_parquet(path: Path) -> tuple[Column, ...]:

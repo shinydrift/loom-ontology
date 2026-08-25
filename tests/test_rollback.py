@@ -88,6 +88,7 @@ def _rollback(root: Path, catalogs, version=None, *, execute=True):
 
 
 LTV = "    - { name: ltv, type: double, column: ltv_usd, nullable: true }"
+LTV_LONG = "    - { name: ltv, type: long, column: ltv_usd, nullable: true }"
 LTV_RENAMED = "    - { name: ltv, type: double, column: lifetime_value, nullable: true, renamedFrom: ltv_usd }"
 REGION = "    - { name: region, type: string, column: region, nullable: true }"
 
@@ -240,19 +241,23 @@ def test_a_table_created_since_is_left_in_place(project):
 
 def test_rolling_back_a_promotion_is_refused_whole(tmp_path):
     """A promotion reverses to a narrowing, which is breaking, so it goes through the refusal that
-    already exists. Not a hole in rollback: once the column is a `double`, the spec that says `int`
-    no longer describes this lake, and the way out of that is forward."""
+    already exists. Not a hole in rollback: once the column is a `long`, the spec that says `int`
+    no longer describes this lake, and the way out of that is forward.
+
+    `int -> long` rather than the `int -> double` this once used, because that pair is not one
+    Iceberg promotes at all — the forward `_apply` below would be refused before the rollback under
+    test ever ran."""
     root, catalog, catalogs = _fresh(tmp_path, "    - { name: ltv, type: int, column: ltv_usd, nullable: true }")
-    _spec(root, LTV)  # int -> double
+    _spec(root, LTV_LONG)  # int -> long
     assert _apply(root, catalogs).status == APPLIED
-    assert catalog.tables["demo.widgets"]["ltv_usd"].iceberg_type == "double"
+    assert catalog.tables["demo.widgets"]["ltv_usd"].iceberg_type == "long"
 
     on_disk = (root / "widget.yaml").read_text()
     writes = len(catalog.writes)
     _, _, _, _, result, _ = _rollback(root, catalogs, version=1)
 
     assert result.status == REFUSED
-    assert "double does not promote to int" in result.error
+    assert "long does not promote to int" in result.error
     assert len(catalog.writes) == writes, "a refused rollback writes nothing, not even history"
     assert (root / "widget.yaml").read_text() == on_disk, "and touches no file either"
 

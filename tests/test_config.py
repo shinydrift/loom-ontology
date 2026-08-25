@@ -400,6 +400,53 @@ def test_find_config_prefers_inside_then_alongside(tmp_path: Path):
     assert find_config(tmp_path / "ontology") == inside
 
 
+def test_a_config_inside_the_ontology_dir_is_not_read_as_a_spec_file(tmp_path: Path):
+    """The location `find_config` prefers has to be a location the spec loader tolerates.
+
+    It was not: `load_dir` globbed every `*.yaml` under the ontology directory and required each to
+    declare one of the three spec kinds, so putting `loom.yaml` in the first place the config finder
+    looks made *every* command exit 1 with `a spec file must declare exactly one of ...` — an error
+    about spec grammar, naming a file that is not a spec, with nothing to connect the two."""
+    from loom.errors import Diagnostics
+    from loom.loader import load_dir
+
+    ontology = tmp_path / "ontology"
+    ontology.mkdir()
+    (ontology / "loom.yaml").write_text("catalogs:\n  local: { type: iceberg-sql, uri: 'sqlite:///c.db' }\n")
+    (ontology / "widget.yaml").write_text(
+        "objectType:\n"
+        "  apiName: Widget\n"
+        "  primaryKey: id\n"
+        "  title: id\n"
+        "  backing: { catalog: local, table: demo.widgets }\n"
+        "  properties:\n"
+        "    - { name: id, type: string, column: id, unique: true }\n"
+    )
+
+    diag = Diagnostics()
+    loaded = load_dir(ontology, diag)
+
+    assert [e.message for e in diag.errors] == []
+    assert set(loaded.objects) == {"Widget"}
+
+
+def test_a_nested_loom_yaml_is_still_a_spec_file(tmp_path: Path):
+    """Only the one at the root is skipped. `find_config` never looks in a subdirectory, so a
+    `loom.yaml` down there is config nothing would ever read — and silently ignoring it would hide
+    a misplaced file rather than report it."""
+    from loom.errors import Diagnostics
+    from loom.loader import load_dir
+
+    ontology = tmp_path / "ontology"
+    (ontology / "nested").mkdir(parents=True)
+    (ontology / "nested" / "loom.yaml").write_text("catalogs: {}\n")
+
+    diag = Diagnostics()
+    load_dir(ontology, diag)
+
+    assert any("must declare exactly one of" in e.message for e in diag.errors)
+
+
 def test_unreadable_and_malformed_files_report_rather_than_raise(tmp_path: Path):
     cfg, diag = _load(tmp_path, "catalogs: [not, a, mapping]\n")
     assert any("'catalogs' must be a mapping" in e.message for e in diag.errors)

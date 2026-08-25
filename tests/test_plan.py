@@ -228,15 +228,31 @@ def test_adding_a_required_column_to_an_existing_table_is_breaking(ontology):
     assert "add it nullable, backfill" in change.reason
 
 
-@pytest.mark.parametrize("current", ["int", "long", "float"])
-def test_a_widening_type_change_is_physical_safe(ontology, current):
-    """`Customer.ltv` is declared double; Iceberg widens all of these into it by field id."""
-    live = dict(CUSTOMERS, lifetime_value=Column("lifetime_value", current, required=False, field_id=4))
+def test_a_widening_type_change_is_physical_safe(ontology):
+    """`Customer.ltv` is declared double, and Iceberg widens a float into it by field id."""
+    live = dict(CUSTOMERS, lifetime_value=Column("lifetime_value", "float", required=False, field_id=4))
     plan = _plan(ontology, {"crm.customers": live, "sales.orders": ORDERS})
     change = _column(plan, "crm.customers", "lifetime_value")
     assert (change.kind, change.severity) == ("promote", Severity.PHYSICAL_SAFE)
-    assert change.detail == f"{current} -> double"
+    assert change.detail == "float -> double"
     assert "field id 4" in change.reason
+
+
+@pytest.mark.parametrize("current", ["int", "long"])
+def test_a_change_iceberg_cannot_alter_is_breaking_however_readable_it_is(ontology, current):
+    """The one a probe found by running `loom apply` into a real catalog.
+
+    An `int` column under a `double` property *reads* fine — `promotable` says so and
+    `loom validate --physical` accepts it on that basis. Iceberg still will not alter the stored
+    type: its promotion set is `int -> long` and `float -> double`, and nothing else. Classifying
+    this as physical-safe produced a plan `apply` could not execute, and the operator met the
+    difference as pyiceberg's `Cannot change column type` half way through the run."""
+    live = dict(CUSTOMERS, lifetime_value=Column("lifetime_value", current, required=False, field_id=4))
+    plan = _plan(ontology, {"crm.customers": live, "sales.orders": ORDERS})
+    change = _column(plan, "crm.customers", "lifetime_value")
+    assert (change.kind, change.severity) == ("retype", Severity.BREAKING)
+    assert change.detail == f"{current} -> double"
+    assert "does not promote" in change.reason
 
 
 def test_a_narrowing_type_change_is_breaking(ontology):
@@ -267,7 +283,7 @@ def test_tightening_a_constraint_is_breaking(ontology):
 def test_a_type_and_a_nullability_change_on_one_column_are_reported_separately(ontology):
     """They are two distinct operations with two distinct severities — collapsing them would hide
     the breaking half behind the safe one."""
-    live = dict(CUSTOMERS, lifetime_value=Column("lifetime_value", "int", required=True, field_id=4))
+    live = dict(CUSTOMERS, lifetime_value=Column("lifetime_value", "float", required=True, field_id=4))
     plan = _plan(ontology, {"crm.customers": live, "sales.orders": ORDERS})
     kinds = {c.kind: c.severity for t in plan.changes for c in t.columns}
     assert kinds == {"promote": Severity.PHYSICAL_SAFE, "loosen": Severity.SAFE}
@@ -375,10 +391,10 @@ def test_a_breaking_add_is_marked_by_severity_not_by_kind(ontology):
 
 
 def test_a_promotion_renders_its_field_id_reasoning(ontology):
-    live = dict(CUSTOMERS, lifetime_value=Column("lifetime_value", "int", required=False, field_id=4))
+    live = dict(CUSTOMERS, lifetime_value=Column("lifetime_value", "float", required=False, field_id=4))
     plan = _plan(ontology, {"crm.customers": live, "sales.orders": ORDERS})
     out = render_plan(plan)
-    assert "      ~ lifetime_value  int -> double  physical-safe" in out
+    assert "      ~ lifetime_value  float -> double  physical-safe" in out
     assert "existing data files are not rewritten" in out
 
 

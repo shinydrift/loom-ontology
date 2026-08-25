@@ -29,7 +29,7 @@ three look identical in a YAML diff. Against a table already holding rows, they 
 ```
 $ loom plan ./ontology
   ! local.demo.widgets — 3 change(s) · Widget
-      ~ score     int -> double         physical-safe
+      ~ score     int -> long           physical-safe
           widening promotion applied by field id 2; existing data files are not rewritten
       ! label     optional -> required  breaking
           existing rows may already hold nulls, which the new constraint would not admit
@@ -37,6 +37,15 @@ $ loom plan ./ontology
 
 Plan: 0 to create, 1 to change · 1 safe, 1 physical-safe, 1 breaking
 ```
+
+**`physical-safe` is Iceberg's promotion set and not a wider one.** Iceberg promotes `int -> long`
+and `float -> double`, and nothing else among the types a spec can name. Anything else is
+`breaking` here even where it reads perfectly well today: an `int` column under a `double` property
+is one `loom validate --physical` accepts — every value in it is exactly representable and every
+engine widens it on the way out — and Loom still will not call changing the *stored* type free,
+because Iceberg would have to rewrite the data and Loom does not rewrite data. Those two commands
+answering differently about one column is the honest pair; a plan that promised the change and an
+apply that met `Cannot change column type` half way through was not.
 
 Two rules shape it. The **live catalog is the baseline** — no state file to drift out of sync, so
 a table someone changed out of band shows up honestly. And **Loom never proposes a drop**: an

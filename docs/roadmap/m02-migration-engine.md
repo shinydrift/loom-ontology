@@ -113,6 +113,29 @@
   reported as unmanaged and left alone. It also means `plan` is not `validate --physical`: that
   pass treats a missing table as an error, which is exactly what a plan reports as a creation.
 
+**Probed as a client (2026-08-25), and the promotion table was wrong.** M2 had only ever been
+driven by tests, and its worked example was run against a real SQLite/filesystem warehouse for the
+first time: bootstrap from an empty catalog, widen a column, tighten one, rename one, roll back.
+`int -> double` — the example this milestone's guide page used to demonstrate `physical-safe` —
+turned out not to be an Iceberg promotion at all. Iceberg promotes `int -> long` and
+`float -> double` and nothing else among the types a spec can name, so:
+
+- `loom validate --physical` said **ok** (correctly: the column *reads* as a double),
+- `loom plan` said **physical-safe** with "existing data files are not rewritten",
+- `loom apply` got `Cannot change column type: score: int -> double` out of pyiceberg, exited 1,
+  and appended a `partial` row to `_loom_meta.applied` for a run that committed nothing.
+
+Three answers to one question. The fix splits the two rules that had been one function:
+`types.promotable` stays the *read* question physical validation asks, and `types.iceberg_alterable`
+is the DDL question the planner asks. Anything outside Iceberg's set is `breaking` now, refused
+before the catalog is touched — which is the same answer the milestone already gave every other
+change it cannot make safely.
+
+Why the suite could not see it: every planner test builds a `Column` by hand against a fake
+catalog, and the apply tests that *do* use pyiceberg only ever exercised `int -> long`. Both halves
+agreed with each other because neither half ever asked Iceberg. The regression test is in
+`tests/test_apply_iceberg.py` and runs the refused plan against a real catalog.
+
 ---
 
 [← M1](./m01-read-slice.md) · [M3 →](./m03-action-runtime.md) · [backlog](./backlog.md)

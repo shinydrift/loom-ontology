@@ -200,6 +200,68 @@ objectType:
     assert impl.load_table("hr.people").scan().to_arrow().to_pylist() == [{"id": "p1", "headcount": 7}]
 
 
+def test_a_change_iceberg_will_not_alter_is_refused_before_it_reaches_the_catalog(project):
+    """The gap a probe walked into, and the reason it is asserted here rather than in test_apply.py.
+
+    `int -> double` was classified physical-safe on a promotion table that was written as Iceberg's
+    and was not: Iceberg promotes `int -> long` and `float -> double`, and nothing else. Both halves
+    of the fake-catalog suite agreed with each other about it, because neither half ever asked
+    pyiceberg — so `loom plan` printed `physical-safe`, `loom validate --physical` printed `ok`, and
+    `loom apply` got `Cannot change column type` out of the catalog part way through the run.
+
+    What the plan says now is `breaking`, which is the truthful answer: reading that column as a
+    double is fine and *restoring* it as one needs the data rewritten, which Loom does not do."""
+    import pyarrow as pa
+    from pyiceberg.catalog.sql import SqlCatalog
+    from pyiceberg.schema import Schema
+    from pyiceberg.types import IntegerType, NestedField, StringType
+
+    target, ontology, config = project
+    cfg = config.catalogs["local"]
+    impl = SqlCatalog("local", uri=cfg.uri, warehouse=cfg.warehouse)
+    impl.create_namespace("hr")
+    impl.create_table(
+        "hr.people",
+        schema=Schema(
+            NestedField(1, "id", StringType(), required=True),
+            NestedField(2, "score", IntegerType(), required=False),
+        ),
+    ).append(
+        pa.table(
+            {"id": ["p1"], "score": [7]},
+            schema=pa.schema([pa.field("id", pa.string(), nullable=False), pa.field("score", pa.int32())]),
+        )
+    )
+
+    (target / "ontology" / "person.yaml").write_text(
+        """
+objectType:
+  apiName: Person
+  primaryKey: id
+  title: id
+  backing: { catalog: local, table: hr.people }
+  properties:
+    - { name: id, type: string, column: id, unique: true }
+    - { name: score, type: double, column: score, nullable: true }
+"""
+    )
+    edited, _ = build(target / "ontology")
+    catalogs = _catalogs(config)
+    diag = Diagnostics()
+    plan = diff_ontology(edited, catalogs, diag)
+    diag.raise_if_errors()
+
+    change = next(c for tc in plan.changes for c in tc.columns if c.column == "score")
+    assert (change.kind, change.detail) == ("retype", "int -> double")
+    result = apply_plan(plan, catalogs, snapshot_spec(target / "ontology"))
+
+    assert result.status == REFUSED
+    assert "int does not promote to double" in result.error
+    # The catalog was never asked, so the live schema is untouched and the rows are still readable.
+    assert _local(config).describe("hr.people").columns["score"].iceberg_type == "int"
+    assert impl.load_table("hr.people").scan().to_arrow().to_pylist() == [{"id": "p1", "score": 7}]
+
+
 def _people_table(config, *, column: str = "headcount"):
     """A populated `hr.people` outside the example spec, so a rename has real rows to survive."""
     import pyarrow as pa

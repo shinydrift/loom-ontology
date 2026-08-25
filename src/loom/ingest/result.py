@@ -136,6 +136,18 @@ The retry guard, and the reason a load has an id at all. See `ingest.log.derive_
 id is when nobody supplies one, and why re-running the same file through the same entry is a refusal
 rather than a second load."""
 
+QUARANTINABLE = frozenset({TYPE_ERROR, NULL_KEY})
+"""The codes `--reject-to` may set a row aside over instead of refusing the whole batch.
+
+Row-level, both of them: the failure is a fact about one row and about no other, which is what makes
+absorbing it the operator's call rather than a partial load Loom decided on. Everything else in this
+module is a fact about the batch, the entry or the table, and no per-row file can answer it.
+
+Named here rather than spelled out at each of its three uses — the runtime gates the two refusal
+branches on it, and the CLI needs the same set to tell a *quarantined* row from a refused load. When
+those two disagreed, a load that applied printed its set-aside rows as `error:` under a preview that
+said `nothing was written`."""
+
 CONFLICT = "conflict"
 """The table moved between the read and the write, and the write was declined.
 
