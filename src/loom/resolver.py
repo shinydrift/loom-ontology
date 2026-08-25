@@ -415,7 +415,15 @@ class Resolver:
         return out
 
     def link_direction(self, object_type: str, name: str) -> LinkDirection:
-        """Resolve a link name as seen from `object_type`, in either direction."""
+        """Resolve a link name as seen from `object_type`, in either direction.
+
+        The object type is resolved first, because `links_of` answers an empty list for a name no
+        ontology declares and the sentence below then reads as though it did: `traverse` on a typo'd
+        `objectType` came back `'Widget' has no link 'orders' (available: none)`, which tells an
+        agent that Widget is a type it may start from and that this deployment declares no links
+        from it. Both halves are false, and the second sends it looking for the link rather than for
+        the typo. `_object` already has the sentence that is true."""
+        self._object(object_type)
         for candidate in self.links_of(object_type):
             if candidate.name == name:
                 return candidate

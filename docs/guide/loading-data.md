@@ -112,6 +112,24 @@ Three consequences worth knowing:
 It checks no referential integrity, and says so: ordering customers before orders makes the *result*
 coherent, but Loom has no cross-table constraint and this does not add one.
 
+## Where governance meets a load
+
+In one place, and it is worth knowing which.
+
+**A deployment whose `governance.policies` do not fit the ontology refuses to load**, in the same
+words `loom query`, `loom run`, `loom serve` and `loom embed` refuse to start — a mask naming a
+property an action writes, a `rows:` predicate naming a claim nobody declared. The pairing is
+checked before any entry runs, so bulk writes cannot be the one plane still moving under a
+configuration the rest of the deployment will not stand on.
+
+**The policies themselves are not applied to a batch.** A load has no caller: nobody is being shown
+a column, and nothing is being withheld from anybody. So an entry writes every column it maps,
+including one a `mask:` withholds from every read — `hide-ltv` blanks `ltv` in every tool, every
+`loom query` and every action's `before`/`after`, and a `customers` load still fills it. The
+asymmetry with an action, which refuses the whole deployment for writing a masked property, is the
+difference between the two planes rather than a rule with a hole in it: an action is reachable by an
+agent through a `run_` tool, and there is deliberately no `ingest_` tool for one to reach.
+
 ---
 
 Next: [an app on top of it](./dashboard.md) — the same ontology with a UI in front.

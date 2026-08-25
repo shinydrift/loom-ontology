@@ -779,10 +779,23 @@ def build_ingest(
     **`governance.edit_log: required` is checked here as well as in `build_runtime`**, and only when
     the posture permits loads: proving a log a deployment will never write would create
     `_loom_meta.loads` in every catalog of every deployment that declared an entry and meant it for
-    later. See `log.require_load_log` for what that posture can honestly claim."""
+    later. See `log.require_load_log` for what that posture can honestly claim.
+
+    **And `governance.policies` is bound here, though this plane applies none of them.** A load has
+    no caller to withhold a column from and no rows to filter — the operator running it is the
+    deployment — so the program this builds is used for nothing but being buildable. That is the
+    point: `bind_policies` is where a policy is checked against the spec it governs, and a
+    deployment whose governance does not fit is one `loom query`, `loom run`, `loom serve` and
+    `loom embed` all refuse to start. Without this line `loom ingest` was the exception, and an
+    exception on the plane that writes whole tables: a mask naming a property an action writes took
+    the read surface down and left bulk loads running. "Every static refusal lives here" is what
+    this function claims, and a policy that does not fit the ontology is one of them."""
     from ..catalog import open_catalogs
+    from ..governance import bind_policies
 
     open_cats = catalogs if catalogs is not None else open_catalogs(config)
+    auth = config.mcp.auth
+    bind_policies(ontology, config.policies, auth.claims if auth else {})
     entries = _resolve(ontology, config.ingest)
     posture = config.ingest_posture
     if posture == INGEST_ALLOWED and config.edit_log == EDIT_LOG_REQUIRED:
