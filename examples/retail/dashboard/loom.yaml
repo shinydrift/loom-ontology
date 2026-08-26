@@ -77,14 +77,12 @@ mcp:
 # is the one this file cannot use: it names a caller, and naming one requires `mcp.auth`. Uncomment
 # it here and `app.py` refuses to start rather than applying the rest — see `build_resolver`.
 #
-# governance:
-#   policies:
-#     - name: hide-ltv
-#       objectType: Customer
-#       mask: [ltv]
-#     - name: current-customers-only
-#       objectType: Customer
-#       rows: "object.tier != 'closed'"
+# The block to uncomment is at the foot of this file, under the `governance:` key that is already
+# there for `ingest:`. It used to sit here as a second `governance:` block of its own, which was a
+# trap rather than a convenience: uncommenting it gave the file two top-level `governance:` keys,
+# and YAML keeps the last — so the policies vanished silently and the dashboard rendered exactly as
+# before. Loom now refuses a duplicate key outright (`_yaml.py`), and this file gives it one place
+# to be.
 
 # The one write on this deployment that is not a tool call, declared where every load is declared.
 #
@@ -107,3 +105,20 @@ governance:
   # Default-refused, so the refresh button would return a `deployment_refused` failure without it —
   # which is the posture doing its job rather than an oversight to route around.
   ingest: allowed
+
+  # What this deployment withholds — the two policies the prose at the top of this file describes.
+  # Uncomment one or both, restart `app.py`, reload. Nothing else changes: no dashboard edit, and no
+  # spec edit.
+  #
+  # `hide-ltv` masks a property of `Customer`, and this deployment's one load is of
+  # `DailySalesPerformance` — so the refresh button goes on working. A mask over the type an entry
+  # loads refuses that entry, per entry rather than per deployment, which is exactly what keeps
+  # those two facts independent. See `ingest/result.py:MASKED_PROPERTY`.
+  #
+  # policies:
+  #   - name: hide-ltv
+  #     objectType: Customer
+  #     mask: [ltv]
+  #   - name: current-customers-only
+  #     objectType: Customer
+  #     rows: "object.tier != 'closed'"

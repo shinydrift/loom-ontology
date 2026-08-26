@@ -18,6 +18,7 @@ from pathlib import Path
 
 import yaml
 
+from . import _yaml
 from ._shape import check_keys, require, suggest
 from .auth import BUILT_IN_CLAIMS, CLAIM_TYPES, MAX_SKEW, ClaimType
 from .errors import Diagnostics, SourceLoc
@@ -422,7 +423,7 @@ def load_config(path: str | Path, diag: Diagnostics) -> LoomConfig | None:
     path = Path(path)
     loc = SourceLoc(str(path))
     try:
-        doc = yaml.safe_load(path.read_text())
+        doc = _yaml.load(path.read_text())
     except OSError as e:
         diag.error(f"cannot read {CONFIG_FILENAME}: {e}", loc)
         return None

@@ -146,7 +146,23 @@ class ToolSpec:
 
         Checked against `input_schema` rather than against a second list, so the enforcement cannot
         drift from what `on_list_tools` advertises: `additionalProperties: False` is what every
-        generated schema already claims, and this is that claim becoming true."""
+        generated schema already claims, and this is that claim becoming true.
+
+        **`type` is the other claim, and it became true later.** Names were checked and types were
+        not, so an argument of the wrong JSON type reached the handler and came back as whatever
+        Python did with it there: `{"limit": "2"}` as `TypeError: '<' not supported between
+        instances of 'str' and 'int'`, `{"parameters": "customer=c2"}` as `AttributeError: 'str'
+        object has no attribute 'get'` — the Python exceptions this surface stopped handing agents
+        everywhere else — and `{"limit": true}` as neither, serving one row and echoing `"limit":
+        true` back in a field that promises the page size. Same rule as `additionalProperties`:
+        what the schema says is what the tool accepts.
+
+        Two deliberate holes in it. A key whose value is `null` is treated as absent rather than
+        refused, because a client filling every optional argument with `null` is asking for the
+        default and the handlers already read it that way. And `filter` and `via` are skipped, for
+        the reason the paragraph above skips their contents: `Resolver._filters` and `Resolver._via`
+        name the object type, the link and the properties available, which a sentence generated from
+        `{"type": "object"}` cannot."""
         if self.input_schema.get("additionalProperties") is not False:  # pragma: no cover - all are
             return None
         accepted = self.input_schema.get("properties") or {}
@@ -158,10 +174,62 @@ class ToolSpec:
             return (
                 f"{named} {what} of '{self.name}' — {hint or 'accepted: ' + (', '.join(accepted) or 'none')}"
             )
-        missing = [k for k in self.input_schema.get("required") or () if k not in arguments]
+        # `null` on a required argument is missing rather than wrongly typed: there is no default
+        # for it to be asking for, and "requires 'key'" is the sentence that says what to do.
+        missing = [k for k in self.input_schema.get("required") or () if arguments.get(k) is None]
         if missing:
             return f"'{self.name}' requires {', '.join(repr(k) for k in missing)}"
+        for name, value in arguments.items():
+            refusal = _type_refusal(name, accepted[name], value)
+            if refusal:
+                return refusal
         return None
+
+
+_OWN_REFUSAL = frozenset({"filter", "via"})
+"""Arguments whose own enforcer says it better — see `ToolSpec.argument_refusal`."""
+
+_JSON_TYPE_ACCEPTS: dict[str, tuple[type, ...]] = {
+    "string": (str,),
+    "integer": (int,),
+    "number": (int, float),
+    "boolean": (bool,),
+    "object": (dict,),
+    "array": (list,),
+}
+"""What a declared JSON type accepts of a decoded body. `bool` is handled separately below: it is a
+subclass of `int` in Python and nothing else in this table, so `{"limit": true}` would otherwise be
+an integer here and a boolean everywhere a caller reads the answer."""
+
+
+def _json_type_name(value: Any) -> str:
+    """What a decoded value would be called in the schema it failed."""
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, float):
+        return "number"
+    for name, types in _JSON_TYPE_ACCEPTS.items():
+        if name != "number" and isinstance(value, types):
+            return name
+    return type(value).__name__  # pragma: no cover - a decoded JSON body holds nothing else
+
+
+def _type_refusal(name: str, schema: Mapping[str, Any], value: Any) -> str | None:
+    """Why this argument's value is not the type the schema advertises for it, or None."""
+    if name in _OWN_REFUSAL or value is None:
+        return None
+    declared = schema.get("type")
+    options = [declared] if isinstance(declared, str) else list(declared or ())
+    accepted = tuple(t for opt in options for t in _JSON_TYPE_ACCEPTS.get(opt, ()))
+    if not accepted:  # a schema that names no type accepts anything
+        return None
+    # A boolean is only ever a boolean, whatever Python thinks of `bool` and `int`.
+    fits = "boolean" in options if isinstance(value, bool) else isinstance(value, accepted)
+    if fits:
+        return None
+    wanted = " or ".join(options)
+    detail = f" ({schema['format']})" if schema.get("format") else ""
+    return f"'{name}' takes {wanted}{detail}, got {_json_type_name(value)}"
 
 
 def snake_case(api_name: str) -> str:

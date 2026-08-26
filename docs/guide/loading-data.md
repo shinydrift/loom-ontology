@@ -112,6 +112,42 @@ Three consequences worth knowing:
 It checks no referential integrity, and says so: ordering customers before orders makes the *result*
 coherent, but Loom has no cross-table constraint and this does not add one.
 
+## Where governance meets a load
+
+Three places, and none of them narrows a batch — every one of them refuses it.
+
+**A deployment whose `governance.policies` do not fit the ontology refuses to load**, in the same
+words `loom query`, `loom run`, `loom serve` and `loom embed` refuse to start — a mask naming a
+property an action writes, a `rows:` predicate naming a claim nobody declared. The pairing is
+checked before any entry runs, so bulk writes cannot be the one plane still moving under a
+configuration the rest of the deployment will not stand on.
+
+**A `mask:` over the object type an entry loads refuses that entry**, reported as a
+`masked_property` failure before the file is opened:
+
+```
+$ loom ingest customers customers.ndjson examples/retail/ontology   # governance masks Customer.ltv
+error: masked_property: ingest 'customers' loads Customer, and governance withholds
+'Customer.ltv' (policy 'hide-ltv') — a load writes what this deployment says nobody may read.
+Withhold the property or declare the load, not both
+refused · 0 row(s) into crm.customers
+```
+
+This is the rule the action plane already states, said on the plane that writes whole tables. A
+masked column is absent from every tool, from `loom query` and from every action's `before`/`after`
+— so a value a load puts there can never be read back by anybody reading this deployment, including
+the operator who would have noticed it was wrong.
+
+It is refused **per entry**, not per deployment, and that is what makes a governed deployment still
+usable: the retail dashboard masks `Customer.ltv` and refreshes `DailySalesPerformance` through an
+entry of its own, so `POST /api/refresh` goes on working while a `customers` load refuses. A
+`--dry-run` reports the same refusal, because the point of a dry run is to answer *would this
+work* without opening the file.
+
+**A `rows:` predicate does not touch a load at all.** It decides which rows a deployment will
+*show*, which is not a claim about which rows may exist — and a load has no caller for it to be
+deciding about. What a `rows:` policy governs is every read of what the load landed.
+
 ---
 
 Next: [an app on top of it](./dashboard.md) — the same ontology with a UI in front.

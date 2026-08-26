@@ -15,6 +15,7 @@ from pathlib import Path
 
 import yaml
 
+from . import _yaml
 from ._shape import check_keys as _check_keys
 from ._shape import require as _require
 from ._shape import suggest as _suggest
@@ -66,10 +67,37 @@ def load_dir(root: str | Path, diag: Diagnostics) -> _Loaded:
     the config layer. Loading it as a spec is what turned it into `a spec file must declare
     exactly one of ('objectType', 'linkType', 'action')` on every command — a fatal error naming
     neither file's real job. Only the one at `root` is skipped: a nested `loom.yaml` is not a
-    location `find_config` would ever read, so silently ignoring it would be the worse answer."""
+    location `find_config` would ever read, so silently ignoring it would be the worse answer.
+
+    **The path itself is checked, because `rglob` does not.** A `Path.rglob` over a directory that
+    is not there yields nothing and raises nothing, so every command read a mistyped path as an
+    ontology that declares nothing — and the one command whose whole job is to say so, `loom
+    validate`, answered `ok — 0 object type(s), 0 link type(s), 0 action(s)` and exited 0. That is
+    the wrong answer twice over: it is the command an operator wires into CI so that a spec problem
+    stops a pipeline, and *the directory you named is not there* is the problem it would most like
+    to be told about. An empty directory is refused on the same footing — a path holding no spec
+    files is a typo rather than an ontology of nothing, and nothing downstream has a use for the
+    latter."""
     root = Path(root)
     config = (root / CONFIG_FILENAME).resolve()
+    if not root.exists():
+        diag.error("no ontology directory at this path", SourceLoc(str(root)))
+        return _Loaded()
+    if not root.is_dir():
+        diag.error(
+            "this is a file, and an ontology is a directory of spec files — point loom at the "
+            "directory that holds it",
+            SourceLoc(str(root)),
+        )
+        return _Loaded()
     files = sorted(p for p in root.rglob("*.yaml")) + sorted(p for p in root.rglob("*.yml"))
+    if not [f for f in files if f.resolve() != config]:
+        diag.error(
+            f"no spec files here — an ontology is one or more *.yaml files, each declaring one "
+            f"of {KINDS}",
+            SourceLoc(str(root)),
+        )
+        return _Loaded()
     out = _Loaded()
     for f in files:
         if f.resolve() == config:
@@ -81,7 +109,7 @@ def load_dir(root: str | Path, diag: Diagnostics) -> _Loaded:
 def _load_file(path: Path, diag: Diagnostics, out: _Loaded) -> None:
     rel = str(path)
     try:
-        doc = yaml.safe_load(path.read_text())
+        doc = _yaml.load(path.read_text())
     except yaml.YAMLError as e:
         diag.error(f"invalid YAML: {e}", SourceLoc(rel))
         return

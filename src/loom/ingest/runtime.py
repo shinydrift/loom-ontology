@@ -29,19 +29,31 @@ Four boundaries this file is careful about:
   across. Here there is no read to project at all in two of three modes — a load is values arriving
   from outside, and the only thing that decides whether they may become rows is the type system.
 
-- **Governance does not condition a load, and that is stated rather than assumed.** A `mask:`
-  withholds a property from a caller and a load has no caller; a `rows:` predicate decides which rows
-  a deployment will *show*, which is not a claim about which rows may exist. Conditioning a load on
-  either would be inventing a meaning for them that §6.1 never gave them — and a `when:` guard is
+- **A `rows:` predicate does not condition a load, and that is stated rather than assumed.** It
+  decides which rows a deployment will *show*, which is not a claim about which rows may exist;
+  conditioning a load on one would be inventing a meaning §6.1 never gave it — and a `when:` guard is
   unanswerable here for the reason `loom run` cannot answer one: there is no transport, so there is
-  nobody to attest. What governs ingest is `governance.ingest`, which is a posture about the
-  deployment, and `governance.edit_log`, which is a demand that it be able to say what it did.
+  nobody to attest. What otherwise governs ingest is `governance.ingest`, a posture about the
+  deployment, and `governance.edit_log`, a demand that it be able to say what it did.
 
-  The one place this could have gone the other way is a mask over a property an entry loads. The
-  action runtime refuses that pairing at bind time — an action that reads or writes a masked property
-  makes the deployment refuse to start — and the reason is leak-through-report: `before` and `after`
-  would carry the value back out. A load's record carries counts and a fingerprint and no values at
-  all, so there is nothing to leak and nothing to refuse.
+  **A `mask:` over a property an entry loads does refuse that entry**, and this paragraph used to say
+  the opposite. The case for allowing it was leak-through-report: the action runtime refuses a masked
+  property at bind time because `before` and `after` would carry the value back out, and a load's
+  record carries counts and a fingerprint and no values at all — nothing leaks, so nothing to refuse.
+  That argument is sound and answers a different question. A mask is not only a rule about
+  disclosure; paired with a write it is two statements about one column, and the write is the half
+  nobody can check. A masked column is absent from every tool, every `loom query` and every action's
+  `before`/`after`, so whatever a load puts there cannot be read back by anyone reading this
+  deployment — including the operator who would notice it was wrong. "Withhold the property or
+  perform the write, not both" is the rule the action plane already states, and the plane that writes
+  whole tables is the last one that should be exempt from it.
+
+  Refused **per entry**, where the action refusal is per deployment, because that is the unit each
+  one can decide: an action names in its own effects the properties it writes, and an entry names an
+  object type while a file supplies the columns. Refusing the deployment would also take down loads
+  of every *other* type — including the ones a governed deployment exists to keep running, which the
+  retail dashboard is exactly: it masks `Customer.ltv` and refreshes `DailySalesPerformance` on a
+  timer. See `result.MASKED_PROPERTY`.
 
 - **It never invents an actor.** `default_actor()` is honest for `loom ingest` — a person at a
   terminal or a CI job that set `LOOM_ACTOR` — and is called by the CLI rather than here, so that a
@@ -83,6 +95,7 @@ from .result import (
     DUPLICATE_LOAD,
     FAILED,
     LOG_FAILED,
+    MASKED_PROPERTY,
     MISSING_COLUMN,
     NULL_KEY,
     PREVIEWED,
@@ -122,6 +135,14 @@ class IngestRuntime:
     catalogs: Mapping[str, Catalog]
     entries: Mapping[str, IngestEntry] = field(default_factory=dict)
     posture: str = INGEST_ALLOWED
+    masks: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    """What `governance.policies` withholds, by object type and property, naming the policy.
+
+    Read from the bound `PolicyProgram` rather than from the config: a mask is refused at bind time
+    if it names a property no type declares, so what arrives here is already true of this ontology.
+    Masks and not the row predicates, because they are the only half of a policy this plane can
+    answer — a mask is caller-independent by construction (`when:` is refused on one), while a
+    `rows:` predicate exists to decide what a *caller* is shown and a load has no caller."""
 
     def load(
         self,
@@ -210,6 +231,25 @@ class _Load:
                 f"this deployment does not perform bulk loads — 'governance.ingest' is "
                 f"'{self.rt.posture}'",
                 {"entry": self.entry.name},
+            )
+            return self._result(REFUSED, source=str(source))
+
+        withheld = self.rt.masks.get(self.target.api_name) or {}
+        if withheld:
+            # After the posture and before the file, for the posture's own reason: a deployment
+            # that will not perform this load has no business reading somebody's data to say so.
+            # The posture comes first because it is the broader sentence — *this deployment does
+            # not bulk-load at all* answers the question that would otherwise be asked per entry.
+            named = ", ".join(
+                f"'{self.target.api_name}.{prop}' (policy '{policy}')"
+                for prop, policy in withheld.items()
+            )
+            self._fail(
+                MASKED_PROPERTY,
+                f"ingest '{self.entry.name}' loads {self.target.api_name}, and governance "
+                f"withholds {named} — a load writes what this deployment says nobody may read. "
+                f"Withhold the property or declare the load, not both",
+                {"entry": self.entry.name, "properties": sorted(withheld)},
             )
             return self._result(REFUSED, source=str(source))
 
@@ -779,10 +819,25 @@ def build_ingest(
     **`governance.edit_log: required` is checked here as well as in `build_runtime`**, and only when
     the posture permits loads: proving a log a deployment will never write would create
     `_loom_meta.loads` in every catalog of every deployment that declared an entry and meant it for
-    later. See `log.require_load_log` for what that posture can honestly claim."""
+    later. See `log.require_load_log` for what that posture can honestly claim.
+
+    **And `governance.policies` is bound here**, for two things. The first is the binding itself:
+    `bind_policies` is where a policy is checked against the spec it governs, and a deployment whose
+    governance does not fit is one `loom query`, `loom run`, `loom serve` and `loom embed` all refuse
+    to start. Without this call `loom ingest` was the exception — and an exception on the plane that
+    writes whole tables, so a mask naming a property an action writes took the read surface down and
+    left bulk loads running. "Every static refusal lives here" is what this function claims, and a
+    policy that does not fit the ontology is one of them.
+
+    The second is `program.masks`, which the runtime carries and every load consults — see the module
+    docstring and `result.MASKED_PROPERTY`. Only the masks: they are the caller-independent half of a
+    policy, and the other half decides what a caller is *shown*, which a load has nobody to be."""
     from ..catalog import open_catalogs
+    from ..governance import bind_policies
 
     open_cats = catalogs if catalogs is not None else open_catalogs(config)
+    auth = config.mcp.auth
+    program = bind_policies(ontology, config.policies, auth.claims if auth else {})
     entries = _resolve(ontology, config.ingest)
     posture = config.ingest_posture
     if posture == INGEST_ALLOWED and config.edit_log == EDIT_LOG_REQUIRED:
@@ -791,7 +846,11 @@ def build_ingest(
             [ontology.object_types[e.object_type].backing_catalog for e in entries.values()],
         )
     return IngestRuntime(
-        ontology=ontology, catalogs=open_cats, entries=entries, posture=posture
+        ontology=ontology,
+        catalogs=open_cats,
+        entries=entries,
+        posture=posture,
+        masks=program.masks,
     )
 
 

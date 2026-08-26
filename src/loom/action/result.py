@@ -190,9 +190,19 @@ class ActionResult:
         claim on the table — that the row is being held while somebody decides. It is not. The run
         that follows a preview does its own read, and that read is what gets asserted. This is the
         same rule the previous slice set when it refused to print a bare snapshot id: the sentence
-        beside the number is load-bearing."""
+        beside the number is load-bearing.
+
+        A refusal is the same argument reaching one status further. Steps 1-3 are where everything
+        that refuses happens, so a refused run that is not a conflict never reached a write for a
+        check to be carried into — and it says so beside a `readSnapshotId` that is often `null`,
+        because a run refused at bind time never read either. "Enforced" there claims a check on a
+        snapshot that does not exist. A **conflict** keeps the original sentence and is the reason
+        this is not a plain `status != APPLIED`: it refused precisely because the assertion was
+        carried in and the snapshot had moved, which is the check working rather than skipped."""
         if self.status == PREVIEWED:
             return "not checked — a preview writes nothing, and holds nothing"
+        if self.status == REFUSED and not self.retryable:
+            return "not reached — this run refused before the write, so nothing was asserted"
         return "enforced — the write asserts the snapshot the read saw"
 
     def as_json(self) -> dict[str, Any]:

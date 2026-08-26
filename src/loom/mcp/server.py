@@ -293,8 +293,16 @@ def build_mcp_server(loom_server: LoomMCPServer):
         if writable
         else " This deployment is read-only: no action is exposed."
     )
+    # The build that generated this surface, in the one field the protocol has for it. It is the
+    # same `loom_version` stamped into every recorded apply, every recorded load and every edit-log
+    # row, and printed by `loom --version` — so a client asking a live server which Loom it is
+    # talking to and an auditor reading what that server wrote cannot get two answers. Left empty,
+    # the SDK reports `version: ""` and substitutes nothing.
+    from ..migrate.meta import loom_version
+
     server: Server = Server(
         loom_server.server_name,
+        version=loom_version(),
         instructions=(
             "This server exposes a Loom ontology: typed objects, declared links, and governed "
             "reads. Use get_/search_/list_ tools for objects and `traverse` to follow a link. "
