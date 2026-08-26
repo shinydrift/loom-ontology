@@ -42,10 +42,13 @@ from .catalog.base import VECTOR_KEY_COLUMN, vector_table
 from .embed.store import (
     DIMS_COLUMN,
     EMBEDDED_AT_COLUMN,
+    HASH_COLUMN,
     MODEL_COLUMN,
     PROPERTY_COLUMN,
     VECTOR_COLUMN,
+    embeddable,
     oldest,
+    source_hash,
 )
 from .filters import FilterError
 from .filters import lower as lower_filter
@@ -97,6 +100,7 @@ _LINK_THROUGH = "lm"  # `lm0`, … — that hop's mapping table, when the link d
 # this line they are already separated, Loom's word beside the object rather than inside it.
 _SCORE_OUTPUT = "_loom_score"
 _STAMP_OUTPUT = "_loom_embedded_at"
+_HASH_OUTPUT = "_loom_source_hash"
 
 
 def _unique(base: str, taken: Container[str]) -> str:
@@ -118,10 +122,19 @@ class Ranked:
     **The score sits beside the object rather than inside it**, which is §7's namespace rule reaching
     the result. The object is the spec's vocabulary and `score` is Loom's, so putting one inside the
     other would let a declared property called `score` shadow the only thing this read adds — and,
-    worse, would do it silently on exactly the ontologies most likely to have one."""
+    worse, would do it silently on exactly the ontologies most likely to have one.
+
+    `stale` says the vector that earned this score was made from text this row no longer has, and it
+    sits beside the score for the same namespace reason. It is the one thing a ranked row can be
+    wrong about that reading the row does not reveal: the object carries the text as it is *now*, so
+    a stale match is returned looking exactly like a good one, scored against a sentence that is
+    gone. M10 named the other failure of a sidecar behind its rows — `match_` silently omits a row
+    that was never embedded — and left the operator to keep the reconcile ahead of the writes. This
+    one it did not name, and unlike an omission it is visible from inside the answer."""
 
     score: float
     object: dict
+    stale: bool = False
 
 
 @dataclass(frozen=True)
@@ -140,6 +153,15 @@ class MatchResult:
     model: str
     matches: tuple[Ranked, ...] = ()
     embedded_as_of: datetime | None = None
+
+    @property
+    def stale_matches(self) -> int:
+        """How many rows on this page were ranked by text they no longer hold.
+
+        The count is the operator's reading and `Ranked.stale` is the caller's — the same split
+        `embedded_as_of` already draws between `loom embed`'s sidecar-wide number and this
+        envelope's per-page one."""
+        return sum(1 for m in self.matches if m.stale)
 
 
 _REVERSED_CARDINALITY = {"many_to_one": "one_to_many", "one_to_many": "many_to_one"}
@@ -368,6 +390,7 @@ class Resolver:
         taken = {c.output for c in columns}
         score_as = _unique(_SCORE_OUTPUT, taken)
         stamp_as = _unique(_STAMP_OUTPUT, taken | {score_as})
+        hash_as = _unique(_HASH_OUTPUT, taken | {score_as, stamp_as})
         plan = Project(
             source=Match(
                 table=self._table(obj, _TARGET),
@@ -384,16 +407,39 @@ class Resolver:
                 limit=self._page_size(limit),
                 offset=self._offset(offset),
             ),
-            columns=(*columns, Column(alias=_VECTORS, column=EMBEDDED_AT_COLUMN, output=stamp_as)),
+            columns=(
+                *columns,
+                Column(alias=_VECTORS, column=EMBEDDED_AT_COLUMN, output=stamp_as),
+                # **The staleness axis, taken over the page rather than over the sidecar.** M10
+                # refused a count of unembedded rows because it needs an anti-join over the whole
+                # admitted set on every call, and refused a sidecar-wide `embedded_as_of` because
+                # "an envelope describes the answer it is attached to". Both reasons permit this
+                # one: the rows are already in hand and the semantic column is already projected —
+                # it is what the caller reads — so re-hashing it costs no read at all.
+                Column(alias=_VECTORS, column=HASH_COLUMN, output=hash_as),
+            ),
         )
 
         matches: list[Ranked] = []
         stamps: list[Any] = []
+        # `len(vector)` and not a number read from the sidecar: `source_hash` folds in the width the
+        # *deployment* embeds at, and the query vector is that width by construction. A row stored at
+        # some other width was never admitted by the comparability guard, so it cannot be here.
+        dims = len(vector)
         for row in self._run(plan):
             data = dict(row)
             score = data.pop(score_as)
             stamps.append(data.pop(stamp_as, None))
-            matches.append(Ranked(score=float(score), object=data))
+            stored = data.pop(hash_as, None)
+            text = embeddable(data.get(prop.name))
+            # A row whose text is now blank is stale rather than fresh: `embeddable` calls that the
+            # absence of text, so the vector still standing for it describes something removed.
+            # Unknown rather than stale when the sidecar predates the column — these tables are only
+            # ever created, so a hash-less row is one Loom cannot decide about and must not accuse.
+            fresh = stored is None or (
+                text is not None and str(stored) == source_hash(text, model, dims)
+            )
+            matches.append(Ranked(score=float(score), object=data, stale=not fresh))
         return MatchResult(
             object_type=obj.api_name,
             property=prop.name,

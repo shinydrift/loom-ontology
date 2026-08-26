@@ -158,6 +158,25 @@ The retry guard, and the reason a load has an id at all. See `ingest.log.derive_
 id is when nobody supplies one, and why re-running the same file through the same entry is a refusal
 rather than a second load."""
 
+EMPTY_REPLACE = "empty_replace"
+"""A `replace` whose every row was quarantined, so the batch it would write is empty.
+
+**`--reject-to` can manufacture the zero-row batch `source.Batch` refuses to read off disk**, and
+this is the guard on the other side of it. That docstring's argument is that a truncated upload and a
+deliberate empty batch are the same zero bytes, so an empty NDJSON fails the ordinary column check
+rather than emptying a table. A quarantine reaches the same state by a different road: the columns
+were all there, every row failed its own type check, and what is left to write is nothing. Under
+`append` and `merge` that is a no-op; under `replace` it is a truncate, and it was reported
+`applied`.
+
+Refused **before** the quarantine file is written, which is the ordering `_Run.execute` already
+argues for: a file describing a subset of a batch that was then declined whole is "the one reading of
+`--reject-to` that is not true", and a batch every row of which was set aside is declined whole.
+
+It is not the same failure as a batch that legitimately shrinks. A `replace` that quarantines two of
+ten rows really does mean *this table is now those eight*, which is what the mode says it does.
+Nothing survives is the case where the flag stops absorbing rows and starts deciding the table."""
+
 QUARANTINABLE = frozenset({TYPE_ERROR, NULL_KEY})
 """The codes `--reject-to` may set a row aside over instead of refusing the whole batch.
 

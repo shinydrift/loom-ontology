@@ -98,6 +98,8 @@ loom serve — 4 object type(s), 3 link type(s), 4 action(s) → 14 tool(s) over
      and it grows with the embedded rows rather than with the answer)
     (a row with no vector is absent from match_, silently — `loom embed` is what reports how many,
      and how far behind)
+    (a row edited since it was embedded is not absent — it comes back marked `stale`, ranked by the
+     text it had then and carrying the text it has now)
 ```
 
 `match_support_ticket` is there because one property in the spec says `semantic: body` and this

@@ -170,6 +170,22 @@ gets re-litigated by whoever builds it.
   row that exists, so the honesty moves from the caller to the operator, and the reconcile has to be
   reliable rather than best-effort. The count goes to `loom embed`'s output and the banner.
 
+  **This named one failure of a sidecar behind its rows and there are two.** *(Found by the fourth
+  end-user probe, and fixed there.)* Omission is what happens to a row that was never embedded. A
+  row **edited after** it was embedded is not omitted: it is ranked by text that is gone and returned
+  carrying the text that replaced it, so a caller holds the evidence the score is wrong and nothing
+  in the answer says so — a ticket rewritten from a double charge into *"cancel my cheese club
+  subscription"* still came back top for *"I was charged twice and want my money back"*. `embeddedAsOf`
+  cannot separate the two cases: it is the same stamp either way.
+
+  So the envelope gained `staleMatches` and each match gained `stale`, and both pass the test the
+  count failed. A caller **can** act on this one — it is holding the row, so it can discount the
+  score or read the text itself — and it costs no extra read: the rows are already in hand and the
+  semantic column is already projected, because it is what the caller reads. Which is the same
+  standard `embeddedAsOf` is held to, *an envelope describes the answer it is attached to*, arriving
+  at the opposite answer for a different question. The count-of-unembedded-rows decision is untouched:
+  that one is still about rows nobody was shown.
+
 - **A model change refuses and names the flag** — `--remodel`. Deliberately unlike `loom apply`,
   which refuses a breaking plan with *no* force flag: there no safe version of the operation exists,
   and here it is merely expensive and reversible.

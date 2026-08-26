@@ -254,9 +254,18 @@ def cmd_query(args) -> int:
         # The two facts the tool's envelope carries and a bare list of rows cannot: what model the
         # ranking is relative to, and how current the oldest vector behind it is.
         stamp = _zulu(ranked.embedded_as_of) if ranked.embedded_as_of else "never"
+        # The third fact, and the only one that is about the rows above being *wrong*: a stale row
+        # is returned carrying the text it has now, scored by the text it had then, so nothing in
+        # the JSON above distinguishes it from a good hit.
+        behind = (
+            f" · {ranked.stale_matches} of these ranked by text the row no longer has — "
+            f"`loom embed`"
+            if ranked.stale_matches
+            else ""
+        )
         print(
             f"(ranked by {ranked.object_type}.{ranked.property} against '{ranked.model}' · "
-            f"oldest vector here embedded {stamp})",
+            f"oldest vector here embedded {stamp}{behind})",
             file=sys.stderr,
         )
     print(f"({len(rows)} row(s))", file=sys.stderr)
@@ -1069,6 +1078,10 @@ def _semantic_mode(config, ontology) -> list[str]:
         # guessing it: the ranked surface deliberately does not count unembedded rows per call.
         "  (a row with no vector is absent from match_, silently — `loom embed` is what reports "
         "how many, and how far behind)",
+        # The other half of the same sidecar being behind, and the half a caller *can* act on: an
+        # edited row is not absent, it is ranked by text it no longer has.
+        "  (a row edited since it was embedded is not absent — it comes back marked `stale`, ranked "
+        "by the text it had then and carrying the text it has now)",
     ]
 
 
