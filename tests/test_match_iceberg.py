@@ -240,6 +240,96 @@ def test_a_row_with_no_text_is_simply_absent(project):
     assert len(result.matches) == 5
 
 
+def test_a_row_edited_after_it_was_embedded_comes_back_marked_stale(project):
+    """The failure mode M10 did not name, and the one an omission cannot become.
+
+    A row that was never embedded is *absent* — the milestone accepted that out loud. A row whose
+    text changed after it was embedded is not absent: it is ranked by a sentence that is gone and
+    returned carrying the sentence that replaced it, so the caller is holding the evidence the score
+    is wrong and nothing in the answer says so. `t1` here is rewritten from a refund into a delivery
+    complaint, and still answers the refund question off its dead vector."""
+    ontology, config, root = project
+    cats, provider = _embedded(project)
+    from pyiceberg.catalog.sql import SqlCatalog
+
+    catalog = SqlCatalog("local", uri=config.catalogs["local"].uri, warehouse=config.catalogs["local"].warehouse)
+    table = catalog.load_table("support.tickets")
+    rows = table.scan().to_arrow().to_pylist()
+    for row in rows:
+        if row["id"] == "t1":
+            row["body"] = "the courier left the parcel by the bins"
+    table.overwrite(pa.Table.from_pylist(rows, schema=SCHEMA))
+
+    resolver = build_resolver(ontology, config, open_catalogs(config))
+    result = _matcher(provider, cats).match(resolver, "Ticket", "money back from the bank")
+
+    top = result.matches[0]
+    assert top.object["ticketId"] == "t1"  # still first, off a vector for text it no longer holds
+    assert top.object["body"] == "the courier left the parcel by the bins"
+    assert top.stale is True
+    assert result.stale_matches == 1
+    # And every row nobody touched is unmarked, so the flag is about the row and not about the run.
+    assert [m.stale for m in result.matches[1:]] == [False] * (len(result.matches) - 1)
+
+
+def test_a_current_sidecar_marks_nothing_stale(project):
+    """The control: staleness is a comparison against the text as it is *now*, so a reconcile that
+    is level with its rows marks none of them — including `t3`, whose text no query here is near."""
+    result = _ranked(project, "money back from the bank")
+    assert result.stale_matches == 0
+    assert not any(m.stale for m in result.matches)
+
+
+def test_a_row_whose_text_was_blanked_is_stale_rather_than_fresh(project):
+    """`embeddable` calls null and blank *the absence of text*, so a vector still standing for a
+    blanked row describes something that was removed. It is the same shape as an edit and not the
+    same shape as a row that was never embedded, which is why it is marked rather than dropped:
+    the row is in the answer, wearing a score earned by prose nobody can read any more."""
+    ontology, config, root = project
+    cats, provider = _embedded(project)
+    from pyiceberg.catalog.sql import SqlCatalog
+
+    catalog = SqlCatalog("local", uri=config.catalogs["local"].uri, warehouse=config.catalogs["local"].warehouse)
+    table = catalog.load_table("support.tickets")
+    rows = table.scan().to_arrow().to_pylist()
+    for row in rows:
+        if row["id"] == "t1":
+            row["body"] = "   "
+    table.overwrite(pa.Table.from_pylist(rows, schema=SCHEMA))
+
+    resolver = build_resolver(ontology, config, open_catalogs(config))
+    result = _matcher(provider, cats).match(resolver, "Ticket", "money back from the bank")
+    stale = {m.object["ticketId"] for m in result.matches if m.stale}
+    assert stale == {"t1"}
+
+
+def test_the_generated_tool_says_which_matches_are_stale(project):
+    """The envelope's half of it. `staleMatches` is the operator's count and `stale` on a match is
+    the caller's — the same split `embeddedAsOf` already draws between `loom embed`'s sidecar-wide
+    number and this envelope's per-page one. A current sidecar carries neither key on a match, so
+    the ordinary answer keeps the shape it has always had."""
+    ontology, config, root = project
+    cats, provider = _embedded(project)
+    from pyiceberg.catalog.sql import SqlCatalog
+
+    catalog = SqlCatalog("local", uri=config.catalogs["local"].uri, warehouse=config.catalogs["local"].warehouse)
+    table = catalog.load_table("support.tickets")
+    rows = table.scan().to_arrow().to_pylist()
+    for row in rows:
+        if row["id"] == "t1":
+            row["body"] = "the courier left the parcel by the bins"
+    table.overwrite(pa.Table.from_pylist(rows, schema=SCHEMA))
+
+    tool = _rebuilt_tool(ontology, config, open_catalogs(config), provider)
+    envelope, is_error = _call(tool, {"text": "money back from the bank"})
+
+    assert is_error is False
+    assert envelope["staleMatches"] == 1
+    assert envelope["matches"][0]["stale"] is True
+    assert "stale" not in envelope["matches"][1]
+    assert "`stale: true`" in tool.description
+
+
 def test_every_object_comes_back_as_its_declared_properties(project):
     result = _ranked(project, "money back")
     assert set(result.matches[0].object) == {"ticketId", "body", "severity", "queue"}

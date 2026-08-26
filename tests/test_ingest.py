@@ -40,6 +40,7 @@ from loom.ingest.result import (
     DEPLOYMENT_REFUSED,
     DUPLICATE_KEY,
     DUPLICATE_LOAD,
+    EMPTY_REPLACE,
     FAILED,
     LOG_FAILED,
     MISSING_COLUMN,
@@ -884,6 +885,11 @@ def test_a_header_only_csv_is_a_batch_of_zero_rows(ontology, tmp_path):
     assert result.status == APPLIED
     assert result.rows_read == 0
     assert catalog.rows["crm.customers"] == []
+    # The load that emptied a table has to name the file that emptied it. `Batch.__len__` is the row
+    # count, so a zero-row batch is *falsy* — and the result read `batch.path if batch else ""`,
+    # which meant this exact operation, the sanctioned way to say *these columns and no rows*,
+    # recorded `applied` citing no source at all.
+    assert result.source == str(path)
 
 
 def test_an_empty_ndjson_declares_no_columns_and_is_refused(ontology, tmp_path):
@@ -895,6 +901,89 @@ def test_an_empty_ndjson_declares_no_columns_and_is_refused(ontology, tmp_path):
     assert result.status == REFUSED
     assert {f.code for f in result.failures} == {MISSING_COLUMN}
     assert len(catalog.rows["crm.customers"]) == 2  # nothing was wiped
+    assert result.source == str(path)  # and the refusal names the file, zero rows or not
+
+
+def test_reject_to_will_not_let_a_replace_empty_a_table_it_could_not_fill(ontology, tmp_path):
+    """`--reject-to` can build the zero-row batch `Batch` refuses to read off disk.
+
+    Every row failed its own type check, so every row was quarantined — and under `replace` what
+    was left to write was nothing, which is a truncate rather than a load. It applied, reported
+    `applied · 0 row(s)`, and took the table with it. The flag absorbs rows; a batch none of whose
+    rows survive is not a narrower load, it is a different operation."""
+    catalog = FakeBulkCatalog()
+    rows = [{**GOOD[0], "tier": "platinum"}, {**GOOD[1], "tier": "platinum"}]
+    rejects = tmp_path / "rejects.ndjson"
+    result = runtime(ontology, catalog, [entry(mode="replace")]).load(
+        "customers", ndjson(tmp_path, rows), reject_to=rejects
+    )
+
+    assert result.status == REFUSED
+    assert EMPTY_REPLACE in [f.code for f in result.failures]
+    assert len(catalog.rows["crm.customers"]) == 2
+    assert catalog.writes == []
+    # Refused whole, so no quarantine file is left describing a subset of a batch nobody loaded.
+    assert not rejects.exists()
+
+
+def test_the_same_batch_under_append_is_still_an_ordinary_quarantine(ontology, tmp_path):
+    """The control on the rule above: `append` and `merge` put no row over another, so writing
+    nothing is a no-op rather than a deletion. Only `replace` turns an empty batch into a decision
+    about the rows already there."""
+    catalog = FakeBulkCatalog()
+    rows = [{**GOOD[0], "tier": "platinum"}]
+    result = runtime(ontology, catalog).load(
+        "customers", ndjson(tmp_path, rows), reject_to=tmp_path / "r.ndjson"
+    )
+
+    assert result.status == APPLIED
+    assert (result.rows_read, result.rows_written, result.rows_rejected) == (1, 0, 1)
+
+
+def test_a_replace_that_keeps_some_rows_still_replaces(ontology, tmp_path):
+    """And the other control: a `replace` that quarantines two of three rows really does mean *this
+    table is now that one*, which is what the mode says. The refusal is about nothing surviving."""
+    catalog = FakeBulkCatalog()
+    rows = [GOOD[0], {**GOOD[1], "tier": "platinum"}]
+    result = runtime(ontology, catalog, [entry(mode="replace")]).load(
+        "customers", ndjson(tmp_path, rows), reject_to=tmp_path / "r.ndjson"
+    )
+
+    assert result.status == APPLIED
+    assert [r["id"] for r in catalog.rows["crm.customers"]] == ["c9"]
+
+
+def test_reject_to_writes_its_file_even_when_nothing_was_rejected(ontology, tmp_path):
+    """The quarantine file is an output of *this* run, so a clean run truncates it.
+
+    A run that left the path alone left the previous run's rejects sitting in it, and the shape the
+    flag exists for — `--reject-to r.ndjson` then `[ -s r.ndjson ]` — read yesterday's bad rows
+    while the envelope beside it said `rows_rejected: 0`."""
+    catalog = FakeBulkCatalog()
+    rejects = tmp_path / "rejects.ndjson"
+    rejects.write_text('{"customerId": "yesterday", "_loom_rejected": ["an earlier run"]}\n')
+    result = runtime(ontology, catalog).load(
+        "customers", ndjson(tmp_path, GOOD), reject_to=rejects
+    )
+
+    assert result.status == APPLIED
+    assert result.rows_rejected == 0
+    assert rejects.read_text() == ""
+
+
+def test_the_load_log_names_the_file_even_when_the_batch_had_no_rows(ontology, tmp_path):
+    """The durable half of the same defect. `_loom_meta.loads` keeps `source` and
+    `source_fingerprint` and nothing else about the data — "not the data, but enough to identify
+    the data" — and a zero-row batch kept only the fingerprint. Which is the wrong half to keep on
+    the one operation that empties a table: an auditor asking *which file did this* got `''`."""
+    path = tmp_path / "header.csv"
+    path.write_text("customerId,name,tier,ltv\n")
+    catalog = FakeBulkCatalog()
+    result = runtime(ontology, catalog, [entry(mode="replace", fmt="csv")]).load("customers", path)
+
+    assert result.status == APPLIED
+    assert catalog.loads[0]["source"] == str(path)
+    assert catalog.loads[0]["source_fingerprint"]
 
 
 def test_csv_values_are_strings_and_coerce_like_every_other_path(ontology, tmp_path):

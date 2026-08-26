@@ -93,6 +93,7 @@ from .result import (
     DEPLOYMENT_REFUSED,
     DUPLICATE_KEY,
     DUPLICATE_LOAD,
+    EMPTY_REPLACE,
     FAILED,
     LOG_FAILED,
     MASKED_PROPERTY,
@@ -304,14 +305,36 @@ class _Load:
         if self.failures and not self._only_row_failures():
             return self._refuse(catalog, identity, batch, snapshot=snapshot)
 
-        if self.rejected:
+        if self.rejected and not prepared and self.entry.mode == INGEST_REPLACE:
+            # The zero-row batch `source.Batch` refuses to read off disk, arrived at from the other
+            # side. Every row was set aside, so what a `replace` would write is nothing and the
+            # table's own rows are what would go — a truncate wearing an `applied`. Above the
+            # quarantine write on purpose: this batch was declined whole, and `--reject-to`'s file
+            # describes rows held back from a load, not a load that stopped being one.
+            self._fail(
+                EMPTY_REPLACE,
+                f"--reject-to set aside all {len(self.rejected)} row(s) the batch held, so a "
+                f"'replace' would write none — and every row now in '{table}' would be gone. A "
+                f"quarantine absorbs rows, not a batch; nothing was written and no quarantine file "
+                f"was left behind",
+                {"table": table, "mode": self.entry.mode, "rowsRejected": len(self.rejected)},
+            )
+            return self._refuse(catalog, identity, batch, snapshot=snapshot)
+
+        if reject_to is not None:
             # **After `_prepare`, not before it.** A quarantine file is the input to the next
             # attempt rather than a record of what happened, so it is written before the load
             # commits — but writing it before the last refusal could fire would leave a file on disk
             # describing a subset of a batch that was then declined whole, which is the one reading
             # of `--reject-to` that is not true.
+            #
+            # **Written even when nothing was rejected**, which is the other half of the same claim.
+            # The file is an output of *this* run, and a clean run that left the path alone left the
+            # previous run's rejects sitting in it — so the `--reject-to r.ndjson` / `[ -s r.ndjson ]`
+            # shape the flag exists for read yesterday's bad rows while the envelope beside it said
+            # `rowsRejected: 0`. Truncating says the same thing the envelope does.
             try:
-                write_rejects(reject_to, self.rejected)  # type: ignore[arg-type]
+                write_rejects(reject_to, self.rejected)
             except OSError as e:
                 self._fail(SOURCE_ERROR, f"could not write rejected rows to '{reject_to}': {e}")
                 return self._refuse(catalog, identity, batch, snapshot=snapshot)
@@ -789,7 +812,13 @@ class _Load:
             table=self.target.backing_table,
             status=status,
             load_id=load_id,
-            source=source if source is not None else (batch.path if batch else ""),
+            # `is not None`, not truthiness: `Batch.__len__` is the row count, so a batch with no
+            # rows is *falsy* while still knowing which file it came from. The neighbouring line
+            # below always got this right; this one did not, and a zero-row batch is exactly the
+            # case where the answer matters — a `replace` from a typed, empty Parquet is the
+            # sanctioned way to empty a table (see `source.Batch`), and it recorded the load that
+            # did it citing no file at all.
+            source=source if source is not None else (batch.path if batch is not None else ""),
             rows_read=len(batch) if batch is not None else 0,
             rows_written=written,
             # Reported only where the identity `rows_read == rows_written + rows_rejected` holds:

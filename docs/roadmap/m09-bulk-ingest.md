@@ -114,6 +114,22 @@ adding a source would be a large one about what Loom is.
   table. A header-only CSV or an empty Parquet table can say *these columns, and no rows*; NDJSON
   cannot, and both directions are tests.
 
+  **`--reject-to` could build the same empty batch from the other side, and the guard was missing.**
+  *(Found by the fourth end-user probe, and fixed there.)* Every row of a batch failing its own type
+  check — one enum value renamed upstream is enough — quarantined every row, left nothing to write,
+  and under `replace` wrote that nothing over the table: nine rows gone, reported `applied · 0
+  row(s)`. The columns were all present, so the check above never fired. `empty_replace` is the guard
+  where it belongs, and it is deliberately narrower than "a replace that writes no rows": a batch
+  whose file legitimately declares no rows is still the sanctioned way to empty a table, and a replace
+  that quarantines two of ten really does mean *this table is now those eight*. Nothing surviving is
+  where the flag stops absorbing rows and starts deciding the table.
+
+  Two smaller things came with it. The result of a zero-row batch named no source file at all — the
+  same `Batch.__len__` that makes the batch falsy made `batch.path if batch else ""` empty — so the
+  one durable record of the load that emptied a table cited no file. And the quarantine file is now
+  written even when nothing was rejected: it is an output of *this* run, and leaving the path alone
+  on a clean run left the previous run's rows in it, under an envelope saying `rows_rejected: 0`.
+
 **Two things review turned into decisions rather than fixes**, and both are about telling *absent*
 apart from *empty* — which is the shape of nearly everything that went wrong in this slice.
 

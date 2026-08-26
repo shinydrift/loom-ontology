@@ -638,10 +638,18 @@ def _match_tool(
             # an empty page that names a model is diagnosable where a bare empty page is not.
             "model": result.model,
             "embeddedAsOf": json_safe(result.embedded_as_of),
+            # How many of *these* rows were ranked by text they no longer hold. In, where a count of
+            # unembedded rows stayed out, because the two fail this surface's test differently: an
+            # agent cannot act on rows it was never shown, and it can act on these — it is holding
+            # the row, and `stale` says the score beside it was earned by a sentence that is gone.
+            "staleMatches": result.stale_matches,
             **_paged(args, len(result.matches)),
             "masked": list(masked),
             "matches": [
-                {"score": m.score, "object": json_safe(m.object)} for m in result.matches
+                # `stale` only when it is: an absent key on every row of a current sidecar keeps the
+                # common answer the shape it has always been.
+                {"score": m.score, "object": json_safe(m.object), **({"stale": True} if m.stale else {})}
+                for m in result.matches
             ],
         }
 
@@ -669,7 +677,9 @@ def _match_tool(
             f"*mean* one." + narrowed + crossed + " Each result carries a `score` beside the object, nearest "
             "first: it is a cosine similarity, comparable between rows and between calls of this "
             "deployment and meaningless against any other model. Only rows that have been embedded "
-            "can be ranked — `embeddedAsOf` says how current the oldest of these is.",
+            "can be ranked — `embeddedAsOf` says how current the oldest of these is, and a result "
+            "marked `stale: true` was ranked against text the row no longer holds, so read its "
+            "score as being about an older version of what you are being shown.",
         )
         + _withheld(masked),
         input_schema=schema,

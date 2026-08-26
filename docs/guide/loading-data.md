@@ -49,9 +49,15 @@ Five things shape it, and the first is what the rest are for:
   it. The refusal says so.
 - **A refusal is whole, and re-running is a refusal too.** One bad value refuses the batch, because a
   partial load leaves the lake in a state nobody declared; `--reject-to` quarantines the rows that
-  failed their own checks and loads the rest. And a load's id is derived from the entry, the mode and
-  the file's bytes, so a pipeline that times out and retries is told it already ran — `--load-id` is
-  how you say *this file again, on purpose*.
+  failed their own checks and loads the rest. Two things that flag will not do. It will not quarantine
+  a `duplicate_key` — which of two rows sharing a key to set aside is a decision the source does not
+  contain. And under `mode: replace` it will not set aside *every* row and load what is left, because
+  what is left is nothing and a replace with nothing in it empties the table: that is `empty_replace`,
+  refused whole, and no quarantine file is written for a batch nobody loaded. The file it does write
+  is an output of the run that wrote it — a load that rejects nothing truncates it, so the path never
+  holds a previous run's rows. And a load's id is derived from the entry, the mode and the file's
+  bytes, so a pipeline that times out and retries is told it already ran — `--load-id` is how you say
+  *this file again, on purpose*.
 - **It is not on the tool surface, and cannot be.** The entry lives in `loom.yaml` rather than in the
   spec, and the MCP surface is assembled from the spec — so a verb that writes an arbitrary batch is
   not something an agent can reach, structurally rather than by a rule someone remembers. It is off
