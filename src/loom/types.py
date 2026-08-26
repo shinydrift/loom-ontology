@@ -95,7 +95,27 @@ class PropType:
         if k == "enum":
             return {"type": "string", "enum": list(self.values or ())}
         if k == "objectRef":
-            return {"type": "string", "description": f"key of a {self.object_type}"}
+            # "key of a X" read, to an agent, as a promise that a key naming no X would be refused.
+            # It is not one, and only one objectRef per action is: the runtime reads the row an
+            # effect's `key` addresses and refuses `object_not_found`, and every *other* objectRef
+            # parameter is bound, type-checked and written as the string it is. `run_record_order`
+            # accepted `customer: "c999"` and committed an Order whose `placedBy` traverses to
+            # nothing.
+            #
+            # Said rather than checked, and deliberately. A reference check here could not be
+            # carried into the write's own commit the way the snapshot assertion is — the referenced
+            # row can be deleted between the check and the commit — so it would narrow the window
+            # rather than close it, which is the thing §4.1 refuses to call optimistic concurrency.
+            # An advisory check that reads like a guarantee is worse than a sentence that says which
+            # one this is.
+            return {
+                "type": "string",
+                "description": (
+                    f"the primaryKey of a {self.object_type}, as the caller states it — Loom "
+                    f"resolves it only where it addresses the row this action targets, so "
+                    f"elsewhere a key naming no {self.object_type} is written rather than refused"
+                ),
+            }
         raise AssertionError(f"unhandled kind {k!r}")
 
     @staticmethod

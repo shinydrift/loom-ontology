@@ -193,10 +193,37 @@ def test_a_rolled_back_add_is_left_live_and_named(project):
 
     assert [(e.table, e.columns) for e in left] == [("demo.widgets", ("region",))]
     assert [(u.table, u.columns) for u in plan.unmanaged] == [("demo.widgets", ("region",))]
-    assert "region — added after version 1" in render_rollback(target, plan, left, changes)
+    assert "region — mapped by the spec you are leaving, not by version 1" in render_rollback(target, plan, left, changes)
 
     assert _rollback(root, catalogs, version=1)[4].status == APPLIED
     assert "region" in catalog.tables["demo.widgets"], "never dropped"
+
+
+def test_an_adopted_column_is_not_reported_as_one_loom_added(project):
+    """`left_behind` is a spec diff and nothing else, and the report used to call it provenance.
+
+    A column that was already live and is merely *adopted* by a later version — mapped by adding a
+    property whose `column` already exists, which plans as no change at all — is in the diff without
+    an apply ever having created it. `region` in the retail example is exactly this shape, and
+    `loom.yaml`'s own comment says it is filled by something that is not Loom. Told it was "added
+    after version 1", an operator tidying up after a rollback is pointed at somebody else's column
+    and invited to drop it.
+
+    The provenance that would separate the two is in `_loom_meta.applied.summary`, and only as the
+    plan's display prose; §9 says a rollback must not parse that. So the wording says what the diff
+    establishes — which spec last mapped it — and stops."""
+    root, catalog, catalogs = project
+    # Live before this ontology ever mentions it, and never created by an apply.
+    catalog.tables["demo.widgets"]["region"] = Column("region", "string", required=False, field_id=9)
+    _spec(root, f"{LTV}\n{REGION}")
+    assert _apply(root, catalogs).status == APPLIED
+
+    target, plan, left, changes, _, _ = _rollback(root, catalogs, version=1, execute=False)
+
+    assert [(e.table, e.columns) for e in left] == [("demo.widgets", ("region",))]
+    out = render_rollback(target, plan, left, changes)
+    assert "region — mapped by the spec you are leaving, not by version 1" in out
+    assert "added after version" not in out
 
 
 def test_a_column_nobody_ever_mapped_is_reported_separately(project):
@@ -211,7 +238,7 @@ def test_a_column_nobody_ever_mapped_is_reported_separately(project):
 
     assert sorted(c for e in left for c in e.columns) == ["region"]
     out = render_rollback(target, plan, left, changes)
-    assert "region — added after version 1" in out
+    assert "region — mapped by the spec you are leaving, not by version 1" in out
     assert "audit_note — never mapped by this ontology" in out
 
 
@@ -231,7 +258,7 @@ def test_a_table_created_since_is_left_in_place(project):
     assert result.status == APPLIED, result.error
     assert catalog.table_exists("demo.gadgets"), "a rollback never drops a table either"
     assert [(e.table, e.whole_table) for e in left] == [("demo.gadgets", True)]
-    assert "demo.gadgets — the whole table, created after version 1" in render_rollback(
+    assert "demo.gadgets — the whole table, mapped by the spec you are leaving and not by version 1" in render_rollback(
         target, plan, left, changes
     )
 
@@ -440,7 +467,7 @@ def test_a_catalog_with_no_history_that_far_back_is_named_not_refused(tmp_path):
     assert result.status == APPLIED, result.error
     # Never dropped, and the report says so rather than leaving it to be noticed.
     assert second.table_exists("demo.gadgets")
-    assert "rest_eu.demo.gadgets — the whole table, created after version 1" in out
+    assert "rest_eu.demo.gadgets — the whole table, mapped by the spec you are leaving and not by version 1" in out
     assert [r.version for r in MetaStore(second).history()] == [2], "the restored spec doesn't bind it"
 
 

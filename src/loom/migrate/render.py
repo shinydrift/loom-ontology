@@ -110,14 +110,20 @@ def _render_left_behind(
     """Everything the rollback is leaving live, in one block and split by how it got there.
 
     Merged with the plan's ordinary unmanaged columns because from the lake's point of view they
-    are now the same thing — and split, because "Loom added this on a version you are undoing" and
-    "this was never yours to begin with" call for different decisions."""
+    are now the same thing — and split, because "the version you are undoing is what mapped this"
+    and "no version of this ontology ever mapped it" call for different decisions.
+
+    The first half says *mapped*, not *added*: `left_behind` is a spec diff, so an adopted column
+    is in it without an apply having created it. See `LeftBehind`."""
     stranded = {(e.catalog, e.table): set(e.columns) for e in left if not e.whole_table}
     lines: list[str] = []
     for entry in plan.unmanaged:
         mine = stranded.get((entry.catalog, entry.table), set())
         for columns, why in (
-            (tuple(c for c in entry.columns if c in mine), f"added after version {version}"),
+            (
+                tuple(c for c in entry.columns if c in mine),
+                f"mapped by the spec you are leaving, not by version {version}",
+            ),
             (tuple(c for c in entry.columns if c not in mine), "never mapped by this ontology"),
         ):
             if columns:
@@ -125,7 +131,11 @@ def _render_left_behind(
     for entry in left:
         if entry.whole_table:
             lines.append(
-                f"  · {entry.catalog}.{entry.table} — the whole table, created after version {version}"
+                # "Mapped", not "created", for the reason the column line says it: an ontology can
+                # adopt a table that was already there as readily as it can create one, and this set
+                # is the same spec diff either way.
+                f"  · {entry.catalog}.{entry.table} — the whole table, mapped by the spec you are "
+                f"leaving and not by version {version}"
             )
     if not lines:
         return []

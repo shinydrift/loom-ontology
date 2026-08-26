@@ -208,6 +208,19 @@ def cmd_query(args) -> int:
     if args.via and args.match is None:
         print("error: --via requires --match", file=sys.stderr)
         return 1
+    # A key addresses a row; a filter selects among rows. `get_<type>` and `traverse` take no
+    # `filter` on the generated surface, so there is no tool shape for this command to mirror — and
+    # the branch below reaches `resolver.get`/`resolver.traverse`, which never saw `filters` at all.
+    # Refused rather than ignored, because the ignoring was silent and reads as confirmation: a
+    # `--key c1 --filter tier=bronze` answered with the gold-tier `c1` says a filter selected that
+    # row, which is the sentence an operator checking a predicate against a known row is looking for.
+    if args.filter and args.key:
+        print(
+            "error: --filter cannot be combined with --key — a key addresses one row and a filter "
+            "selects among rows. Drop --key to filter, or drop --filter to fetch that row",
+            file=sys.stderr,
+        )
+        return 1
     try:
         filters = _filter_pairs(args.filter or [], "--filter")
         via = _via_pairs(args.via or [])

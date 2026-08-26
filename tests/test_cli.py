@@ -156,6 +156,26 @@ def test_link_without_a_key_is_refused_before_any_catalog_is_opened(tmp_path, ca
     assert "--link requires --key" in capsys.readouterr().err
 
 
+def test_a_filter_beside_a_key_is_refused_rather_than_dropped(tmp_path, capsys):
+    """The keyed branch reaches `resolver.get`/`resolver.traverse`, neither of which ever saw
+    `filters` — so `--key c1 --filter tier=bronze` answered with the gold-tier `c1`.
+
+    Silently ignoring it is worse than any wrong answer it could give, because the shape of the
+    output is confirmation: an operator checking whether a known row survives a predicate — the
+    obvious way to test a `rows:` policy by hand — gets a yes for every filter, including the ones
+    that exclude it. This command refuses `--match` with `--key`, `--link` without `--key` and
+    `--via` without `--match`; this was the one combination it took and discarded.
+
+    Refused before any catalog is opened, like its three neighbours."""
+    ontology = _project(tmp_path, config=UNREACHABLE_CONFIG)
+    assert main(["query", "Customer", str(ontology), "--key", "c1", "--filter", "tier=gold"]) == 1
+    assert "--filter cannot be combined with --key" in capsys.readouterr().err
+
+    argv = ["query", "Customer", str(ontology), "--key", "c1", "--link", "orders"]
+    assert main([*argv, "--filter", "tier=gold"]) == 1
+    assert "--filter cannot be combined with --key" in capsys.readouterr().err
+
+
 def test_a_missing_local_warehouse_gets_an_actionable_hint(tmp_path, capsys):
     """SQLite's own message names neither the path nor the reason."""
     pytest.importorskip("pyiceberg", reason="needs the [iceberg] extra")

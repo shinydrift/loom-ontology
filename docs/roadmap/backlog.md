@@ -41,6 +41,28 @@ Consciously deferred in v0; each is a self-contained follow-up:
       as `before`/`after` — and now in the vector sidecar, because an embedding is a lossy but
       *partially invertible* copy rather than an opaque token. A command that reaches two of the
       three is one that reports success while leaving recoverable text in the lake
+- [ ] **`hasMore` on an exactly-full last page** — `_paged` computes it `count == limit`, which is
+      "the page filled up" and not "there is more", and its own docstring says the key exists because
+      *an agent has no other way to tell those apart*. Guaranteed wrong whenever the admitted row
+      count is a multiple of the page size: four customers at `offset: 2, limit: 2` come back with
+      `hasMore: true` and the next page is empty. The cost is one wasted call and one wrong sentence
+      to a model that reads the envelope, so it is small — but the fix is not local. Either the read
+      path over-fetches one row and trims (a `Page(rows, has_more)` where four surfaces now return
+      `list[dict]`, and `match_` would have to trim `stale_matches` and `embedded_as_of` with it), or
+      a count query runs beside every page, which is the per-call extra read M10 refused for the
+      unembedded-row count. That is a read-IR decision rather than a patch, which is why the
+      whole-app probe reported it here instead of taking it.
+- [ ] **What an `objectRef` parameter refers to** — only the ref an effect's `key` addresses is
+      resolved; every other one is written as sent (§4.1). Two things follow that a decision here
+      would settle. A `create` can commit a reference to a row that does not exist — `recordOrder`
+      accepted `customer: "c999"` and left an Order whose `placedBy` traverses to nothing. And a
+      `rows:` policy's claim that *an agent cannot act on a row it cannot see* holds for the target
+      and not for a referencing parameter: a caller who cannot read a withheld Customer can still
+      create an Order naming one. The obvious fix — read the referenced row and refuse — is the one
+      that cannot be right on its own terms, because the check cannot be carried into the write's
+      commit and would narrow the race rather than close it. So the question is what Loom means by a
+      reference: a checked-at-write constraint it cannot keep, a governance-scoped resolution that
+      only runs where a policy is in force, or a declared join key that stays advisory and says so.
 - [ ] More engine adapters — Trino, Spark (+ route writes through native `MERGE` when
       `capabilities().native_merge`)
 
