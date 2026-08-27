@@ -58,14 +58,13 @@ not one this layer composes.
 from __future__ import annotations
 
 import datetime as _dt
-import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from .. import filters
-from .._shape import suggest
+from .._shape import snake_case, suggest
 from ..auth import current_principal
 from ..governance import PolicyProgram
 from ..model import Action, ObjectType
@@ -230,16 +229,6 @@ def _type_refusal(name: str, schema: Mapping[str, Any], value: Any) -> str | Non
     wanted = " or ".join(options)
     detail = f" ({schema['format']})" if schema.get("format") else ""
     return f"'{name}' takes {wanted}{detail}, got {_json_type_name(value)}"
-
-
-def snake_case(api_name: str) -> str:
-    """`Customer` -> `customer`, `PurchaseOrder` -> `purchase_order`.
-
-    MCP tool names are identifiers agents type, so they get the conventional spelling rather than
-    the api name verbatim."""
-    s = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", api_name)
-    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s)
-    return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
 
 
 def json_safe(value: Any) -> Any:

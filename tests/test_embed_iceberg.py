@@ -161,7 +161,7 @@ def test_the_stored_hash_is_the_one_the_runtime_would_recompute(seeded):
     }
 
     for key, row in stored(seeded).items():
-        assert row["source_hash"] == source_hash(names[key].strip(), "stub-v1", 3)
+        assert row["source_hash"] == source_hash(names[key].strip(), "stub-v1", 3, "name")
 
 
 def test_re_embedding_replaces_a_row_rather_than_duplicating_it(seeded):
@@ -193,7 +193,9 @@ def test_re_embedding_replaces_a_row_rather_than_duplicating_it(seeded):
     after = stored(seeded)
     assert len(after) == len(before)  # replaced, not appended beside
     assert after[changed]["vector"] != before[changed]["vector"]
-    assert after[changed]["source_hash"] == source_hash("Someone Else Entirely", "stub-v1", 3)
+    assert after[changed]["source_hash"] == source_hash(
+        "Someone Else Entirely", "stub-v1", 3, "name"
+    )
 
 
 def test_remodel_alone_re_embeds_nothing_because_the_model_is_in_the_hash(seeded):

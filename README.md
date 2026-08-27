@@ -148,8 +148,9 @@ Each of those sentences was a decision with an argument behind it, and the argum
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 1177 tests
+pytest                              # 1213 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 3 action(s)
+                                    #   · no loom.yaml found — spec checked, deployment not
 ```
 
 `embed` is not in that list, and this page gets as far as the ranked plane. Add it —

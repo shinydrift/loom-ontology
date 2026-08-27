@@ -38,8 +38,43 @@ def _project(tmp_path: Path, config: str = LOCAL_CONFIG) -> Path:
 
 
 def test_validate_is_offline_and_needs_no_config(capsys):
+    """And says which halves it read, so `ok` does not stand for more than was checked."""
     assert main(["validate", str(VALID)]) == 0
-    assert "ok — 2 object type(s)" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "ok — 2 object type(s)" in out
+    assert "no loom.yaml found — spec checked, deployment not" in out
+
+
+@pytest.mark.parametrize(
+    ("config", "problem"),
+    [
+        ("engine: { type: postgres }\n", "unknown engine type 'postgres'"),
+        (
+            "mcp: { name: x, embedding: { provider: banana, model: m } }\n",
+            "unknown embedding provider 'banana'",
+        ),
+        (
+            "mcp: { name: x, embedding: { provider: local, model: m, dims: 384 } }\n",
+            "unexpected key 'dims' in mcp.embedding",
+        ),
+        ("governance: { ingest: maybe }\n", "'governance.ingest' must be one of"),
+    ],
+)
+def test_validate_refuses_a_config_every_other_verb_refuses(tmp_path, capsys, config, problem):
+    """The command that exists to answer *is this good?* was the only one not reading loom.yaml.
+
+    Each of these printed `ok` here and `1 problem in ontology spec: loom.yaml: ...` from `plan`,
+    `query`, `ingest`, `run`, `serve` and `validate --physical` — so a pre-flight check passed on a
+    deployment that could not start. None of them needs a catalog to decide."""
+    ontology = _project(tmp_path, config=LOCAL_CONFIG + config)
+    assert main(["validate", str(ontology)]) == 1
+    assert problem in capsys.readouterr().err
+
+
+def test_validate_says_it_read_the_config_when_there_is_one(tmp_path, capsys):
+    ontology = _project(tmp_path)
+    assert main(["validate", str(ontology)]) == 0
+    assert "loom.yaml ok" in capsys.readouterr().out
 
 
 def test_validate_reports_a_broken_spec(tmp_path, capsys):
@@ -154,6 +189,25 @@ def test_link_without_a_key_is_refused_before_any_catalog_is_opened(tmp_path, ca
     ontology = _project(tmp_path, config=UNREACHABLE_CONFIG)
     assert main(["query", "Customer", str(ontology), "--link", "orders"]) == 1
     assert "--link requires --key" in capsys.readouterr().err
+
+
+def test_query_pages_with_offset_because_its_own_refusal_names_one(tmp_path, capsys):
+    """`Resolver._page_size` refuses a `limit` over the cap with *"page with 'offset'"* — a flag
+    `loom query` did not have, so there was no way to reach row 501 of anything from the CLI while
+    the generated tools paged fine. This command mirrors those tools; the mirror was missing a half.
+    """
+    pytest.importorskip("pyiceberg", reason="needs the [iceberg] extra")
+    ontology = _project(tmp_path)
+    assert main(["query", "Customer", str(ontology), "--limit", "501"]) == 1
+    err = capsys.readouterr().err
+    assert "page with 'offset'" in err
+
+
+def test_an_offset_beside_a_bare_key_is_refused_for_the_reason_a_filter_is(tmp_path, capsys):
+    """`get_<type>` takes no page, so there is no tool shape to mirror. `--key --link` does page."""
+    ontology = _project(tmp_path)
+    assert main(["query", "Customer", str(ontology), "--key", "c1", "--offset", "1"]) == 1
+    assert "there is no page to skip into" in capsys.readouterr().err
 
 
 def test_a_filter_beside_a_key_is_refused_rather_than_dropped(tmp_path, capsys):

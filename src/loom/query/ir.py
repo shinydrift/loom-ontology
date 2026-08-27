@@ -332,10 +332,18 @@ class VectorRef:
     load-bearing twice over: without the width, a sidecar holding two of them makes the distance
     function *raise* rather than answer.
 
-    The `property` half closes the narrowest window and the least visible one. Re-pointing
-    `semantic:` changes every `source_hash`, so a reconcile fixes it — but between the deploy and the
-    reconcile the sidecar holds vectors of the *old* text under the new spec, and without this clause
-    they would be ranked, silently, under an envelope naming the new property.
+    The `property` half closes the narrowest window and the least visible one: between a deploy that
+    re-points `semantic:` and the reconcile that follows it, the sidecar holds vectors of the *old*
+    text under the new spec, and without this clause they would be ranked, silently, under an
+    envelope naming the new property.
+
+    This docstring used to add *"re-pointing `semantic:` changes every `source_hash`, so a reconcile
+    fixes it"*, and that was true of re-pointing and false of renaming. An apiName edit that keeps
+    the column moves no data, so `loom plan` said *No changes*, every hash still matched, and `loom
+    embed` reported every row current — while this guard withheld all of them. The window was not
+    narrow, it was permanent, and the reconcile named as the cure could not see it. `source_hash`
+    now folds the property in alongside `model` and `dims`, so the sentence is true because the four
+    columns this guard compares are the four the hash is built from.
 
     The column names arrive from above rather than being known here, for `ThroughRef`'s reason: this
     layer speaks physical columns and never spells one itself."""

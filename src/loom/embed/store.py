@@ -28,7 +28,10 @@ would invalidate the vector row of every order they ever placed — plus a gover
 denormalised column is not an `ir.TableRef` and no policy rides on it.
 
 **Staleness is defined here, once.** A row *is embedded* iff the sidecar holds a row for its key whose
-`source_hash` equals the hash of the text that row has **now**. Nothing is time-based, nothing is
+`source_hash` equals the hash of the text that row has **now** — where the hash covers everything
+`ir.VectorRef`'s comparability guard will compare it on: the text, the model, the width and the
+property. Fewer than all four and the guard can refuse a row the reconcile calls current, which is
+the one disagreement that shows an operator a working deployment and an empty ranking. Nothing is time-based, nothing is
 compared against a snapshot id, and there is no threshold — the ROADMAP refuses one permanently,
 because any number is a magic one. `embedded_at` is recorded and is never consulted to decide
 freshness; it exists to answer *as of when* in a result envelope.
@@ -94,8 +97,8 @@ def vector_columns(key_type: str) -> tuple[Column, ...]:
     )
 
 
-def source_hash(text: str, model: str, dims: int) -> str:
-    """`hash(text ‖ model ‖ dims)` — what makes a vector's staleness decidable.
+def source_hash(text: str, model: str, dims: int, property_name: str) -> str:
+    """`hash(text ‖ model ‖ dims ‖ property)` — what makes a vector's staleness decidable.
 
     **The model is in here, not just the text**, so changing provider invalidates every vector by
     construction rather than by anyone remembering to. `dims` is in here too and is not redundant: a
@@ -103,10 +106,28 @@ def source_hash(text: str, model: str, dims: int) -> str:
     mistake, and folding the width in means the next reconcile notices instead of ranking two
     incompatible generations of vector against each other.
 
+    **`property` is in here for the same reason, and was not until a whole-app probe asked what
+    happened without it.** These four are exactly the columns `ir.VectorRef`'s comparability guard
+    requires a stored row to match on, and three of them were folded in here while the fourth was
+    only written to the sidecar. So the guard and the reconcile could disagree, and did: renaming a
+    `semantic:` property — an apiName edit that moves no column, changes no text and makes `loom
+    plan` say *No changes* — left every `source_hash` identical, so `loom embed` reported
+    `rowsCurrent: 14, rowsEmbedded: 0` while `match_` guarded all fourteen rows out and ranked
+    nothing. `VectorRef` claimed the case was covered, on the grounds that "re-pointing `semantic:`
+    changes every `source_hash`" — true only when the text changes with it, and a rename is the case
+    where it does not. The window that docstring calls *between the deploy and the reconcile* was
+    permanent, and the reconcile is the thing `loom serve`'s banner tells the operator to read.
+
+    Folding it in here rather than teaching `existing()` to read the property column is what keeps
+    the invariant one sentence: a row is embedded iff its stored hash equals the hash of what it is
+    now, where *what it is now* means everything the guard will compare. The upgrade cost is one
+    full re-embed per warehouse, which is exactly what a model swap already costs and is the same
+    honesty — a vector whose provenance Loom can no longer prove is one it should not rank.
+
     Length-prefixed rather than concatenated with a separator, so no text can impersonate a different
     (text, model) pair by containing the separator. A contrived collision, but the fix is one line and
     the failure it prevents is a vector that never refreshes."""
-    parts = [text, model, str(dims)]
+    parts = [text, model, str(dims), property_name]
     payload = "".join(f"{len(p)}:{p}" for p in parts)
     return hashlib.sha256(payload.encode()).hexdigest()
 

@@ -239,6 +239,23 @@ def test_paging_is_stable_across_pages(resolver):
 # ---- traversal -----------------------------------------------------------------
 
 
+def test_the_cli_pages_with_the_offset_its_own_refusal_names(project, capsys):
+    """`loom query` mirrors the generated tools, and had no `--offset` while every paged tool did —
+    so the refusal above the page cap named a flag the command did not take, and row 501 of anything
+    was unreachable from the CLI. Driven through `main` rather than the resolver, because the
+    missing half was the argument and not the read."""
+    from loom.cli import main
+
+    ontology = str(project[2] / "ontology")
+    assert main(["query", "Customer", ontology, "--limit", "2", "--offset", "0"]) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert main(["query", "Customer", ontology, "--limit", "2", "--offset", "2"]) == 0
+    second = json.loads(capsys.readouterr().out)
+
+    assert [r["customerId"] for r in first] == ["c1", "c2"]
+    assert [r["customerId"] for r in second] == ["c3", "c4"]
+
+
 def test_reverse_traverse_returns_the_linked_objects(resolver):
     """Customer -> orders, via the link's reverseName."""
     orders = resolver.traverse("Customer", "c2", "orders")

@@ -491,7 +491,7 @@ def test_a_sidecar_holding_two_widths_answers_rather_than_raising(project):
                 model="other-model",
                 dims=2,
                 vector=wide.embed([text])[0],
-                source_hash=source_hash(text, "other-model", 2),
+                source_hash=source_hash(text, "other-model", 2, "body"),
                 embedded_at=now(),
             )
         ],

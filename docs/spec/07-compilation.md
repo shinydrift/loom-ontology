@@ -18,6 +18,14 @@ Tool names are the api name in `snake_case`, for every row of that table. This o
 `run_upgradeTier`, which no other row's spelling would have produced — a slip, corrected, in the
 same class as the two §4/§5 bugs the action runtime turned up.
 
+**Two object types may not spell the same tool name**, and this is a rule rather than an
+observation because `snake_case` is not injective over §0's grammar: `ABCTest` and `AbcTest` are
+both well-formed PascalCase and both come out `abc_test`. Tools are collected by name, so without
+this rule the second type's three tools replace the first's and one object type has no surface at
+all — a spec whose api names are unique by §0 producing a tool set that is not. `loom validate`
+refuses it, naming both types; it needs no catalog and no config to decide, which is why it is not
+left to `loom serve`.
+
 **And an `ingest:` entry generates nothing, which is why it is not in the spec.** It is the one
 declared, named, runnable thing in Loom with no row in this table — a `loom ingest` command and
 nothing else. That is enforced by where it is written rather than by a rule about what to skip: this

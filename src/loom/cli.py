@@ -151,7 +151,34 @@ def cmd_validate(args) -> int:
             )
             suffix = f" · physical ok against {len(config.catalogs)} catalog(s)"
         else:
-            ontology, diag = build(args.path)
+            # `loom.yaml` is checked here too, and not only under `--physical`. Without this the one
+            # command whose whole job is to answer *is this good?* was the only one that never read
+            # the deployment half: an unknown embedding provider, a stray `dims:`, an engine type
+            # nothing implements, a `sequences:` entry naming an ingest entry that does not exist —
+            # every one of those printed `ok` here and `1 problem in ontology spec: loom.yaml: ...`
+            # from every other verb, including `validate --physical`. The error machinery already
+            # calls a config problem a spec problem; this is the command that agrees with it.
+            #
+            # **Found, not required.** A missing config stays out of `diag` because the spec half is
+            # meaningful on its own — `loom validate tests/fixtures/valid` is the guide's first
+            # command and there is no `loom.yaml` beside it. What changes is that `ok` stops
+            # overclaiming: the suffix says which halves were read, so a clean spec and an unread
+            # config are no longer the same sentence. `--physical` still *requires* one, because
+            # catalogs are named in it and there is nothing to check against without them.
+            config_path = find_config(args.path)
+            if config_path is not None:
+                load_config(config_path, diag)
+                # Named rather than assumed. `find_config` looks in the ontology dir, then beside
+                # it, then in the working directory — so the file checked here is not always the one
+                # the caller had in mind, and a bare "loom.yaml ok" would be the same sentence for
+                # all three. Every other verb reads it from the same three places and says nothing;
+                # this is the command whose whole output is *what was checked*.
+                suffix = f" · {config_path} ok"
+            else:
+                suffix = " · no loom.yaml found — spec checked, deployment not"
+            ontology, ont_diag = build(args.path)
+            diag.warnings.extend(ont_diag.warnings)
+            diag.raise_if_errors()
     except SpecErrors as e:
         print(str(e), file=sys.stderr)
         return 1
@@ -214,6 +241,16 @@ def cmd_query(args) -> int:
     # Refused rather than ignored, because the ignoring was silent and reads as confirmation: a
     # `--key c1 --filter tier=bronze` answered with the gold-tier `c1` says a filter selected that
     # row, which is the sentence an operator checking a predicate against a known row is looking for.
+    # `get_<type>` takes no page, so an `--offset` beside a bare `--key` has no tool shape to mirror
+    # and would be read as *skip, then fetch that row* — which is not a thing this command can do.
+    # A `--key --link` traverse does page, so that combination is left alone.
+    if args.offset and args.key and not args.link:
+        print(
+            "error: --offset cannot be combined with --key — a key addresses one row, and there is "
+            "no page to skip into. Use --offset with a search, or with --key --link",
+            file=sys.stderr,
+        )
+        return 1
     if args.filter and args.key:
         print(
             "error: --filter cannot be combined with --key — a key addresses one row and a filter "
@@ -241,12 +278,16 @@ def cmd_query(args) -> int:
             # reintroduce the collision `Resolver.match` exists to keep impossible.
             rows = [{"score": m.score, "object": m.object} for m in ranked.matches]
         elif args.key and args.link:
-            rows = resolver.traverse(args.object_type, args.key, args.link, limit=args.limit)
+            rows = resolver.traverse(
+                args.object_type, args.key, args.link, limit=args.limit, offset=args.offset
+            )
         elif args.key:
             row = resolver.get(args.object_type, args.key)
             rows = [row] if row else []
         else:
-            rows = resolver.search(args.object_type, filters, limit=args.limit)
+            rows = resolver.search(
+                args.object_type, filters, limit=args.limit, offset=args.offset
+            )
     except (ResolverError, CatalogError, CapabilityError, PolicyError, EmbeddingError) as e:
         # A `CapabilityError` reaches here for the same reason `loom query` mirrors the generated
         # tools at all: if the dev command can read out of an engine the served surface refuses to
@@ -389,7 +430,9 @@ def _cli_match(ontology, config, catalogs, resolver, args, filters, via):
             "no objectType in this ontology declares a 'semantic:' property, so there is nothing "
             "to rank by meaning"
         )
-    return matcher.match(resolver, args.object_type, args.match, filters, via, limit=args.limit)
+    return matcher.match(
+        resolver, args.object_type, args.match, filters, via, limit=args.limit, offset=args.offset
+    )
 
 
 def cmd_run(args) -> int:
@@ -1495,6 +1538,13 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     q.add_argument("--limit", type=int, default=None)
+    # The other half of a page. Without it this command could not reach row 501 of anything, while
+    # the refusal it printed above 500 — "Ask for that many and page with 'offset'" — named a flag
+    # that did not exist. Both halves come from `Resolver`, so the cap, the refusals and the
+    # defaults are the generated tools' and not a second set with the same numbers.
+    q.add_argument(
+        "--offset", type=int, default=0, help="rows to skip, for paging past --limit"
+    )
     q.set_defaults(func=cmd_query)
 
     r_ = sub.add_parser("run", help="run one declared action (dev tool)")

@@ -7,8 +7,9 @@ query through DuckDB, a write, and an MCP server. Nothing here needs a service r
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,iceberg,duckdb,mcp]"
 
-pytest                              # 1177 tests
+pytest                              # 1213 tests
 loom validate tests/fixtures/valid  # → ok — 2 object type(s), 1 link type(s), 3 action(s)
+                                    #   · no loom.yaml found — spec checked, deployment not
 ```
 
 `embed` is not in that list, and this page gets as far as the ranked plane. Add it —
@@ -28,6 +29,7 @@ loom validate --physical examples/retail/ontology     # check the spec against l
 loom query Customer examples/retail/ontology --key c1 # → one row, through DuckDB
 loom query Customer examples/retail/ontology --key c2 --link orders   # → a link traversal
 loom query DailySalesPerformance examples/retail/ontology --key 2026-02-11 # → precomputed daily KPIs
+loom query Customer examples/retail/ontology --limit 2 --offset 2     # → the second page
 loom run upgradeTier examples/retail/ontology \
   --param customer=c3 --param newTier=gold            # → one row rewritten, one row recorded
 loom serve examples/retail/ontology                   # → 14 MCP tools over stdio
@@ -101,6 +103,10 @@ loom serve — 4 object type(s), 3 link type(s), 4 action(s) → 14 tool(s) over
     (a row edited since it was embedded is not absent — it comes back marked `stale`, ranked by the
      text it had then and carrying the text it has now)
 ```
+
+`loom query` takes `--limit` and `--offset` because the generated tools do — this command mirrors
+them, and the page cap, the defaults and the refusals all come from the one `Resolver` rather than
+from a second set of numbers that happen to match.
 
 `match_support_ticket` is there because one property in the spec says `semantic: body` and this
 deployment configures a provider — both halves, which is why the three lines under it are

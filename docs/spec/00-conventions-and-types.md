@@ -12,6 +12,11 @@
   - Links / actions / properties / parameters: `camelCase`, match `^[a-z][A-Za-z0-9]*$`
   - `apiName` is **globally unique within its kind** (object namespace, link namespace,
     action namespace are separate).
+  - These patterns are checked by `loom validate`, and the property half is load-bearing rather
+    than cosmetic: §5's expression grammar can only *name* an identifier of this shape, so a
+    property called `full Name` is one no `rows:` predicate and no action `validation:` rule could
+    ever mention — while `mask:`, a list of strings rather than an expression, would still reach
+    it. Uniqueness within a kind is not sufficient on its own either; see §7 on tool names.
 - **Unknown keys are errors**, not ignored. A typo like `primryKey` fails `loom validate`
   with a "did you mean" — a spec language that silently drops fields rots.
 - **Everything compiles or nothing loads.** `loom validate` runs the full ruleset below and
