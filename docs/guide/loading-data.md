@@ -123,10 +123,20 @@ coherent, but Loom has no cross-table constraint and this does not add one.
 Three places, and none of them narrows a batch — every one of them refuses it.
 
 **A deployment whose `governance.policies` do not fit the ontology refuses to load**, in the same
-words `loom query`, `loom run`, `loom serve` and `loom embed` refuse to start — a mask naming a
-property an action writes, a `rows:` predicate naming a claim nobody declared. The pairing is
-checked before any entry runs, so bulk writes cannot be the one plane still moving under a
-configuration the rest of the deployment will not stand on.
+words `loom query`, `loom run`, `loom serve`, `loom embed` and `loom validate` refuse to start — a
+mask naming a property an action writes, a `rows:` predicate naming a claim nobody declared. The
+pairing is checked before any entry runs, so bulk writes cannot be the one plane still moving under
+a configuration the rest of the deployment will not stand on.
+
+A *second* refusal is not in that list, and the difference is worth naming because a probe read the
+sentence above as covering it. A policy that names the **caller** — `when:`, or `principal.` inside
+`rows:` — is refused by the surfaces that can never attest one: `loom query`, `loom run`, and a
+spawned stdio server. `loom ingest`, `loom sequence` and `loom embed` do **not** refuse it, and
+should not. A `rows:` predicate does not touch a load at all (see below), and `loom embed`
+deliberately discards row predicates — a sidecar that were a function of the policy set would be
+silently invalidated by editing a policy. What those three need from a policy is the half that is
+never conditional: a `mask:` cannot carry `when:`, so it is decidable for every caller, and they
+enforce it.
 
 **A `mask:` over the object type an entry loads refuses that entry**, reported as a
 `masked_property` failure before the file is opened:

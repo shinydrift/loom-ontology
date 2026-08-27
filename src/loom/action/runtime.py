@@ -159,6 +159,7 @@ class ActionRuntime:
         actor: str | None = None,
         principal: str | None = None,
         dry_run: bool = False,
+        record_refusals: bool = False,
     ) -> ActionResult:
         """One action, up to `MAX_ATTEMPTS` times, recorded once, and the last word either way.
 
@@ -213,16 +214,47 @@ class ActionRuntime:
             if not run.conflicted:
                 break
         assert result is not None and run is not None  # the loop runs at least once
-        if dry_run:
+        if dry_run and not (record_refusals and not result.ok):
             # A preview writes nothing and holds nothing, so there is no edit to record and no id to
             # cite. `loom run` previews before every real run; logging them would double the table.
+            #
+            # **Except a preview that refused, when the caller says so.** `loom run` short-circuits
+            # on a refused preview and never reaches the real run, so for its whole life every
+            # refusal it reported — `object_not_found`, `validation_failed`, `ambiguous_key` — was
+            # recorded nowhere, while the identical refusal through a `run_` tool was recorded. That
+            # is the log disagreeing with itself about which door the caller came through, and
+            # `quickstart.md` promising the opposite ("a log of successes cannot say who *tried*").
+            #
+            # It cannot be fixed by re-running the refusal for real: the run re-reads, so a row that
+            # moved in between could turn the second attempt into an *applied* write the operator
+            # was never asked to confirm. Recording the preview is the only version of this that
+            # cannot write. A refusal that would have applied is still not recorded — that one is
+            # followed by a real run that records itself, which is the double-entry this guards.
             return result
         return self._record(run, result, target, edit_id, who, principal)
 
-    def preview(self, action_name: str, parameters: Mapping[str, Any]) -> ActionResult:
+    def preview(
+        self,
+        action_name: str,
+        parameters: Mapping[str, Any],
+        actor: str | None = None,
+        principal: str | None = None,
+        record_refusals: bool = False,
+    ) -> ActionResult:
         """Everything but the write. The write path's `loom plan`, and nearly free, because a
-        refusal already had to change nothing."""
-        return self.run(action_name, parameters, dry_run=True)
+        refusal already had to change nothing.
+
+        `record_refusals` is for the caller that stops here — `loom run` refuses on this result and
+        never reaches the real run, so without it the refusal it just printed goes unrecorded. See
+        the branch in `run`."""
+        return self.run(
+            action_name,
+            parameters,
+            actor=actor,
+            principal=principal,
+            dry_run=True,
+            record_refusals=record_refusals,
+        )
 
     def _record(
         self,

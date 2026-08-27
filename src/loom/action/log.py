@@ -133,6 +133,13 @@ class EditRecord:
     all do — including `failed`, which is the one case where nobody knows whether the write landed,
     and therefore the case the record is most worth having.
 
+    **A preview that *refused* is the exception, and it is not really one.** Its status is `refused`,
+    not `previewed`, and the doubling argument above does not apply to it: `loom run` stops on a
+    refused preview and never reaches the real run, so there is no second record for it to be the
+    duplicate of. Without that, every refusal `loom run` reported went unrecorded while the identical
+    refusal through a `run_` tool was recorded — the log answering "who tried" differently depending
+    on which door they came through. See `ActionRuntime.run`'s `record_refusals`.
+
     `before` and `after` are the object **as the ontology sees it** — declared properties, by
     property name, through the same projection `ActionResult` uses. That rule is extended here rather
     than repeated, because the reader is different: an auditor, not an agent. The physical row was
@@ -205,6 +212,13 @@ class EditRecord:
         }
 
 
+MAX_LOG_ATTEMPTS = 3
+"""How many times an append to the edit log may lose a commit race before it is reported as lost.
+
+Matches `runtime.MAX_ATTEMPTS`, and duplicated rather than imported because `runtime` imports this
+module. See `EditLog.record` for why an append that asserts nothing still needs a retry at all."""
+
+
 @dataclass
 class EditLog:
     """The `_loom_meta.edits` table of one catalog, created on first write.
@@ -244,10 +258,32 @@ class EditLog:
 
         Raises `CatalogError` on failure and does not swallow it — but the caller does not treat that
         as the action failing, because by the time this runs the row write has already committed. See
-        `_Run`'s caller in `runtime.py`."""
+        `_Run`'s caller in `runtime.py`.
+
+        **Retried, because the conflict it loses to means nothing.** An append to `_loom_meta.edits`
+        carries no snapshot assertion — it puts no row over another, so a competing append is not a
+        disagreement about anything, just two writers reaching one table at once. Iceberg still
+        refuses the second with "Table has been updated by another process", and with one attempt
+        per run that refusal was final: six concurrent runs lost two audit rows, and for a *refusal*
+        that loss is undetectable, because a refusal leaves no commit to stamp with its `edit_id`.
+        The row write already retries a conflict for the same reason and calls the retry the price
+        of a coarse check; the log had the price and not the retry.
+
+        `MAX_LOG_ATTEMPTS` matches the row write's `MAX_ATTEMPTS` deliberately — a deployment that
+        tolerates three tries for the row has no reason to tolerate fewer for the record of it. It is
+        a second constant rather than a shared one only because `runtime` imports this module and not
+        the other way round. The last failure is re-raised untouched, so `log_failed` still says
+        exactly what Iceberg said."""
         if self.writer is None:  # pragma: no cover - the runtime resolves a writer before calling
             raise RuntimeError("EditLog has no writer — nothing can be recorded")
-        self.writer.append_edit(EDIT_COLUMNS, entry.row())
+        row = entry.row()
+        for attempt in range(1, MAX_LOG_ATTEMPTS + 1):
+            try:
+                self.writer.append_edit(EDIT_COLUMNS, row)
+                return
+            except CatalogError:
+                if attempt == MAX_LOG_ATTEMPTS:
+                    raise
 
 
 def require_edit_log(ontology: Ontology, catalogs: Mapping[str, Catalog]) -> None:

@@ -63,9 +63,29 @@ class Batch:
     columns: tuple[str, ...]
     fingerprint: str
     path: str = ""
+    lines: tuple[int, ...] = ()
+    """Where each row came from in the file, 1-based, parallel to `rows`.
+
+    Carried so a refusal about a row can name the place an operator can *open*. The runtime used to
+    report `enumerate(batch.rows)` — 0-based, and counting parsed rows rather than file lines — so
+    the first line of a file was "row 0", a blank line silently shifted every number after it, and
+    the reader's own `line 2` sat in the same output meaning something else. Two numbering schemes
+    and one word between them.
+
+    Empty for a batch built before this existed; `locate` falls back to the row's position."""
 
     def __len__(self) -> int:
         return len(self.rows)
+
+    def locate(self, index: int) -> str:
+        """How to name row `index` to somebody holding the file.
+
+        `line N` where the format has lines and the reader counted them — the same words
+        `_read_ndjson` and `_read_csv` use for a parse failure, because it is the same N. `row N`,
+        1-based, for parquet, which has rows and no lines."""
+        if index < len(self.lines):
+            return f"line {self.lines[index]}"
+        return f"row {index + 1}"
 
 
 def read_batch(path: str | Path, fmt: str) -> Batch:
@@ -81,11 +101,19 @@ def read_batch(path: str | Path, fmt: str) -> Batch:
     reader = readers.get(fmt)
     if reader is None:  # pragma: no cover - config validation rejects unknown formats first
         raise SourceError(f"no reader for format '{fmt}'")
-    rows, columns = reader(raw, str(p))
-    return Batch(rows=tuple(rows), columns=tuple(columns), fingerprint=fingerprint, path=str(p))
+    rows, columns, lines = reader(raw, str(p))
+    return Batch(
+        rows=tuple(rows),
+        columns=tuple(columns),
+        fingerprint=fingerprint,
+        path=str(p),
+        lines=tuple(lines),
+    )
 
 
-def _read_parquet(raw: bytes, name: str) -> tuple[Sequence[Mapping[str, Any]], Sequence[str]]:
+def _read_parquet(
+    raw: bytes, name: str
+) -> tuple[Sequence[Mapping[str, Any]], Sequence[str], Sequence[int]]:
     try:
         import pyarrow.parquet as pq
     except ImportError as e:
@@ -97,15 +125,20 @@ def _read_parquet(raw: bytes, name: str) -> tuple[Sequence[Mapping[str, Any]], S
         table = pq.read_table(io.BytesIO(raw))
     except Exception as e:
         raise SourceError(f"'{name}' is not readable as parquet: {e}") from e
-    return table.to_pylist(), tuple(table.column_names)
+    # No lines to give, and none invented: parquet is columnar, so a row has a position and not a
+    # place in a file. `Batch.locate` falls back to `row N` — 1-based, and never `row 0`.
+    return table.to_pylist(), tuple(table.column_names), ()
 
 
-def _read_ndjson(raw: bytes, name: str) -> tuple[Sequence[Mapping[str, Any]], Sequence[str]]:
+def _read_ndjson(
+    raw: bytes, name: str
+) -> tuple[Sequence[Mapping[str, Any]], Sequence[str], Sequence[int]]:
     """One JSON object per line. Blank lines are skipped; anything else that is not an object is an
     error naming the line, because a file that is *almost* NDJSON is the case where a silent skip
     loses rows an operator believed they had loaded."""
     rows: list[Mapping[str, Any]] = []
     columns: list[str] = []
+    lines: list[int] = []
     seen: set[str] = set()
     for number, line in enumerate(raw.decode("utf-8", errors="replace").splitlines(), start=1):
         if not line.strip():
@@ -117,14 +150,17 @@ def _read_ndjson(raw: bytes, name: str) -> tuple[Sequence[Mapping[str, Any]], Se
         if not isinstance(row, dict):
             raise SourceError(f"'{name}' line {number} is a {type(row).__name__}, not a JSON object")
         rows.append(row)
+        lines.append(number)
         for key in row:
             if key not in seen:
                 seen.add(key)
                 columns.append(str(key))
-    return rows, columns
+    return rows, columns, lines
 
 
-def _read_csv(raw: bytes, name: str) -> tuple[Sequence[Mapping[str, Any]], Sequence[str]]:
+def _read_csv(
+    raw: bytes, name: str
+) -> tuple[Sequence[Mapping[str, Any]], Sequence[str], Sequence[int]]:
     """A header row and then values, every one of them a string.
 
     Strings all the way through is the point rather than a limitation: `coerce_value` is the same
@@ -142,13 +178,16 @@ def _read_csv(raw: bytes, name: str) -> tuple[Sequence[Mapping[str, Any]], Seque
         raise SourceError(f"'{name}' has no header row, so its columns cannot be named")
     columns = [str(f) for f in reader.fieldnames]
     rows: list[Mapping[str, Any]] = []
+    lines: list[int] = []
     for number, row in enumerate(reader, start=2):
         if None in row:
             raise SourceError(
                 f"'{name}' line {number} has more values than the header has columns"
             )
         rows.append({k: v for k, v in row.items() if k is not None})
-    return rows, columns
+        # `start=2` above is the header offset, so this is the line an operator opens the file to.
+        lines.append(number)
+    return rows, columns, lines
 
 
 def write_rejects(path: str | Path, rows: Sequence[Mapping[str, Any]]) -> None:

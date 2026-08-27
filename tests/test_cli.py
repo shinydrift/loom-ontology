@@ -404,9 +404,9 @@ def test_run_goes_through_the_same_runtime_entry_point_the_mcp_tool_will(tmp_pat
     calls: list[tuple] = []
     original = ActionRuntime.run
 
-    def spy(self, name, params, *, actor=None, dry_run=False):
+    def spy(self, name, params, *, actor=None, dry_run=False, **kw):
         calls.append((name, dict(params), dry_run))
-        return original(self, name, params, actor=actor, dry_run=dry_run)
+        return original(self, name, params, actor=actor, dry_run=dry_run, **kw)
 
     monkeypatch.setattr(ActionRuntime, "run", spy)
     main(["run", "upgradeTier", str(ontology), "--param", "customer=c1",
@@ -1021,3 +1021,86 @@ def test_the_cli_can_say_which_build_it_is(capsys):
 
     assert e.value.code == 0
     assert capsys.readouterr().out.strip() == f"loom {loom_version()}"
+
+
+# --- probe #7: validate answers the question every other verb answers ------------------------
+
+
+GOVERNED_CONFIG = LOCAL_CONFIG + """
+governance:
+  policies:
+    - name: hide-tier
+      objectType: Customer
+      mask: [tier]
+"""
+
+BAD_PREDICATE_CONFIG = LOCAL_CONFIG + """
+governance:
+  policies:
+    - name: bad-predicate
+      objectType: Customer
+      rows: "object.nosuchprop != 'x'"
+"""
+
+
+def test_validate_refuses_a_mask_over_a_property_an_action_writes(tmp_path, capsys):
+    """`ok · loom.yaml ok` on a config `loom serve` will not start on is the one answer this command
+    must not give.
+
+    The seventh probe found three such configs, and this is the one the retail example's own
+    `loom.yaml` promises about in so many words: *"Try masking `tier` instead and the server refuses
+    to start."* True of serve, true of query, true of run, true of embed — and `loom validate`, the
+    command whose whole job is to answer *is this good?*, printed ok and exited 0. It read the
+    config for well-formedness and never paired it with the spec."""
+    ontology = _project(tmp_path, GOVERNED_CONFIG)
+    assert main(["validate", str(ontology)]) == 1
+    _, err = capsys.readouterr()
+    assert "upgradeTier" in err and "tier" in err
+
+
+def test_validate_refuses_a_row_predicate_naming_no_property(tmp_path, capsys):
+    """The same gap, reached by the other half of `bind_policies`."""
+    ontology = _project(tmp_path, BAD_PREDICATE_CONFIG)
+    assert main(["validate", str(ontology)]) == 1
+    _, err = capsys.readouterr()
+    assert "nosuchprop" in err
+
+
+def test_validate_does_not_refuse_a_policy_that_merely_names_a_caller(tmp_path):
+    """The line this check stops at, and it is deliberate.
+
+    A `when:` policy is refused by the surfaces that can never attest a caller — `loom query`,
+    `loom run`, a stdio server. That is a fact about *those surfaces*, not a defect in the config:
+    the same file served over `http` with `mcp.auth` is correct. Refusing it here would fail a
+    deployment that is valid for the transport it declares."""
+    config = LOCAL_CONFIG + """
+mcp:
+  transport: http
+  auth:
+    issuer: https://issuer.example.com
+    audience: loom
+    jwks_uri: https://issuer.example.com/jwks.json
+    claims:
+      groups: string[]
+governance:
+  policies:
+    - name: gold-desk
+      objectType: Customer
+      when: "principal.groups contains 'gold-desk'"
+      rows: "object.tier == 'gold'"
+"""
+    ontology = _project(tmp_path, config)
+    assert main(["validate", str(ontology)]) == 0
+
+
+def test_validate_still_passes_a_config_whose_policies_do_fit(tmp_path):
+    """The pinned half: the new check refuses a pairing, not a governance block."""
+    config = LOCAL_CONFIG + """
+governance:
+  policies:
+    - name: hide-ltv
+      objectType: Customer
+      mask: [ltv]
+"""
+    ontology = _project(tmp_path, config)
+    assert main(["validate", str(ontology)]) == 0

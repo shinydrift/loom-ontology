@@ -224,3 +224,69 @@ def test_no_ingest_tool_appears_on_the_surface(app_module):
     server, _ = module.build_loom_server(ontology, config)
 
     assert not [name for name in server.tools if "ingest" in name or "load" in name]
+
+
+# --- probe #7: the passthrough refuses a malformed call instead of breaking on it -------------
+
+
+def _call_route(module, config, body):
+    """`POST /api/call` against a client that would answer anything, so the response is the route's.
+
+    The tool is advertised but never reached by any of these — every case is refused before the
+    session is touched, which is the property under test."""
+    from starlette.testclient import TestClient
+
+    class _StubClient:
+        url = "http://127.0.0.1:8765/mcp"
+        server_name = "loom-retail-dashboard"
+        tools = [{"name": "get_customer"}]
+
+        async def call(self, name, arguments):
+            return {"name": name, "arguments": arguments, "isError": False, "result": {}, "ms": 0}
+
+    app = module.build_app(_StubClient(), config, writes=True)
+    return TestClient(app).post("/api/call", json=body)
+
+
+def test_a_non_object_arguments_is_a_400_and_not_a_500(app_module):
+    """The guard checked the body and not the one key inside it that has to be an object too.
+
+    `{"name": "get_customer", "arguments": "c1"}` is a JSON object, so it passed, and the string
+    reached the MCP SDK, failed pydantic validation, and came back as a bare `Internal Server
+    Error`. The route's own comment says who that hurts: "a person with curl, reading the rail and
+    reproducing a call by hand", for whom "the server broke" is the wrong thing to believe."""
+    pytest.importorskip("starlette")
+    module, target = app_module
+    _, config = module.load_project(target / "dashboard" / "loom.yaml")
+
+    for arguments in ("c1", ["c1"], 7):
+        response = _call_route(module, config, {"name": "get_customer", "arguments": arguments})
+        assert response.status_code == 400, arguments
+        assert "arguments" in response.json()["error"]
+
+
+def test_a_missing_name_is_not_reported_as_a_tool_called_none(app_module):
+    """`no tool named None on this deployment` — Python's spelling of absence, handed to somebody
+    who never wrote it. The key is missing; say that."""
+    pytest.importorskip("starlette")
+    module, target = app_module
+    _, config = module.load_project(target / "dashboard" / "loom.yaml")
+
+    response = _call_route(module, config, {"arguments": {}})
+    assert response.status_code == 400
+    assert "None" not in response.json()["error"]
+    assert '"name"' in response.json()["error"]
+
+
+def test_a_well_formed_call_still_goes_straight_through(app_module):
+    """The pinned half: the guards refuse malformed calls and nothing else. `arguments` may still be
+    omitted entirely, which is how a no-argument tool is called."""
+    pytest.importorskip("starlette")
+    module, target = app_module
+    _, config = module.load_project(target / "dashboard" / "loom.yaml")
+
+    ok = _call_route(module, config, {"name": "get_customer", "arguments": {"key": "c1"}})
+    assert ok.status_code == 200 and ok.json()["arguments"] == {"key": "c1"}
+
+    omitted = _call_route(module, config, {"name": "get_customer"})
+    assert omitted.status_code == 200 and omitted.json()["arguments"] == {}

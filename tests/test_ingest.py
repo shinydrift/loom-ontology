@@ -1148,3 +1148,86 @@ def test_a_conflict_still_says_the_check_was_carried_in(ontology, tmp_path):
 
     assert result.status == REFUSED and result.retryable
     assert "enforced" in result.concurrency
+
+
+# --- probe #7: a refusal names a place in the file -------------------------------------------
+
+
+def test_a_refusal_names_the_files_own_line_number(ontology, tmp_path):
+    """`row 0` is a place no file has, and it was what the first line of every file was called.
+
+    The runtime numbered `enumerate(batch.rows)` from zero while the reader numbered real file lines
+    from one, so one command's output carried both schemes under two words: a parse failure said
+    `line 2` and a type failure on the first row said `row 0`. An operator handed either one opens
+    the file and counts."""
+    rows = [{"customerId": "c9", "name": "A", "tier": "bronze", "ltv": "not-a-number"}]
+    result = runtime(ontology, FakeBulkCatalog()).load("customers", ndjson(tmp_path, rows))
+
+    assert result.status == REFUSED
+    assert result.failures[0].message.startswith("line 1: ")
+    assert result.failures[0].detail["row"] == "line 1"
+
+
+def test_a_blank_line_does_not_shift_every_number_after_it(ontology, tmp_path):
+    """The reader skips blank lines, so the parsed index and the file line part company at the first
+    one — and the parsed index was what got reported. The bad row here is on file line 3."""
+    path = tmp_path / "gap.ndjson"
+    path.write_text(
+        json.dumps({"customerId": "c9", "name": "A", "tier": "bronze", "ltv": 1.0})
+        + "\n\n"
+        + json.dumps({"customerId": "c10", "name": "B", "tier": "gold", "ltv": "nope"})
+        + "\n"
+    )
+    result = runtime(ontology, FakeBulkCatalog()).load("customers", path)
+
+    assert result.status == REFUSED
+    assert "line 3" in result.failures[0].message
+
+
+def test_the_quarantine_file_and_the_reported_failure_say_the_same_thing(ontology, tmp_path):
+    """`_loom_rejected` mixed both spellings in one file: the null-key path wrote
+    `"row 2: customerId is null"` and the type path wrote a bare `"property 'ltv': ..."` with no
+    location at all. A quarantine you cannot look up is a quarantine you re-derive by hand."""
+    rows = [
+        {"customerId": "c9", "name": "A", "tier": "bronze", "ltv": "nope"},
+        {"customerId": None, "name": "B", "tier": "gold", "ltv": 1.0},
+    ]
+    rt = runtime(ontology, FakeBulkCatalog())
+    result = rt.load("customers", ndjson(tmp_path, rows), reject_to=tmp_path / "rej.ndjson")
+
+    assert result.status == APPLIED and result.rows_rejected == 2
+    quarantined = [json.loads(x) for x in (tmp_path / "rej.ndjson").read_text().splitlines()]
+    assert [q["_loom_rejected"][0].split(":")[0] for q in quarantined] == ["line 1", "line 2"]
+
+
+def test_a_csv_line_number_counts_the_header(ontology, tmp_path):
+    """A CSV's first data row is file line 2, and that is the line the operator opens to."""
+    path = tmp_path / "c.csv"
+    path.write_text("customerId,name,tier,ltv\nc9,A,bronze,nope\n")
+    result = runtime(ontology, FakeBulkCatalog(), [entry(fmt="csv")]).load("customers", path)
+
+    assert result.status == REFUSED
+    assert "line 2" in result.failures[0].message
+
+
+def test_parquet_has_rows_and_not_lines(ontology, tmp_path):
+    """The one format with no lines to name, so it says `row N` — 1-based, never `row 0`."""
+    pytest.importorskip("pyarrow")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "p.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "customerId": pa.array(["c9"], pa.string()),
+                "name": pa.array(["A"], pa.string()),
+                "tier": pa.array(["nope"], pa.string()),
+            }
+        ),
+        path,
+    )
+    result = runtime(ontology, FakeBulkCatalog(), [entry(fmt="parquet")]).load("customers", path)
+
+    assert result.status == REFUSED
+    assert "row 1" in result.failures[0].message
