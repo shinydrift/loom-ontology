@@ -212,6 +212,28 @@ def coerce_value(
     if value is None:
         return None
     kind = prop_type.kind
+    # A JSON `true` has no reading as anything but a boolean, and the one it was getting was a
+    # *Python* one: `str(True)` is `"True"`, so a bare `{"name": true}` searched `full_name` for the
+    # substring `True` and `{"ltv": true}` compared against `1.0`. That is the Python-repr defect
+    # `filters._coerced` refuses a list and an object for, reaching the one scalar whose repr is not
+    # its JSON spelling — and it is the *plausible* half of it, because `0 rows` is an answer.
+    # `_as_integer` already said this for `int`/`long`; said once here it is true of every kind.
+    if isinstance(value, bool) and kind != "boolean":
+        # Raised bare rather than wrapped, because the caller's wrapper renders the value with
+        # `repr` — "cannot read True as string" would spell the argument the way Python writes it
+        # while telling the caller their JSON was wrong.
+        # Two readings, so two halves of a sentence: `str(True)` is a Python spelling and
+        # `float(True)` is a number the caller never wrote. Naming the one that applies is what makes
+        # this an explanation rather than a restatement of the refusal.
+        became = (
+            "Python's spelling of it"
+            if kind in ("string", "enum", "objectRef")
+            else f"{'1' if value else '0'}"
+        )
+        raise ValueError(
+            f"{ctx}: cannot read {'true' if value else 'false'} as {kind} — a boolean is not a "
+            f"{kind}, and reading it as one would have compared against {became}"
+        )
     if kind == "objectRef":
         # An objectRef travels as the referenced object's primary key, so it coerces as that key's
         # type — not as a string.
@@ -265,11 +287,19 @@ def _as_integer(value: object) -> int:
 
 
 def _as_decimal(prop_type: PropType, value: object) -> Decimal:
-    """`Decimal(str(value))`, then checked against the declared precision and scale.
+    """`Decimal(str(value))`, then checked against the declared precision and scale, then *held* at
+    that scale.
 
     Checked here rather than left to the storage layer because the storage layer's only options are
     to round or to raise something unreadable, and rounding money is exactly what declaring a
-    `decimal` was meant to prevent."""
+    `decimal` was meant to prevent.
+
+    The last step is what makes that true. Checking alone left `"450"` — a legal `decimal(12,2)`,
+    and the way anyone writes a whole number of pounds — as a `Decimal` of scale 0, which is a
+    different Iceberg type from the column's: pyiceberg answered `Could not convert 450 into a
+    decimal(12, 2)`, the unreadable raise this function exists to pre-empt, for an input that was
+    never wrong. `quantize` cannot round here, because the scale check above has already refused
+    everything with more places than the column holds — it only ever pads."""
     if isinstance(value, float):
         raise ValueError("a float cannot be read as a decimal without losing precision — send a string")
     try:
@@ -292,7 +322,7 @@ def _as_decimal(prop_type: PropType, value: object) -> Decimal:
     # 13-digit integer at scale 2 needs 15.
     if len(digits) + scale + exponent > precision:
         raise ValueError(f"has more digits than {spelling} can hold")
-    return out
+    return out.quantize(Decimal(1).scaleb(-scale))
 
 
 def _as_date(value: object) -> date:

@@ -36,7 +36,7 @@ contract). A property/parameter `type` is one of:
 | `date`         | `date`            | `{type: string, format: date}`             | |
 | `timestamp`    | `timestamptz`     | `{type: string, format: date-time}`        | tz-aware; UTC on the wire |
 | `enum`         | `string` + check  | `{type: string, enum: [...]}`              | requires `values` |
-| `objectRef`    | (referenced PK)   | `{type: string}`                           | **parameters only**; requires `objectType` |
+| `objectRef`    | (referenced PK)   | `{type: string}`                           | **parameters only**; requires `objectType`; resolved only as a target key (§4.1) |
 
 Deferred to a later version (call it out rather than pretend): `array<T>`, `struct`, `map`,
 `geo`. Adding one = one new row here + adapter lowering; that's the extension shape.

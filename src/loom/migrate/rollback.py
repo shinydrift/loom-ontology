@@ -81,8 +81,18 @@ class LeftBehind:
     """A live column, or a whole table, that the rollback will not take back.
 
     Mirrors `diff.Unmanaged` on purpose — after the rollback that is exactly what these are. The
-    difference is provenance: an ordinary unmanaged column is someone else's data, and one of these
-    is a column Loom itself added, on a version this rollback is undoing."""
+    difference is which spec last claimed it: an ordinary unmanaged column is one no version of this
+    ontology ever mapped, and one of these is mapped by the spec the lake is at now and not by the
+    one it is going back to.
+
+    **That is narrower than "a column Loom added", which is what this used to say.** The set is a
+    spec diff and nothing else, so a column that was already live and was merely *adopted* by a later
+    version — `region` in the retail example, which `loom.yaml`'s own comment says is filled by
+    something that is not Loom — lands in it having never been created by an apply. Told it was
+    "added after version N", an operator tidying up after a rollback is pointed at somebody else's
+    column. The provenance that would separate the two is in `_loom_meta.applied.summary`, and only
+    as the plan's display prose; §9 says a rollback must not parse that, so the wording says what a
+    spec diff can establish and stops there."""
 
     catalog: str
     table: str

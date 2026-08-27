@@ -369,3 +369,48 @@ def test_a_governance_predicate_cannot_reach_the_hint_channel(ontology):
     source = engine.plan.source
     assert source.table.predicate is not None
     assert pushdown_hints(source.filters) == ()
+
+
+# ---- what a scalar is allowed to be ---------------------------------------------
+
+
+def test_a_decimal_written_at_a_shorter_scale_is_held_at_the_declared_one(ontology):
+    """`"450"` is a legal `decimal(12,2)` and the way anyone writes a whole number of pounds.
+
+    It was checked and then handed on unquantized, so the value reaching Iceberg had scale 0 where
+    the column has 2, and pyiceberg answered `Could not convert 450 into a decimal(12, 2)` — a raw
+    engine error, on the MCP surface, for an input that was never wrong. `_as_decimal`'s docstring
+    already said the storage layer's only options are to round or to raise something unreadable;
+    checking without normalising left the raise reachable anyway.
+
+    `gte` and `in` never had it: only `eq`/`ne` push the literal down as an Iceberg predicate, so the
+    same value worked through one operator and blew up through another. Asserted through `lower`,
+    which is what both spellings share."""
+    from decimal import Decimal
+
+    order = ontology.object_types["Order"]
+    for spelling in ("450", "450.0", "450.00"):
+        (compare,) = _lower(ontology, order, "total", {"eq": spelling})
+        assert compare.right.value == Decimal("450.00")
+        assert compare.right.value.as_tuple().exponent == -2, spelling
+
+    # Still refused for more places than the column holds — quantize only ever pads.
+    with pytest.raises(FilterError, match="more than 2 decimal place"):
+        _lower(ontology, order, "total", {"eq": "450.001"})
+
+
+def test_a_json_boolean_is_refused_rather_than_read_as_pythons_spelling(ontology, customer):
+    """`str(True)` is `"True"`, not `true`, so `{"name": true}` searched `full_name` for a Python
+    repr — the defect `_coerced` refuses a list and an object for, reaching the one scalar whose
+    repr is not its JSON spelling. It is the *plausible* half of that: `0 rows` is an answer, and a
+    caller gets no sign the argument was never understood.
+
+    Refused for every kind but `boolean`, where it is the value. `int`/`long` already said this;
+    saying it once above them makes it true of `string`, `double`, `date` and the rest."""
+    for value in (True, False):
+        with pytest.raises(FilterError, match="a boolean is not a string"):
+            _lower(ontology, customer, "name", value)
+        with pytest.raises(FilterError, match="a boolean is not a enum"):
+            _lower(ontology, customer, "tier", {"eq": value})
+        with pytest.raises(FilterError, match="a boolean is not a"):
+            _lower(ontology, customer, "name", {"in": [value]})

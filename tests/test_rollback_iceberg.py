@@ -69,7 +69,7 @@ def test_a_rollback_reverses_the_rename_and_leaves_the_add(project, capsys):
     # Reversing an add means dropping, and Loom never drops — so `region` stays, unmapped by the
     # restored spec, and the report names it rather than leaving it to be found later.
     assert "region" in after.columns
-    assert "region — added after version 1" in out
+    assert "region — mapped by the spec you are leaving, not by version 1" in out
     assert "Rows are untouched" in out
     # And the spec is back, byte for byte — this is what `_loom_meta.spec` is stored verbatim for.
     assert (ontology / "person.yaml").read_text() == version_1
@@ -146,7 +146,7 @@ def test_a_spec_file_added_since_is_deleted_and_its_table_left_whole(project, ca
     assert "- person.yaml — to delete; it did not exist at that version" in out
     assert not (ontology / "person.yaml").exists()
     assert _local(config).table_exists("hr.people")
-    assert "local.hr.people — the whole table, created after version 1" in out
+    assert "local.hr.people — the whole table, mapped by the spec you are leaving and not by version 1" in out
 
 
 def test_rollback_needs_a_config_and_a_history_like_everything_else(tmp_path, capsys):

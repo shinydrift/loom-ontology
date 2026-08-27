@@ -111,6 +111,26 @@ opposite of silence — a person wrote the word, named the object type, and the 
 declared parameter. The scopes differ too. Never-drop governs **schema**: Loom never drops a column
 or a table, in any command. This removes **one row**, addressed by primary key.
 
+**An `objectRef` is a key, and only one of them per run is resolved.** The runtime reads the row an
+effect's `key` addresses — that is where `object_not_found` comes from — and every *other* `objectRef`
+parameter is bound, type-checked against the referenced type's primary key, and written as the value
+it is. `recordOrder(customer: "c999")` creates an Order whose `placedBy` traverses to nothing, and a
+`create` has no target row at all, so **no** `objectRef` on a create is ever resolved.
+
+Not an oversight, and not a gap the runtime should close on its own. A reference check could not be
+carried into the write's own commit the way the snapshot assertion is — the referenced row can be
+deleted between the check and the commit — so it would *narrow* the window rather than close it,
+which is the thing the concurrency paragraph below refuses to let the word "optimistic" cover.
+Referential integrity is a lake-wide property and Loom does not own the tables; §3 compiles a link
+to a JOIN and promises nothing about a key on either side of it.
+
+Two consequences worth stating rather than discovering. The generated tool description says which
+kind of `objectRef` a parameter is, because "key of a Customer" read as a promise it was not. And
+`governance.policies` — whose `rows:` half is stated as *an agent cannot act on a row it cannot
+see* — enforces that where the ref is the target and not where it is a referencing parameter: a
+caller who cannot read a withheld Customer can still create an Order naming one. Closing that means
+deciding what a reference *is*, and it is on the backlog rather than half-answered here.
+
 **The key is checked for uniqueness before the write.** The primary key is single-property in v0
 and Loom does not own the table, so nothing physically guarantees it is unique — and an
 equality-delete on a key matching two rows would remove both and append one. A key matching more

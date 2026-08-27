@@ -822,3 +822,43 @@ def test_an_expression_that_cannot_be_evaluated_is_its_own_code(ontology, catalo
 
     assert [f.code for f in result.failures] == [EXPRESSION_ERROR]
     assert catalog.writes == []
+
+
+# ---- what an objectRef parameter is, and is not --------------------------------
+
+
+def test_an_objectref_that_is_not_the_target_key_is_written_as_sent(ontology, catalog):
+    """Only one objectRef per run is resolved: the one an effect's `key` addresses.
+
+    `forgetCustomer` and `upgradeTier` read that row and refuse `object_not_found`; a `create` has
+    no prior row, so an objectRef among its parameters is bound, type-checked and written as the
+    string it is. `run_record_order` in the retail example accepted a customer key naming nobody and
+    committed an Order whose `placedBy` traverses to nothing — while the tool description generated
+    for that same parameter said *key of a Customer*.
+
+    The behaviour is deliberate and stays: a reference check could not be carried into the write's
+    own commit the way the snapshot assertion is, so it would narrow the window rather than close
+    it, which §4.1 refuses to call optimistic concurrency. What changed is that the surface stops
+    claiming otherwise — see `test_an_objectref_parameter_says_what_is_checked` in
+    `test_mcp_registry.py`. This pins the pair together, so the sentence cannot drift back."""
+    from dataclasses import replace
+
+    from loom.model import Ontology, Parameter, PropType
+
+    create = ontology.actions["createOrder"]
+    params = dict(create.parameters)
+    params["customerId"] = replace(
+        params["customerId"], type=PropType(kind="objectRef", object_type="Customer")
+    )
+    assert isinstance(params["customerId"], Parameter)
+    runtime = ActionRuntime(
+        ontology=Ontology(
+            ontology.object_types, ontology.link_types, {"createOrder": replace(create, parameters=params)}
+        ),
+        catalogs={"rest_main": catalog},
+    )
+
+    result = runtime.run("createOrder", {"orderId": "o9", "customerId": "nobody", "total": "1.00"})
+
+    assert result.status == APPLIED, result.failures
+    assert catalog.row("sales.orders", "id", "o9")["customer_id"] == "nobody"

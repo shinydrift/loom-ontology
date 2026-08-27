@@ -1104,3 +1104,47 @@ def test_a_refusal_message_carries_no_python_internals(ontology, tmp_path):
     assert "<class" not in message and "ConversionSyntax" not in message
     assert "cannot read '12,50' as decimal (not a number)" in message
     assert "<class" not in json.dumps(result.as_json())
+
+
+def test_a_refused_load_does_not_claim_the_check_it_never_made(ontology, tmp_path):
+    """`concurrency` had the mode axis and not the status one, so a `replace` refused before it
+    opened its source file reported `enforced` beside a `readSnapshotId` of null.
+
+    That is the sentence `ActionResult.concurrency` was corrected for on the single-row plane — and
+    it lands harder here, because `enforced` is the whole of what makes `replace`, the mode that
+    empties a table, safe to run. Asserted for `merge` too: only `append` had an honest answer, and
+    only because its answer is true of every append whatever happened."""
+    for mode in ("replace", "merge"):
+        catalog = FakeBulkCatalog()
+        result = runtime(ontology, catalog, [entry(mode=mode)]).load(
+            "customers", tmp_path / "does-not-exist.ndjson"
+        )
+
+        assert result.status == REFUSED
+        assert [f.code for f in result.failures] == [SOURCE_ERROR]
+        assert result.read_snapshot_id is None
+        assert "not reached" in result.concurrency, mode
+        assert "enforced" not in result.concurrency, mode
+
+
+def test_a_conflict_still_says_the_check_was_carried_in(ontology, tmp_path):
+    """The reason the refusal branch asks `retryable` rather than `status != APPLIED`.
+
+    A conflict refuses *because* the assertion went into the commit and the snapshot had moved —
+    which is the check working. Reporting it as "not reached" would make the one failure that proves
+    concurrency is enforced the one that denies it."""
+    catalog = FakeBulkCatalog()
+    original = catalog.current_snapshot_id
+
+    def moving(table):
+        value = original(table)
+        catalog.snapshots[table] = catalog.snapshots.get(table, 0) + 1
+        return value
+
+    catalog.current_snapshot_id = moving
+    result = runtime(ontology, catalog, [entry(mode="merge")]).load(
+        "customers", ndjson(tmp_path, GOOD)
+    )
+
+    assert result.status == REFUSED and result.retryable
+    assert "enforced" in result.concurrency

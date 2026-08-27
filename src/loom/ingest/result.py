@@ -273,9 +273,21 @@ class IngestResult:
 
         Mode-dependent as well as status-dependent, which is one more axis than an action's needs.
         An append genuinely asserts nothing and says so in words rather than by showing a `null` an
-        operator would have to interpret — *no check* and *the check passed* must not look alike."""
+        operator would have to interpret — *no check* and *the check passed* must not look alike.
+
+        The mode axis was here from the start and the status axis was not, so this claimed the one
+        thing `ActionResult.concurrency` had already been corrected for saying: a `replace` refused
+        before it opened its source file came back `status: refused`, `readSnapshotId: null` and
+        `concurrency: enforced`. Nothing was read and nothing was written, and the sentence named
+        the check that makes `replace` — the mode that empties a table — safe to run at all. Status
+        is asked **first** for the same reason it is on the action plane: a refusal that never
+        reached a write has no mode-dependent story to tell, and *no check* and *the check passed*
+        must not look alike there either. A **conflict** keeps "enforced" and is why this is not a
+        plain `status != APPLIED` — it refused precisely because the check was carried in."""
         if self.status == PREVIEWED:
             return "not checked — a preview writes nothing, and holds nothing"
+        if self.status == REFUSED and not self.retryable:
+            return "not reached — this load refused before the write, so nothing was asserted"
         if self.mode == "append":
             return "not asserted — an append reads nothing and puts no row over another"
         return "enforced — the write asserts the snapshot the read saw"

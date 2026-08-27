@@ -496,7 +496,12 @@ def test_run_input_schemas_come_from_the_declared_parameters(ontology):
 
     upgrade = tools["run_upgrade_tier"].input_schema["properties"][PARAMETERS_ARG]
     assert upgrade["properties"]["newTier"]["enum"] == ["silver", "gold"]
-    assert upgrade["properties"]["customer"]["description"] == "key of a Customer"
+    # Says which of the two things an objectRef can be. The runtime resolves the one an effect's
+    # `key` addresses and refuses `object_not_found`; every other one is written as sent. See
+    # `test_an_objectref_parameter_says_it_is_not_resolved`.
+    assert upgrade["properties"]["customer"]["description"].startswith(
+        "the primaryKey of a Customer, as the caller states it"
+    )
     assert sorted(upgrade["required"]) == ["customer", "newTier"]
 
     create = tools["run_create_order"].input_schema["properties"][PARAMETERS_ARG]
@@ -830,3 +835,41 @@ def test_no_declared_ingest_can_reach_the_tool_surface(ontology):
         for schema in _objects(tool.input_schema):
             for field in (schema.get("properties") or {}):
                 assert field not in ("mode", "format", "batch", "rows", "source", "loadId")
+
+
+def test_an_objectref_parameter_says_what_is_checked(ontology):
+    """`key of a Customer` read as a promise that a key naming no Customer would be refused.
+
+    It is one for exactly one parameter per action — the objectRef an effect's `key` addresses,
+    which the runtime reads and refuses `object_not_found` for. Every other one is written as sent
+    (`test_an_objectref_that_is_not_the_target_key_is_written_as_sent`), and an agent handed the old
+    sentence had no way to tell which kind it was holding.
+
+    An author's own `description` still replaces this outright rather than being appended to: the
+    generated sentence is Loom's claim about the surface, and a spec author writing one is making
+    their own."""
+    from dataclasses import replace
+
+    tools = _tools(ontology, runtime=_runtime(ontology))
+    described = tools["run_upgrade_tier"].input_schema["properties"][PARAMETERS_ARG]["properties"]
+
+    assert described["customer"]["type"] == "string"
+    assert "resolves it only where it addresses the row this action targets" in (
+        described["customer"]["description"]
+    )
+    assert "key of a Customer" not in described["customer"]["description"]
+
+    upgrade = ontology.actions["upgradeTier"]
+    params = dict(upgrade.parameters)
+    params["customer"] = replace(params["customer"], description="Customer to upgrade")
+    authored_ont = replace(
+        ontology,
+        actions={**ontology.actions, "upgradeTier": replace(upgrade, parameters=params)},
+    )
+    authored = _tools(authored_ont, runtime=_runtime(authored_ont))
+    assert (
+        authored["run_upgrade_tier"].input_schema["properties"][PARAMETERS_ARG]["properties"][
+            "customer"
+        ]["description"]
+        == "Customer to upgrade"
+    )
