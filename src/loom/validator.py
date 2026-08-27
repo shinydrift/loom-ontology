@@ -15,7 +15,7 @@ import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-from ._shape import snake_case, suggest
+from ._shape import MEMBER_NAME, OBJECT_NAME, identifier_problem, snake_case, suggest
 from .errors import Diagnostics, SourceLoc
 from .expr import FUNCTIONS, Binary, Call, Expr, Literal, Ref, Unary
 from .loader import _Loaded
@@ -39,19 +39,16 @@ _ARITH = {"+", "-", "*", "/"}
 # an action `validation:` rule naming it — so Loom would serve a property that no row predicate could
 # ever govern, while `mask:` (a list of strings, not an expression) still reached it. Half of §6
 # applying to a property and half not is not a policy anybody wrote.
-_OBJECT_NAME = re.compile(r"^[A-Z][A-Za-z0-9]*$")
-_MEMBER_NAME = re.compile(r"^[a-z][A-Za-z0-9]*$")
+# The patterns themselves live in `_shape`, so the command that *generates* an api name reads the
+# same grammar the command that checks one does. See `_shape.OBJECT_NAME`.
+_OBJECT_NAME = OBJECT_NAME
+_MEMBER_NAME = MEMBER_NAME
 
 
 def _check_name(kind: str, name: str, pattern: re.Pattern[str], loc: SourceLoc, diag: Diagnostics) -> None:
-    if pattern.match(name):
-        return
-    shape = "PascalCase" if pattern is _OBJECT_NAME else "camelCase"
-    diag.error(
-        f"{kind} '{name}' is not a legal identifier — {shape}, matching '{pattern.pattern}' "
-        f"(spec-v0 §0). Letters and digits only: no spaces, no underscores, no leading digit",
-        loc,
-    )
+    problem = identifier_problem(kind, name, pattern)
+    if problem is not None:
+        diag.error(problem, loc)
 
 
 def _validate_identifiers(loaded: _Loaded, diag: Diagnostics) -> None:

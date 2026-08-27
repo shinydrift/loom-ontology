@@ -22,9 +22,19 @@ It **opens no catalog and writes no file**, which is what keeps it clear of the 
 it bends: `BulkWriter` has no DDL verb because a *load* must never infer a *migration* from the
 shape of somebody's file. This runs before there is a table, produces text, and stops.
 
-And the draft **does not validate** until a person has been through it — `primaryKey` and `backing`
-come out as placeholders no property matches, so `loom validate` fails on them by name. A scaffold
-that emitted something immediately servable is a scaffold that gets committed unread.
+**Two things a file cannot answer, and the flags that answer them.** `primaryKey` and `backing` come
+out as placeholders no property matches, so a draft made without `--key`, `--catalog` and `--table`
+does not validate — `loom validate` fails on them by name, and the note under the draft says so. A
+scaffold that emitted something immediately servable is a scaffold that gets committed unread.
+
+The command above passes all three, so *that* draft does validate, and its note says that instead.
+Both notes are true and they are different sentences; the one you get depends on what you told it.
+What no draft answers for you is `title`, `searchable` and any `enum` — those are questions rather
+than placeholders, so a draft is poorer for leaving them and validates either way.
+
+`--as` is checked before anything is read: it names the objectType the draft declares, so it has to
+be a name a spec can hold (PascalCase, §0). `--as daily_sales` is refused here rather than drafted
+and refused later by `loom validate`.
 
 Parquet only. A CSV declares no types at all, so every type would be sniffed from a sample — and
 decimal-versus-double on a money column is the sniff that loses fractions of a cent silently. JSON

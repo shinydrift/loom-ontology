@@ -289,11 +289,31 @@ def build_app(client: LoomClient, config, *, writes: bool):
                 status_code=400,
             )
         name = body.get("name")
-        if not isinstance(name, str) or not any(t["name"] == name for t in client.tools):
+        if not isinstance(name, str):
+            # Said as its own refusal rather than folded into the one below, which rendered a missing
+            # key as `no tool named None on this deployment` — Python's spelling of absence, offered
+            # to somebody who never wrote it.
+            return JSONResponse(
+                {"error": 'request needs a "name": the tool to call, as a string'},
+                status_code=400,
+            )
+        if not any(t["name"] == name for t in client.tools):
             # Not a permission check — the server would refuse an unknown tool by itself, and says
             # so better. This keeps the rail honest: everything in it is a call that was made.
             return JSONResponse({"error": f"no tool named {name!r} on this deployment"}, status_code=400)
-        return JSONResponse(await client.call(name, body.get("arguments") or {}))
+        arguments = body.get("arguments")
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            # The other half of the guard above, and the half it was missing: the *body* was checked
+            # for being an object and `arguments` was not, so `{"name": "get_customer",
+            # "arguments": "c1"}` reached the MCP SDK, failed pydantic validation, and came back as
+            # the bare 500 this route exists to not produce.
+            return JSONResponse(
+                {"error": '"arguments" must be a JSON object of the tool\'s arguments, or omitted'},
+                status_code=400,
+            )
+        return JSONResponse(await client.call(name, arguments))
 
     async def refresh(_request: Request):
         return JSONResponse(await asyncio.to_thread(_refresh_aggregate, config))

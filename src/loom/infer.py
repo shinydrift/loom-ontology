@@ -38,6 +38,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from ._shape import OBJECT_NAME, identifier_problem
+
 # Only one, and the refusals below are the argument for keeping it that way until each of the others
 # has an answer better than a shrug.
 INFER_FORMATS = ("parquet",)
@@ -262,7 +264,20 @@ def infer_draft(
     """One file plus the two things it cannot contain: what to call this, and where it lives.
 
     `key` names a *source column*, not a property, because at the point somebody runs this the
-    property does not exist yet — they are looking at a file."""
+    property does not exist yet — they are looking at a file.
+
+    `--as` is checked against §0's identifier grammar before anything is read. It is the one value
+    here that comes from the caller rather than the file, and it was the one value nothing checked:
+    `--as "not a name"` and `--as daily_sales` both drafted happily and printed *"the placeholders
+    are answered — this draft validates as it stands"*, which `loom validate` then refused. A
+    scaffold whose whole contract is "this validates" must not be able to emit something that
+    doesn't."""
+    problem = identifier_problem("objectType apiName", api_name, OBJECT_NAME)
+    if problem is not None:
+        raise InferError(
+            f"{problem}. '--as' names the objectType this draft declares, so it has to be a name a "
+            f"spec can hold"
+        )
     columns = read_columns(source, fmt)
 
     names: dict[str, str] = {}

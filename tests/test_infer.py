@@ -387,3 +387,50 @@ def test_the_command_says_the_draft_validates_when_it_does(tmp_path, capsys):
     assert "validates as it stands" in err
     # The questions a file cannot answer are still put, because they are still worth answering.
     assert "searchable" in err
+
+
+# --- probe #7 -----------------------------------------------------------------------------------
+
+
+def test_an_illegal_api_name_is_refused_rather_than_drafted():
+    """`--as` is the one value here the file cannot supply, and it was the one nothing checked.
+
+    The seventh probe ran `loom infer daily.parquet --as "not a name" --key … --catalog … --table …`
+    and got a full draft, exit code 0, and the note *"the placeholders are answered — this draft
+    validates as it stands."* `loom validate` then refused it by name. `--as daily_sales` — the
+    spelling somebody would actually type — did the same thing. §0's grammar was added to the
+    validator by PR #41 and never reached the command that *generates* a name."""
+    import pytest
+
+    from loom.infer import InferError, infer_draft
+
+    for bad in ("not a name", "daily_sales", "customer", "9Lives", ""):
+        with pytest.raises(InferError, match="not a legal identifier"):
+            infer_draft("unread.parquet", bad)
+
+
+def test_the_api_name_is_checked_before_the_file_is_opened():
+    """It refuses on a path that does not exist, which is how you can tell the check ran first.
+
+    Not a nicety: the refusal is about the argument, so making the operator supply a readable file
+    before being told their name is wrong is two round trips for one mistake."""
+    import pytest
+
+    from loom.infer import InferError, infer_draft
+
+    with pytest.raises(InferError, match="not a legal identifier"):
+        infer_draft("/nonexistent/nothing.parquet", "bad name")
+
+
+def test_a_legal_pascal_case_name_is_untouched(tmp_path):
+    """The pinned half — the grammar is §0's, not a new one."""
+    pytest.importorskip("pyarrow")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from loom.infer import infer_draft
+
+    path = tmp_path / "d.parquet"
+    pq.write_table(pa.table({"id": pa.array(["a"], pa.string())}), path)
+    for good in ("DailySalesPerformance", "Customer", "ABCTest", "X9"):
+        assert infer_draft(path, good).api_name == good

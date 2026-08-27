@@ -119,11 +119,39 @@ def cmd_infer(args) -> int:
     return 0
 
 
+def _check_policy_pairing(ontology, config) -> None:
+    """Refuse here what `bind_policies` refuses everywhere else — the spec-and-config *pairing*.
+
+    `load_config` above answers *is this file well-formed*: an unknown provider, a stray `dims:`, a
+    `sequences:` entry naming an ingest entry that does not exist. It cannot answer *does this
+    deployment stand on this spec*, because that question needs both halves at once — a `mask:` over
+    a property an action writes is a spec that is fine and a policy that is fine and a pairing that
+    cannot run.
+
+    Without this, the command whose whole job is to answer *is this good?* printed
+    `ok · loom.yaml ok` on configurations `loom query`, `loom run`, `loom embed` and `loom serve`
+    all refuse to start on — including the one the retail example's own `loom.yaml` promises will
+    refuse ("Try masking `tier` instead and the server refuses to start"). Probe #6 made this
+    command read the deployment half; this is the half of reading it that was still missing.
+
+    **Not `select(None)`.** A policy naming a caller is a fact about which *surfaces* can serve the
+    deployment, not a defect in it: `loom serve` over `http` with `mcp.auth` runs it correctly, and
+    `loom query` refuses the same config because it can attest nobody. Refusing here would fail a
+    deployment that is valid for the transport it declares."""
+    if config is None:
+        return
+    from .governance import bind_policies
+
+    auth = config.mcp.auth
+    bind_policies(ontology, config.policies, auth.claims if auth else {})
+
+
 def cmd_validate(args) -> int:
     # Bound before the `try`, not inside the `--physical` branch, so the `except` clause below has
     # the name whichever half ran. It costs nothing: `loom.catalog` reaches pyiceberg only through
     # `factory`, which imports it per catalog type at open time.
     from .catalog import CatalogError
+    from .governance import PolicyError
 
     diag = Diagnostics()
     suffix = ""
@@ -149,6 +177,7 @@ def cmd_validate(args) -> int:
             ontology = Ontology(
                 object_types=loaded.objects, link_types=loaded.links, actions=loaded.actions
             )
+            _check_policy_pairing(ontology, config)
             suffix = f" · physical ok against {len(config.catalogs)} catalog(s)"
         else:
             # `loom.yaml` is checked here too, and not only under `--physical`. Without this the one
@@ -166,8 +195,9 @@ def cmd_validate(args) -> int:
             # config are no longer the same sentence. `--physical` still *requires* one, because
             # catalogs are named in it and there is nothing to check against without them.
             config_path = find_config(args.path)
+            config = None
             if config_path is not None:
-                load_config(config_path, diag)
+                config = load_config(config_path, diag)
                 # Named rather than assumed. `find_config` looks in the ontology dir, then beside
                 # it, then in the working directory — so the file checked here is not always the one
                 # the caller had in mind, and a bare "loom.yaml ok" would be the same sentence for
@@ -179,8 +209,14 @@ def cmd_validate(args) -> int:
             ontology, ont_diag = build(args.path)
             diag.warnings.extend(ont_diag.warnings)
             diag.raise_if_errors()
+            _check_policy_pairing(ontology, config)
     except SpecErrors as e:
         print(str(e), file=sys.stderr)
+        return 1
+    except PolicyError as e:
+        # Worded as every other verb words it, because it *is* the refusal every other verb gives:
+        # the value of this command is that its answer and theirs are the same answer.
+        print(f"error: {e}", file=sys.stderr)
         return 1
     except CatalogError as e:
         # `--physical` is the only half of this command that opens anything, and a catalog that
@@ -481,7 +517,17 @@ def cmd_run(args) -> int:
         # so what the prompt shows is what is about to happen rather than a second guess at it. It
         # is a preview and not a recording — an effect holding `now()` gets a fresh value on the
         # run, for the same reason `loom apply` re-plans instead of replaying a saved plan.
-        preview = runtime.run(args.action, parameters, dry_run=True)
+        # `record_refusals` because of what happens four lines below: a refused preview is the end of
+        # this command, so it is the only chance this refusal has to reach `_loom_meta.edits`.
+        preview = runtime.run(
+            args.action,
+            parameters,
+            actor=default_actor(),
+            dry_run=True,
+            # Not under `--dry-run`, which is the caller asking *would this work* rather than trying
+            # to do it. A log of what was attempted should not fill up with questions.
+            record_refusals=not args.dry_run,
+        )
     except (ActionError, PolicyError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -492,6 +538,10 @@ def cmd_run(args) -> int:
     print(_render_run(preview, str(args.path)), file=sys.stderr)
     if not preview.ok or args.dry_run:
         print(json.dumps(json_safe(preview.as_json()), indent=2, default=str))
+        if preview.edit_id and not any(f.code == LOG_FAILED for f in preview.failures):
+            # Said for the refusal too, in the same words the applied path uses. The point of
+            # recording it is lost if the operator cannot tell that it was.
+            print(f"note: recorded in {EDIT_LOG_TABLE} as {preview.edit_id}.", file=sys.stderr)
         return 0 if preview.ok else 1
 
     if not _confirmed(args.yes, "run"):

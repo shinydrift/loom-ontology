@@ -862,3 +862,49 @@ def test_an_objectref_that_is_not_the_target_key_is_written_as_sent(ontology, ca
 
     assert result.status == APPLIED, result.failures
     assert catalog.row("sales.orders", "id", "o9")["customer_id"] == "nobody"
+
+
+# --- probe #7: a container is not a scalar, on the write path either -------------------------
+
+
+def test_a_container_parameter_is_refused_rather_than_stringified():
+    """A JSON array or object sent for a string parameter is refused, not `str()`d.
+
+    The seventh whole-app probe sent `{"orderId": ["a"]}` to a `create` and got back
+    `status: applied` with the key `"['a']"` — Python's repr of a list, committed as an Iceberg
+    primary key. `{"a": 1}` landed as `"{'a': 1}"` beside it. `filters._coerced` had refused exactly
+    this on the read path since PR #26 and kept the guard at its own call site, so the write path
+    never inherited it; the guard now lives in `coerce_value`, which is the function both doors go
+    through."""
+    from loom.model import coerce_value
+    from loom.types import PropType
+
+    for value, spelling in (([1, 2], "a list"), ({"a": 1}, "an object"), (("x",), "a list")):
+        with pytest.raises(ValueError) as e:
+            coerce_value(PropType(kind="string"), value, {}, "parameter 'orderId'")
+        assert spelling in str(e.value)
+        assert "Python's spelling" in str(e.value)
+
+
+def test_a_container_is_refused_for_every_kind_not_only_string():
+    """`string` is where it bit, because every other kind happened to raise on the way past. The
+    refusal is stated once for all of them rather than left to that coincidence — `int(['a'])`
+    raising `TypeError` is not the same promise as a rule."""
+    from loom.model import coerce_value
+    from loom.types import PropType
+
+    for kind in ("string", "int", "long", "double", "boolean", "date", "timestamp"):
+        with pytest.raises(ValueError, match="cannot read a list"):
+            coerce_value(PropType(kind=kind), ["x"], {}, "value")
+
+
+def test_scalar_coercion_is_untouched_by_the_container_refusal():
+    """The pinned half. `"42"` for a long and `42` for a string stay coerced — an agent sends both
+    and JSON cannot tell them apart. Only containers, which have no reading as a scalar at all,
+    became a refusal."""
+    from loom.model import coerce_value
+    from loom.types import PropType
+
+    assert coerce_value(PropType(kind="long"), "42", {}, "v") == 42
+    assert coerce_value(PropType(kind="string"), 42, {}, "v") == "42"
+    assert coerce_value(PropType(kind="string"), None, {}, "v") is None

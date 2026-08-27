@@ -545,13 +545,14 @@ class _Load:
         duplicates: list[Any] = []
 
         for index, source_row in enumerate(batch.rows):
-            row, problems = self._coerce(source_row, mapping, present, index)
+            where = batch.locate(index)
+            row, problems = self._coerce(source_row, mapping, present, index, where)
             if problems:
                 self.rejected.append({**dict(source_row), "_loom_rejected": problems})
                 continue
             key = row.get(pk_column)
             if key is None:
-                self._reject_row(source_row, index, NULL_KEY, f"row {index}: {pk} is null")
+                self._reject_row(source_row, where, NULL_KEY, f"{where}: {pk} is null")
                 continue
             if key in seen_keys:
                 # Batch-level, and therefore never quarantined: choosing which of two rows carrying
@@ -578,6 +579,7 @@ class _Load:
         mapping: Mapping[str, str],
         present: set[str],
         index: int,
+        where: str,
     ) -> tuple[dict[str, Any], list[str]]:
         """One source row to one physical row, keyed by column name.
 
@@ -613,18 +615,23 @@ class _Load:
                 problems.append(str(e))
                 row[prop.column] = None
         if problems:
-            self._fail_row(index, problems)
+            # Prefixed in place, so the quarantine file and the reported failure carry the same
+            # sentence. They used to differ: `_reject_row` put the location in `_loom_rejected` and
+            # this path did not, so one rejects file held "line 3: orderId is null" beside a bare
+            # "property 'total': cannot read ...", and only one of them could be looked up.
+            problems[:] = [f"{where}: {p}" for p in problems]
+            self._fail_row(where, problems)
         return row, problems
 
-    def _fail_row(self, index: int, problems: Sequence[str]) -> None:
+    def _fail_row(self, where: str, problems: Sequence[str]) -> None:
         if sum(1 for f in self.failures if f.code == TYPE_ERROR) >= MAX_REPORTED_ROWS:
             return
-        self._fail(TYPE_ERROR, f"row {index}: {'; '.join(problems)}", {"row": index})
+        self._fail(TYPE_ERROR, "; ".join(problems), {"row": where})
 
-    def _reject_row(self, source_row: Mapping[str, Any], index: int, code: str, message: str) -> None:
+    def _reject_row(self, source_row: Mapping[str, Any], where: str, code: str, message: str) -> None:
         self.rejected.append({**dict(source_row), "_loom_rejected": [message]})
         if sum(1 for f in self.failures if f.code == code) < MAX_REPORTED_ROWS:
-            self._fail(code, message, {"row": index})
+            self._fail(code, message, {"row": where})
 
     # ---- 5. write --------------------------------------------------------------
 

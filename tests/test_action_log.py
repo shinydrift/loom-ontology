@@ -607,3 +607,81 @@ def test_the_log_is_rows_so_rollback_never_touches_it():
     verbs = {n for n in dir(CatalogWriter) if not n.startswith("_")}
     assert verbs == {"ensure_namespace", "create_table", "alter_table", "append_rows"}
     assert not any("delete" in v or "replace" in v for v in verbs)
+
+
+# --- probe #7: the record of a run survives an ordinary commit race ---------------------------
+
+
+def test_the_log_append_is_retried_when_it_loses_a_commit_race():
+    """An append to the edit log asserts no snapshot, so a conflict on it means nothing.
+
+    Iceberg still refuses the second of two concurrent appends — "Table has been updated by another
+    process" — and with one attempt per run that refusal was final. Six concurrent runs through a
+    served `run_` tool lost two audit rows to it. The row write already retries a conflict and calls
+    the retry the price of a coarse check; the log had the price and not the retry. It matters most
+    for a *refusal*, whose lost record is undetectable: a refusal leaves no commit to stamp with the
+    `edit_id` that would make the gap findable."""
+    from loom.action.log import MAX_LOG_ATTEMPTS, EditLog
+    from loom.catalog.base import CatalogError
+
+    class Flaky:
+        """Loses every race but the last, the way a busy log table does."""
+
+        def __init__(self, failures):
+            self.remaining = failures
+            self.appended = []
+
+        def ensure_log(self, columns):
+            pass
+
+        def append_edit(self, columns, row):
+            if self.remaining:
+                self.remaining -= 1
+                raise CatalogError("Table has been updated by another process")
+            self.appended.append(row)
+
+    writer = Flaky(MAX_LOG_ATTEMPTS - 1)
+    EditLog(catalog=None, writer=writer).record(_an_edit())
+    assert len(writer.appended) == 1, "the record should survive a losing streak it can outlast"
+
+
+def test_a_log_append_that_keeps_losing_is_still_reported_as_lost():
+    """The retry raises the ceiling; it does not pretend there is none. The last failure comes back
+    untouched so `log_failed` still says exactly what Iceberg said."""
+    from loom.action.log import MAX_LOG_ATTEMPTS, EditLog
+    from loom.catalog.base import CatalogError
+
+    attempts = []
+
+    class AlwaysLoses:
+        def ensure_log(self, columns):
+            pass
+
+        def append_edit(self, columns, row):
+            attempts.append(row)
+            raise CatalogError("Table has been updated by another process")
+
+    with pytest.raises(CatalogError, match="another process"):
+        EditLog(catalog=None, writer=AlwaysLoses()).record(_an_edit())
+    assert len(attempts) == MAX_LOG_ATTEMPTS
+
+
+def _an_edit():
+    """One minimal record. Only the two required columns matter here — this is about the append."""
+    from datetime import UTC, datetime
+
+    from loom.action.log import EditRecord
+
+    return EditRecord(
+        edit_id="e1",
+        recorded_at=datetime.now(UTC),
+        actor="probe",
+        action="upgradeTier",
+        object_type="Customer",
+        operation="modify",
+        catalog="rest_main",
+        table_name="crm.customers",
+        object_key="c1",
+        status="refused",
+        attempts=1,
+    )

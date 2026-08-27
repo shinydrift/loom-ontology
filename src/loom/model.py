@@ -212,6 +212,22 @@ def coerce_value(
     if value is None:
         return None
     kind = prop_type.kind
+    # A container has no reading as a scalar, and the one it was getting was a *Python* one: every
+    # kind below bottoms out in `str(value)`, so `{"orderId": ["a"]}` became the key `"['a']"` and
+    # `{"a": 1}` became `"{'a': 1}"` — committed, as a primary key, into a real table.
+    #
+    # **Here rather than at a caller.** `filters._coerced` refused exactly this on the read path and
+    # kept the refusal at its own call site, so the write path never inherited it: an action's
+    # parameters and a bulk load's cells reach this function by a different door. A guard that lives
+    # at one of three doors is a guard three surfaces have to remember. This is the door they share.
+    # `_coerced` still answers first, because it can name the property and offer `in`; this is what
+    # every other caller gets, and what a new one gets without being told.
+    if isinstance(value, (Mapping, list, tuple, set)):
+        raise ValueError(
+            f"{ctx}: cannot read {'an object' if isinstance(value, Mapping) else 'a list'} as "
+            f"{kind} — a single {kind} value was expected, and reading a container as one would "
+            f"have stored Python's spelling of it"
+        )
     # A JSON `true` has no reading as anything but a boolean, and the one it was getting was a
     # *Python* one: `str(True)` is `"True"`, so a bare `{"name": true}` searched `full_name` for the
     # substring `True` and `{"ltv": true}` compared against `1.0`. That is the Python-repr defect

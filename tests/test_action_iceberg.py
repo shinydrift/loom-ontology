@@ -369,3 +369,53 @@ def test_the_snapshot_assertion_is_really_on_the_transaction(seeded):
     assert e.value.found != stale
     assert e.value.table == "crm.customers"
     assert next(r for r in physical(seeded, "crm.customers") if r["id"] == "c2")["tier"] == "silver"
+
+
+# --- probe #7 -----------------------------------------------------------------------------------
+
+
+def test_a_container_key_never_reaches_the_table(seeded, runtime):
+    """The whole point of the refusal, asserted where it matters: in the lake.
+
+    The seventh probe created two Orders through a served `run_` tool whose primary keys were
+    `"['a']"` and `"{'a': 1}"` — Python reprs of the JSON containers it had sent. Nothing downstream
+    could address those rows by the key their caller used, and `search_order` listed them forever.
+    A refusal that stopped at the runtime and let the row land would be no refusal at all."""
+    before = physical(seeded, "sales.orders")
+
+    for bad in (["a"], {"a": 1}):
+        result = runtime.run(
+            "recordOrder", {"orderId": bad, "customer": "c1", "total": "5.00"}
+        )
+        assert result.status == REFUSED, result.status
+        assert [f.code for f in result.failures] == ["type_error"]
+        assert "orderId" in result.failures[0].message
+
+    assert physical(seeded, "sales.orders") == before
+
+
+def test_a_refused_run_is_recorded_when_the_caller_stops_there(seeded, runtime):
+    """`loom run` refuses on its preview and never reaches the real run, so the preview is the only
+    thing that can carry the refusal into `_loom_meta.edits`.
+
+    For the whole life of the command it did not: every refusal it printed — `object_not_found`,
+    `validation_failed`, `ambiguous_key` — came back with an empty `editId` and left no row, while
+    the identical refusal through a `run_` tool was recorded. That is the log answering *who tried*
+    differently depending on which door the caller came through."""
+    result = runtime.preview(
+        "upgradeTier", {"customer": "nobody", "newTier": "gold"}, actor="probe", record_refusals=True
+    )
+    assert result.status == REFUSED
+    assert [f.code for f in result.failures] == ["object_not_found"]
+    assert result.edit_id, "a refusal the caller stops on has to be recorded"
+
+
+def test_a_preview_that_would_apply_is_still_not_recorded(seeded, runtime):
+    """The other half, and the reason `record_refusals` is not simply "record previews": a preview
+    that succeeds is followed by a real run that records itself, so recording both would put two
+    rows in the log for one edit."""
+    result = runtime.preview(
+        "upgradeTier", {"customer": "c3", "newTier": "gold"}, actor="probe", record_refusals=True
+    )
+    assert result.status == PREVIEWED
+    assert not result.edit_id

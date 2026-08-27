@@ -32,6 +32,28 @@ def snake_case(api_name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
 
 
+# §0's identifier grammar. Here rather than in `validator.py` for `snake_case`'s reason, one command
+# further along: the validator is not the only place that has to know the shape of a legal name —
+# `loom infer` *generates* one from `--as`, and while this pattern lived beside its checker the
+# on-ramp emitted `apiName: not a name`, printed "this draft validates as it stands", and exited 0
+# on a draft `loom validate` then refused. A grammar with one reader is a grammar the next writer
+# does not know about.
+OBJECT_NAME = re.compile(r"^[A-Z][A-Za-z0-9]*$")
+MEMBER_NAME = re.compile(r"^[a-z][A-Za-z0-9]*$")
+
+
+def identifier_problem(kind: str, name: str, pattern: re.Pattern[str]) -> str | None:
+    """The one sentence §0 gives for a name outside its grammar, or None. One wording, three
+    callers: the validator's diagnostic, `loom infer`'s refusal, and any grammar added after."""
+    if pattern.match(name):
+        return None
+    shape = "PascalCase" if pattern is OBJECT_NAME else "camelCase"
+    return (
+        f"{kind} '{name}' is not a legal identifier — {shape}, matching '{pattern.pattern}' "
+        f"(spec-v0 §0). Letters and digits only: no spaces, no underscores, no leading digit"
+    )
+
+
 def suggest(bad: str, options: Iterable[str]) -> str | None:
     match = difflib.get_close_matches(bad, list(options), n=1)
     return f"did you mean '{match[0]}'?" if match else None
