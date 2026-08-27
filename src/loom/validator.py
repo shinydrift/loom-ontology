@@ -11,10 +11,11 @@ bound — `loom validate` stays structural and offline, `loom validate --physica
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-from ._shape import suggest
+from ._shape import snake_case, suggest
 from .errors import Diagnostics, SourceLoc
 from .expr import FUNCTIONS, Binary, Call, Expr, Literal, Ref, Unary
 from .loader import _Loaded
@@ -29,7 +30,76 @@ _BOOLEANS = {"&&", "||"}
 _ARITH = {"+", "-", "*", "/"}
 
 
+# §0's identifier grammar, which was a documented rule and nothing else until a whole-app probe
+# asked what enforced it. `loom validate` returned `ok` for a property called `full Name` and for an
+# object type called `thing bad`, and both reached the generated tool surface verbatim.
+#
+# The property case is the one with teeth. A name outside this pattern is unreachable from the
+# *expression* grammar — `rows: "object.full Name != 'x'"` is refused as "trailing tokens", and so is
+# an action `validation:` rule naming it — so Loom would serve a property that no row predicate could
+# ever govern, while `mask:` (a list of strings, not an expression) still reached it. Half of §6
+# applying to a property and half not is not a policy anybody wrote.
+_OBJECT_NAME = re.compile(r"^[A-Z][A-Za-z0-9]*$")
+_MEMBER_NAME = re.compile(r"^[a-z][A-Za-z0-9]*$")
+
+
+def _check_name(kind: str, name: str, pattern: re.Pattern[str], loc: SourceLoc, diag: Diagnostics) -> None:
+    if pattern.match(name):
+        return
+    shape = "PascalCase" if pattern is _OBJECT_NAME else "camelCase"
+    diag.error(
+        f"{kind} '{name}' is not a legal identifier — {shape}, matching '{pattern.pattern}' "
+        f"(spec-v0 §0). Letters and digits only: no spaces, no underscores, no leading digit",
+        loc,
+    )
+
+
+def _validate_identifiers(loaded: _Loaded, diag: Diagnostics) -> None:
+    for obj in loaded.objects.values():
+        _check_name("objectType apiName", obj.api_name, _OBJECT_NAME, obj.loc, diag)
+        for p in obj.properties.values():
+            _check_name("property", p.name, _MEMBER_NAME, obj.loc, diag)
+    for link in loaded.links.values():
+        _check_name("linkType apiName", link.api_name, _MEMBER_NAME, link.loc, diag)
+        if link.reverse_name is not None:
+            _check_name("linkType reverseName", link.reverse_name, _MEMBER_NAME, link.loc, diag)
+    for act in loaded.actions.values():
+        _check_name("action apiName", act.api_name, _MEMBER_NAME, act.loc, diag)
+        for name in act.parameters:
+            _check_name("parameter", name, _MEMBER_NAME, act.loc, diag)
+
+
+def _validate_tool_names(loaded: _Loaded, diag: Diagnostics) -> None:
+    """Two object types whose generated tool names collide.
+
+    A separate rule from the one above rather than a consequence of it, because `snake_case` is not
+    injective over §0's *legal* grammar either: `ABCTest` and `AbcTest` are both well-formed
+    PascalCase and both spell `abc_test`, so enforcing the identifier pattern does not close this.
+
+    What it costs is the whole surface of one type. §7 makes the tool set a function of the spec, and
+    `ToolSpec`s are collected into a dict by name — so the second type's `get_`/`search_`/`list_`
+    silently replace the first's and one object type becomes unreachable, with `loom serve`'s own
+    banner printing the arithmetic that gives it away ("2 object type(s) ... -> 3 tool(s)") and
+    nothing reading it. Refused here rather than at `cmd_serve` for the reason `--physical` is a
+    flag: this needs no catalog, no config and no MCP extra to decide, and an author wants it at the
+    same moment they want every other §2 problem."""
+    seen: dict[str, str] = {}
+    for obj in loaded.objects.values():
+        tool = snake_case(obj.api_name)
+        if tool in seen:
+            diag.error(
+                f"objectType '{obj.api_name}' generates the same MCP tool names as "
+                f"'{seen[tool]}' (both spell 'get_{tool}', 'search_{tool}', 'list_{tool}'), so one "
+                f"of the two would have no tools at all — see spec-v0 §7",
+                obj.loc,
+            )
+        else:
+            seen[tool] = obj.api_name
+
+
 def validate(loaded: _Loaded, diag: Diagnostics) -> None:
+    _validate_identifiers(loaded, diag)
+    _validate_tool_names(loaded, diag)
     for obj in loaded.objects.values():
         _validate_object(obj, diag)
     for link in loaded.links.values():

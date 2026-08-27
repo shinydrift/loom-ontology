@@ -246,7 +246,37 @@ def test_changed_text_is_re_embedded_and_unchanged_text_is_not():
     assert result.rows_embedded == 1
     assert provider.calls[-1] == ["Ada Byron"]
     stored = {r["key"]: r for r in catalog.vectors}
-    assert stored["c1"]["source_hash"] == source_hash("Ada Byron", "fake-v1", 4)
+    assert stored["c1"]["source_hash"] == source_hash("Ada Byron", "fake-v1", 4, "name")
+
+
+def test_renaming_the_semantic_property_makes_every_row_pending():
+    """The one staleness the reconcile could not see, and the one that silently empties `match_`.
+
+    Renaming a property's apiName moves no column and changes no text, so `loom plan` says *No
+    changes* and every `source_hash` still matched — the reconcile reported `rowsCurrent: 2,
+    rowsEmbedded: 0`. But `ir.VectorRef`'s comparability guard also compares the stored `property`,
+    so it withheld both rows and the ranked plane returned nothing at all, permanently. The hash now
+    covers the fourth column the guard compares, so a rename invalidates by construction — the same
+    way a model swap does, and for the same reason."""
+    catalog = FakeVectorCatalog()
+    provider = FakeProvider()
+    ont = ontology_fixture()
+    runtime(ont, catalog, provider).reconcile()
+    assert all(r["property"] == "name" for r in catalog.vectors)
+
+    # Same column, same text, same model — only the name the spec calls the property by.
+    customer = ont.object_types["Customer"]
+    renamed = replace(customer.properties["name"], name="fullName")
+    props = {("fullName" if k == "name" else k): (renamed if k == "name" else v)
+             for k, v in customer.properties.items()}
+    moved = replace(customer, properties=props, semantic="fullName")
+    after = replace(ont, object_types={**ont.object_types, "Customer": moved})
+
+    result = runtime(after, catalog, provider).reconcile()
+    assert result.rows_embedded == 2
+    assert result.types[0].rows_current == 0
+    assert all(r["property"] == "fullName" for r in catalog.vectors)
+    assert len(catalog.vectors) == 2  # rewritten in place, not left beside the old ones
 
 
 def test_the_stored_vector_is_the_one_the_model_returned_for_that_row():
@@ -484,15 +514,20 @@ def test_a_type_without_semantic_is_a_malformed_command():
 # ---- the store's own vocabulary -------------------------------------------------
 
 
-def test_source_hash_covers_the_model_and_the_width():
-    assert source_hash("x", "a", 4) != source_hash("x", "b", 4)
-    assert source_hash("x", "a", 4) != source_hash("x", "a", 8)
-    assert source_hash("x", "a", 4) == source_hash("x", "a", 4)
+def test_source_hash_covers_the_model_the_width_and_the_property():
+    """The four things `ir.VectorRef`'s comparability guard compares — all four, or the guard can
+    refuse a row this hash calls current. The property was the one left out: a `semantic:` rename
+    keeps the text, so without it every hash matched, `reconcile` reported nothing to do, and
+    `match_` ranked nothing at all."""
+    assert source_hash("x", "a", 4, "p") != source_hash("x", "b", 4, "p")
+    assert source_hash("x", "a", 4, "p") != source_hash("x", "a", 8, "p")
+    assert source_hash("x", "a", 4, "p") != source_hash("x", "a", 4, "q")
+    assert source_hash("x", "a", 4, "p") == source_hash("x", "a", 4, "p")
 
 
 def test_source_hash_cannot_be_impersonated_across_its_parts():
     """Length-prefixed rather than joined, so no text can spell a different (text, model) pair."""
-    assert source_hash("ab", "c", 1) != source_hash("a", "bc", 1)
+    assert source_hash("ab", "c", 1, "p") != source_hash("a", "bc", 1, "p")
 
 
 def test_embeddable_treats_blank_and_null_alike_and_refuses_a_non_string():

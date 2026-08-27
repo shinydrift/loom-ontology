@@ -437,7 +437,7 @@ class Resolver:
             # Unknown rather than stale when the sidecar predates the column — these tables are only
             # ever created, so a hash-less row is one Loom cannot decide about and must not accuse.
             fresh = stored is None or (
-                text is not None and str(stored) == source_hash(text, model, dims)
+                text is not None and str(stored) == source_hash(text, model, dims, prop.name)
             )
             matches.append(Ranked(score=float(score), object=data, stale=not fresh))
         return MatchResult(

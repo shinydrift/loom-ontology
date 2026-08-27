@@ -330,6 +330,80 @@ def test_non_boolean_validation_rule(tmp_path):
     """}, "must be boolean")
 
 
+@pytest.mark.parametrize(
+    ("body", "problem"),
+    [
+        # A property name a source column produced: `loom infer` drafts `full Name` from a column
+        # called `Full Name`, and drafted `2weird` from `2weird`.
+        (
+            """
+            objectType:
+              apiName: Customer
+              primaryKey: customerId
+              backing: { catalog: c, table: crm.customers }
+              properties:
+                - { name: customerId, type: string, column: id, unique: true }
+                - { name: full Name, type: string, column: full_name }
+            """,
+            "property 'full Name' is not a legal identifier",
+        ),
+        (
+            """
+            objectType:
+              apiName: Customer
+              primaryKey: customerId
+              backing: { catalog: c, table: crm.customers }
+              properties:
+                - { name: customerId, type: string, column: id, unique: true }
+                - { name: 2weird, type: string, column: weird }
+            """,
+            "property '2weird' is not a legal identifier",
+        ),
+        (
+            """
+            objectType:
+              apiName: thing bad
+              primaryKey: customerId
+              backing: { catalog: c, table: crm.customers }
+              properties:
+                - { name: customerId, type: string, column: id, unique: true }
+            """,
+            "objectType apiName 'thing bad' is not a legal identifier",
+        ),
+    ],
+)
+def test_an_identifier_outside_section_zeros_grammar_is_refused(tmp_path, body, problem):
+    """§0 states the pattern and nothing enforced it, so `loom validate` said `ok` on all three.
+
+    The property case is the one with teeth: a name outside this grammar cannot be *named* by the
+    expression grammar, so `rows: "object.full Name != 'x'"` and an action `validation:` rule over
+    it are both refused as "trailing tokens" — while `mask:`, a list of strings rather than an
+    expression, reaches it fine. Half of §6 applying to a property and half not is not a policy
+    anyone wrote."""
+    _expect_error(tmp_path, {"o.yaml": body}, problem)
+
+
+def test_two_object_types_whose_tool_names_collide_are_refused(tmp_path):
+    """`snake_case` is not injective over §0's *legal* grammar — `ABCTest` and `AbcTest` are both
+    well-formed PascalCase and both spell `abc_test` — so enforcing the identifier pattern does not
+    close this. `ToolSpec`s are collected by name, so the second type's three tools replace the
+    first's and one object type becomes wholly unreachable, with `loom serve`'s banner printing the
+    arithmetic that gives it away ("2 object type(s) ... -> 3 tool(s)") and nothing reading it."""
+    one = """
+        objectType:
+          apiName: ABCTest
+          primaryKey: id
+          backing: { catalog: c, table: t.a }
+          properties:
+            - { name: id, type: string, column: id, unique: true }
+        """
+    _expect_error(
+        tmp_path,
+        {"a.yaml": one, "b.yaml": one.replace("ABCTest", "AbcTest").replace("t.a", "t.b")},
+        "generates the same MCP tool names as 'ABCTest'",
+    )
+
+
 def test_duplicate_api_name(tmp_path):
     _expect_error(tmp_path, {
         "a.yaml": CUSTOMER,

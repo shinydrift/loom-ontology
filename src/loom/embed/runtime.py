@@ -283,7 +283,7 @@ class EmbedRuntime:
         assert prop is not None  # `targets` is built from `semantic_property`, which the validator ensures
         store = self._store(obj)
 
-        current, skipped = self._current_text(obj, prop.column, model, dims)
+        current, skipped = self._current_text(obj, prop.column, model, dims, prop.name)
         stored = store.existing()
 
         pending = [k for k, (_, digest) in current.items() if stored.get(k, {}).get("source_hash") != digest]
@@ -320,7 +320,7 @@ class EmbedRuntime:
             )
 
     def _current_text(
-        self, obj: ObjectType, column: str, model: str, dims: int
+        self, obj: ObjectType, column: str, model: str, dims: int, property_name: str
     ) -> tuple[dict[Any, tuple[str, str]], dict[str, int]]:
         """Every keyed, embeddable, unambiguous row of the object's table as `key -> (text, hash)`.
 
@@ -366,7 +366,7 @@ class EmbedRuntime:
             if text is None:
                 skipped["without_text"] += 1
                 continue
-            out[key] = (text, source_hash(text, model, dims))
+            out[key] = (text, source_hash(text, model, dims, property_name))
         return out, skipped
 
     def _check_model(
